@@ -308,6 +308,55 @@ class TestDuplicateIDHandling:
         assert "page1" in indexer.pages
         assert "page2" in indexer.pages
 
+    def test_duplicate_page_id_detection(self, temp_help_dir):
+        """Verify duplicate page IDs are tracked in _duplicate_ids dict."""
+        xml_content = """<?xml version="1.0" encoding="UTF-8"?>
+<BrHelpContent>
+    <Section Id="section1" Text="Section 1" File="section1.html">
+        <Page Id="dup_page_id" Text="First Page" File="first_page.html"/>
+        <Page Id="dup_page_id" Text="Second Page" File="second_page.html"/>
+    </Section>
+</BrHelpContent>
+"""
+        xml_path = temp_help_dir / "brhelpcontent.xml"
+        xml_path.write_text(xml_content, encoding="utf-8")
+
+        indexer = HelpContentIndexer(temp_help_dir)
+        indexer.parse_xml_structure()
+
+        # Check that duplicate was detected
+        assert "dup_page_id" in indexer._duplicate_ids
+        assert len(indexer._duplicate_ids["dup_page_id"]) == 2
+        assert "First Page" in indexer._duplicate_ids["dup_page_id"]
+        assert "Second Page" in indexer._duplicate_ids["dup_page_id"]
+
+    def test_duplicate_page_id_does_not_crash(self, temp_help_dir):
+        """Verify parsing continues when duplicate page IDs encountered."""
+        xml_content = """<?xml version="1.0" encoding="UTF-8"?>
+<BrHelpContent>
+    <Section Id="section1" Text="Section 1" File="section1.html">
+        <Page Id="dup_page_id" Text="First Page" File="first.html"/>
+    </Section>
+    <Section Id="section2" Text="Section 2" File="section2.html">
+        <Page Id="dup_page_id" Text="Duplicate Page" File="dup.html"/>
+        <Page Id="page2" Text="Page 2" File="p2.html"/>
+    </Section>
+</BrHelpContent>
+"""
+        xml_path = temp_help_dir / "brhelpcontent.xml"
+        xml_path.write_text(xml_content, encoding="utf-8")
+
+        indexer = HelpContentIndexer(temp_help_dir)
+        # Should not raise exception
+        indexer.parse_xml_structure()
+
+        # Both sections and the unique page should be parsed
+        assert "section1" in indexer.pages
+        assert "section2" in indexer.pages
+        assert "page2" in indexer.pages
+        # The duplicate page ID exists (last occurrence wins)
+        assert "dup_page_id" in indexer.pages
+
 
 class TestMetadataOperations:
     """Test metadata loading and saving."""
