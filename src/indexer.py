@@ -345,6 +345,7 @@ class HelpContentIndexer:
             from typing import cast
 
             from lxml.html import HtmlElement
+
             root_elem = cast(HtmlElement, root)
             for element in root_elem.xpath(".//script | .//style"):
                 element.getparent().remove(element)
@@ -423,6 +424,7 @@ class HelpContentIndexer:
             from typing import cast
 
             from lxml.html import HtmlElement
+
             root_elem = cast(HtmlElement, root)
             for element in root_elem.xpath(".//script | .//style"):
                 element.getparent().remove(element)
