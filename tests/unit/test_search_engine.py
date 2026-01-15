@@ -278,6 +278,44 @@ class TestIndexBuildAndLoad:
 
         engine.close()
 
+    def test_index_exists_returns_false_when_fts_table_empty(self, initialized_indexer, tmp_path):
+        """Verify _index_exists returns False when FTS5 table exists but is empty."""
+        db_path = tmp_path / "test.db"
+
+        # Create database with empty FTS5 table
+        conn = sqlite3.connect(str(db_path))
+        cursor = conn.cursor()
+
+        # Create the FTS5 table but don't insert any data
+        cursor.execute("""
+            CREATE VIRTUAL TABLE help_fts USING fts5(
+                page_id UNINDEXED,
+                title,
+                content,
+                file_path UNINDEXED,
+                help_id UNINDEXED,
+                is_section UNINDEXED,
+                breadcrumb_path UNINDEXED,
+                category UNINDEXED,
+                tokenize='porter unicode61'
+            )
+        """)
+        conn.commit()
+        conn.close()
+
+        # Now create search engine - should detect empty table and rebuild
+        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=False)
+
+        # After rebuild, index should exist and have data
+        assert engine._index_exists() is True
+
+        # Verify it has documents
+        cursor = engine.conn.execute("SELECT COUNT(*) FROM help_fts")
+        count = cursor.fetchone()[0]
+        assert count > 0
+
+        engine.close()
+
     def test_needs_reindex_detects_xml_change(self, initialized_indexer, tmp_path):
         """Verify _needs_reindex detects XML changes."""
         db_path = tmp_path / "test.db"
