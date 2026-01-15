@@ -401,11 +401,12 @@ class TestURLBuilding:
 
     def test_url_with_as_version_4(self):
         """Verify URLs are built correctly for AS4."""
-        version, base_url = get_as_version_config()
-        file_path = "motion/axis.html"
+        with patch.dict(os.environ, {"AS_HELP_VERSION": "4"}):
+            version, base_url = get_as_version_config()
+            file_path = "motion/axis.html"
 
-        expected_url = f"{base_url}{file_path}"
-        assert expected_url == "https://help.br-automation.com/#/en/4/motion/axis.html"
+            expected_url = f"{base_url}{file_path}"
+            assert expected_url == "https://help.br-automation.com/#/en/4/motion/axis.html"
 
     def test_url_with_as_version_6(self):
         """Verify URLs are built correctly for AS6."""
