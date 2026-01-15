@@ -343,6 +343,7 @@ class HelpContentIndexer:
             # Remove script and style elements using XPath (faster than Cleaner)
             # Cast to lxml HtmlElement to access xpath method
             from typing import cast
+
             from lxml.html import HtmlElement
             root_elem = cast(HtmlElement, root)
             for element in root_elem.xpath(".//script | .//style"):
@@ -420,6 +421,7 @@ class HelpContentIndexer:
             # Remove script and style elements using XPath (faster than Cleaner)
             # Cast to lxml HtmlElement to access xpath method
             from typing import cast
+
             from lxml.html import HtmlElement
             root_elem = cast(HtmlElement, root)
             for element in root_elem.xpath(".//script | .//style"):
