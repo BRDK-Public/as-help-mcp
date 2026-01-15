@@ -58,17 +58,37 @@ Restart VS Code, then test in Copilot Chat: *"Search AS help for mapp Motion"*
 # Clone and install
 git clone <repository-url>
 cd as-help
-uv sync
+uv sync --extra test --extra dev
 
-# Create .env file
-echo "AS_HELP_ROOT=C:\Program Files (x86)\BRAutomation\AS6\Help-en\Data" > .env
-echo "AS_HELP_VERSION=6" >> .env
+# Run server with command line arguments (precedence over .env)
+uv run as-help-server --help-root "C:\BRAutomation\AS412\Help-en\Data" --db-path "data\.ashelp\search.db" --metadata-dir "data\.ashelp_metadata"
 
-# Run server
-uv run as-help-server
+# Or use relative paths (automatically resolved)
+uv run as-help-server --db-path ./data/ashelp.db --metadata-dir ./data
 ```
 
-### Option 2: Docker Compose
+### Option 2: Environment Variables (.env)
+
+You can also create a `.env` file in the root directory. Command-line arguments will override these values if provided.
+
+```bash
+AS_HELP_ROOT=C:\Program Files (x86)\BRAutomation\AS6\Help-en\Data
+AS_HELP_VERSION=6
+```
+
+### CLI Arguments
+
+Run `uv run as-help-server --help` for full details.
+
+| Argument | Env Var Equivalent | Description |
+|----------|--------------------|-------------|
+| `--help-root` | `AS_HELP_ROOT` | Path to AS Help Data folder |
+| `--db-path` | `AS_HELP_DB_PATH` | Path to the SQLite database file |
+| `--metadata-dir` | `AS_HELP_METADATA_DIR` | Path to the indexing metadata directory |
+| `--as-version` | `AS_HELP_VERSION` | AS version for online help (`4` or `6`) |
+| `--force-rebuild` | `AS_HELP_FORCE_REBUILD` | Force a full index rebuild |
+
+### Option 3: Docker Compose
 
 ```bash
 # Local build
@@ -103,15 +123,17 @@ Use the launch configurations in `.vscode/launch.json`:
 
 ---
 
-## Environment Variables
+## Environment Variables & CLI Arguments
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `AS_HELP_ROOT` | `/data/help` | Path to AS Help Data folder |
-| `AS_HELP_VERSION` | `6` | AS version for online help URLs (`4` or `6`) |
-| `AS_HELP_FORCE_REBUILD` | `false` | Force index rebuild |
-| `AS_HELP_DB_PATH` | `{root}/.ashelp_search.db` | Database location |
-| `AS_HELP_METADATA_DIR` | `{root}/.ashelp_metadata` | Metadata directory |
+The server supports configuration via both environment variables and command-line arguments. **CLI arguments take precedence.** Relative paths are automatically resolved to absolute paths.
+
+| CLI Argument | Environment Variable | Default | Description |
+|--------------|----------------------|---------|-------------|
+| `--help-root` | `AS_HELP_ROOT` | `/data/help` | Path to AS Help Data folder |
+| `--as-version` | `AS_HELP_VERSION` | `4` | AS version for online help (`4` or `6`) |
+| `--force-rebuild` | `AS_HELP_FORCE_REBUILD` | `false` | Force index rebuild |
+| `--db-path` | `AS_HELP_DB_PATH` | `{root}/.ashelp_search.db` | Database location |
+| `--metadata-dir` | `AS_HELP_METADATA_DIR` | `{root}/.ashelp_metadata` | Metadata directory |
 
 ---
 
