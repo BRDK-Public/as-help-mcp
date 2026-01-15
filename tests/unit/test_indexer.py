@@ -450,6 +450,15 @@ class TestContentExtraction:
         html2 = indexer.extract_html_content("x20di9371_page")
         assert html1 is html2  # Same object reference
 
+    def test_extract_html_content_unknown_page_id(self, temp_help_dir, sample_xml):
+        """Verify extract_html_content returns None for unknown page_id."""
+        indexer = HelpContentIndexer(temp_help_dir)
+        indexer.parse_xml_structure()
+
+        # Request content for non-existent page
+        html = indexer.extract_html_content("unknown_page_id")
+        assert html is None
+
     def test_extract_plain_text(self, temp_help_dir, sample_xml):
         """Verify plain text extraction."""
         indexer = HelpContentIndexer(temp_help_dir)
