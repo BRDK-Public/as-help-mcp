@@ -10,11 +10,15 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from dotenv import load_dotenv
 from mcp.server.fastmcp import Context, FastMCP
 from pydantic import BaseModel, Field
 
 from src.indexer import HelpContentIndexer
 from src.search_engine import HelpSearchEngine
+
+# Load environment variables from .env file
+load_dotenv()
 
 
 def get_as_version_config() -> tuple[str, str]:
@@ -33,19 +37,13 @@ def get_as_version_config() -> tuple[str, str]:
     return "4", "https://help.br-automation.com/#/en/4/"
 
 
-# Configure logging - must write to file for MCP Inspector compatibility (Windows stdio issue)
-log_file = Path.home() / ".ashelp_mcp_server.log"
+# Configure logging - use stderr so it doesn't interfere with stdio transport
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler(log_file, mode="a"),  # Append to file instead of stderr
-        # Uncomment below for console output when NOT using MCP Inspector:
-        # logging.StreamHandler()
-    ],
+    handlers=[logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
-logger.info(f"Logging to {log_file}")
 
 
 # Pydantic models for structured output
@@ -145,25 +143,29 @@ async def app_lifespan(server: FastMCP):
 
     # Get help root from environment (defaults to /data/help for Docker)
     help_root = os.getenv("AS_HELP_ROOT", "/data/help")
-    help_root_path = Path(help_root)
+    help_root_path = Path(help_root).resolve()
 
     # Get database path for SQLite FTS5 index
     # Default to /data/db for Docker volumes (not help root for read-only compatibility)
-    default_db_path = (
-        "/data/db/.ashelp_search.db" if help_root.startswith("/data/") else str(help_root_path / ".ashelp_search.db")
-    )
-    db_path = Path(os.getenv("AS_HELP_DB_PATH", default_db_path))
+    if help_root.startswith("/data/"):
+        default_db_path = "/data/db/.ashelp_search.db"
+    else:
+        default_db_path = str(help_root_path / ".ashelp_search.db")
+
+    db_path = Path(os.getenv("AS_HELP_DB_PATH", default_db_path)).resolve()
 
     # Check if force rebuild is requested
     force_rebuild = os.getenv("AS_HELP_FORCE_REBUILD", "false").lower() == "true"
 
     # Get metadata directory (separate from help root for read-only mounts)
     # Default to /data/db for Docker volumes (not help root for read-only compatibility)
-    default_metadata_dir = (
-        "/data/db/.ashelp_metadata" if help_root.startswith("/data/") else str(help_root_path / ".ashelp_metadata")
-    )
+    if help_root.startswith("/data/"):
+        default_metadata_dir = "/data/db/.ashelp_metadata"
+    else:
+        default_metadata_dir = str(help_root_path / ".ashelp_metadata")
+
     metadata_dir = os.getenv("AS_HELP_METADATA_DIR", default_metadata_dir)
-    metadata_path = Path(metadata_dir)
+    metadata_path = Path(metadata_dir).resolve()
 
     # Get AS version from environment variable
     as_version, online_help_base_url = get_as_version_config()
@@ -875,6 +877,43 @@ Now search for "{topic}" in the Services section."""
 
 def main():
     """Entry point for the MCP server."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="B&R Automation Studio Help MCP Server")
+    parser.add_argument(
+        "--help-root",
+        help="Path to AS Help Data folder (AS_HELP_ROOT). Example: 'C:\\BRAutomation\\AS412\\Help-en\\Data'",
+    )
+    parser.add_argument(
+        "--db-path",
+        help="Path to database file (AS_HELP_DB_PATH). Example: './db/ashelp.db'",
+    )
+    parser.add_argument(
+        "--metadata-dir",
+        help="Path to metadata directory (AS_HELP_METADATA_DIR). Example: './metadata'",
+    )
+    parser.add_argument("--force-rebuild", action="store_true", help="Force index rebuild (AS_HELP_FORCE_REBUILD)")
+    parser.add_argument(
+        "--as-version",
+        choices=["4", "6"],
+        help="AS version for online help (AS_HELP_VERSION). Default: 4",
+    )
+    parser.add_argument("--usage", action="store_true", help="Print usage examples and exit")
+
+    # Parse known args to allow them to be passed before or after FastMCP args
+    args, _ = parser.parse_known_args()
+
+    if args.help_root:
+        os.environ["AS_HELP_ROOT"] = str(Path(args.help_root).resolve())
+    if args.db_path:
+        os.environ["AS_HELP_DB_PATH"] = str(Path(args.db_path).resolve())
+    if args.metadata_dir:
+        os.environ["AS_HELP_METADATA_DIR"] = str(Path(args.metadata_dir).resolve())
+    if args.force_rebuild:
+        os.environ["AS_HELP_FORCE_REBUILD"] = "true"
+    if args.as_version:
+        os.environ["AS_HELP_VERSION"] = args.as_version
+
     # Run with stdio transport by default (for local MCP clients like Claude Desktop)
     # To run as HTTP server, use: mcp.run(transport="streamable-http")
     mcp.run()

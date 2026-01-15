@@ -46,13 +46,15 @@ class HelpContentIndexer:
         self._breadcrumb_cache: dict[str, list[HelpPage]] = {}  # Cache breadcrumbs to avoid recomputation
         self._duplicate_ids: dict[str, list[str]] = {}  # Track duplicate IDs: id -> [first_title, second_title, ...]
 
-        if not self.help_root.exists():
-            raise ValueError(f"Help root directory does not exist: {help_root}")
-        if not self.xml_path.exists():
-            raise ValueError(f"brhelpcontent.xml not found at: {self.xml_path}")
-
-        # Ensure metadata directory exists
+        # Ensure directories exist
+        self.help_root.mkdir(parents=True, exist_ok=True)
         self.metadata_dir.mkdir(parents=True, exist_ok=True)
+
+        if not self.xml_path.exists():
+            raise ValueError(
+                f"brhelpcontent.xml not found at: {self.xml_path}. "
+                "Please ensure you have copied the B&R Help 'Data' folder content to this directory."
+            )
 
     def _get_xml_hash(self) -> str:
         """Calculate MD5 hash of brhelpcontent.xml for change detection."""
