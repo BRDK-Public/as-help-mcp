@@ -91,7 +91,7 @@ class HelpSearchEngine:
         if not row:
             return True  # pragma: no cover
 
-        return row[0] != self.indexer._get_xml_hash()
+        return str(row[0]) != self.indexer._get_xml_hash()
 
     def _create_tables(self):
         """Create FTS5 table and metadata table."""

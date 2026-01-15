@@ -7,10 +7,28 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import TypedDict
 
 import defusedxml.ElementTree as DefusedET
 
 logger = logging.getLogger(__name__)
+
+
+class SectionChild(TypedDict):
+    """Type definition for section children."""
+
+    id: str
+    title: str
+    file_path: str
+    is_section: bool
+
+
+class Category(TypedDict):
+    """Type definition for top-level categories."""
+
+    id: str
+    title: str
+    file_path: str
 
 
 @dataclass
@@ -60,11 +78,12 @@ class HelpContentIndexer:
         """Calculate MD5 hash of brhelpcontent.xml for change detection."""
         return hashlib.md5(self.xml_path.read_bytes(), usedforsecurity=False).hexdigest()
 
-    def _load_metadata(self) -> dict | None:
+    def _load_metadata(self) -> dict[str, str | int] | None:
         """Load index metadata if it exists."""
         if self.metadata_path.exists():
             try:
-                return json.loads(self.metadata_path.read_text(encoding="utf-8"))
+                data = json.loads(self.metadata_path.read_text(encoding="utf-8"))
+                return data if isinstance(data, dict) else None
             except Exception as e:  # pragma: no cover
                 logger.warning(f"Failed to load metadata: {e}")  # pragma: no cover
         return None
@@ -322,12 +341,16 @@ class HelpContentIndexer:
                 return None  # pragma: no cover
 
             # Remove script and style elements using XPath (faster than Cleaner)
-            for element in root.xpath(".//script | .//style"):
+            # Cast to lxml HtmlElement to access xpath method
+            from typing import cast
+            from lxml.html import HtmlElement
+            root_elem = cast(HtmlElement, root)
+            for element in root_elem.xpath(".//script | .//style"):
                 element.getparent().remove(element)
 
             # Extract text with proper spacing between block elements
             # Using get_text() with separator to preserve word boundaries
-            text_parts = []
+            text_parts: list[str] = []
             for elem in root.iter():
                 if elem.text:
                     text_parts.append(elem.text)
@@ -355,10 +378,9 @@ class HelpContentIndexer:
 
             text = "".join(text_parts) if text_parts else ""
 
-            # Clean up whitespace
             if text:
-                # Normalize whitespace in one pass
-                return " ".join(text.split())
+                text_result = " ".join(text.split())
+                return text_result
             return None  # pragma: no cover
         except Exception as e:  # pragma: no cover
             logger.debug(f"Failed to extract text from {html_file}: {e}")  # pragma: no cover
@@ -396,7 +418,11 @@ class HelpContentIndexer:
             root = lxml_html.fromstring(html_content)
 
             # Remove script and style elements using XPath (faster than Cleaner)
-            for element in root.xpath(".//script | .//style"):
+            # Cast to lxml HtmlElement to access xpath method
+            from typing import cast
+            from lxml.html import HtmlElement
+            root_elem = cast(HtmlElement, root)
+            for element in root_elem.xpath(".//script | .//style"):
                 element.getparent().remove(element)
 
             # Extract text with proper spacing between block elements
@@ -485,8 +511,8 @@ class HelpContentIndexer:
         Returns:
             List of HelpPage objects from root to current page
         """
-        breadcrumb = []
-        current_id = page_id
+        breadcrumb: list[HelpPage] = []
+        current_id: str | None = page_id
         visited = set()  # Prevent infinite loops from duplicate IDs in XML
 
         while current_id:
@@ -562,7 +588,7 @@ class HelpContentIndexer:
         # Sort alphabetically by title for consistent ordering
         return sorted(categories, key=lambda x: x["title"].lower())
 
-    def get_section_children(self, section_id: str) -> list[dict]:
+    def get_section_children(self, section_id: str) -> list[SectionChild]:
         """Get all immediate children of a section.
 
         Returns both child sections and child pages that have the specified
@@ -579,7 +605,7 @@ class HelpContentIndexer:
             logger.warning(f"Section '{section_id}' not found")
             return []
 
-        children = []
+        children: list[SectionChild] = []
         for _, page in self.pages.items():
             if page.parent_id == section_id:
                 children.append(

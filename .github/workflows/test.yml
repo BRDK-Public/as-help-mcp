@@ -40,7 +40,6 @@ jobs:
       - name: Run type checker (mypy)
         run: |
           uv run mypy src
-        continue-on-error: true # Don't fail build on type errors initially
 
       - name: Run unit tests
         run: |
