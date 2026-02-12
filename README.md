@@ -24,6 +24,8 @@ https://github.com/user-attachments/assets/b4df6bc7-ed7c-471f-93b8-db84b0110ac3
 
 Add to `.vscode/mcp.json` in your workspace:
 
+### Option 1: Docker (Recommended)
+
 ```json
 {
   "servers": {
@@ -45,7 +47,37 @@ Add to `.vscode/mcp.json` in your workspace:
 Update the volume path to match your AS installation:
 - **AS 4.x:** `C:\\BRAutomation\\AS412\\Help-en\\Data:/data/help:ro`
 - **AS 6.x:** `C:\\Program Files (x86)\\BRAutomation\\AS6\\Help-en\\Data:/data/help:ro`
-- **AS 6.x in WSL** `/mnt/c/Program Files (x86)/BRAutomation/AS6/Help-en/Data:/data/help:ro`
+- **AS 6.x in WSL:** `/mnt/c/Program Files (x86)/BRAutomation/AS6/Help-en/Data:/data/help:ro`
+
+### Option 2: UV (Local Development)
+
+```json
+{
+  "servers": {
+    "as-help": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "/path/to/as-help-mcp",
+        "as-help-server",
+        "--help-root",
+        "C:\\Program Files (x86)\\BRAutomation\\AS6\\Help-en\\Data",
+        "--db-path",
+        "..\\data\\as6\\.ashelp\\search.db",
+        "--metadata-dir",
+        "..\\data\\as6\\.ashelp_metadata",
+        "--as-version",
+        "6"
+      ]
+    }
+  }
+}
+```
+
+Update `--directory` to point to your cloned repository and adjust paths as needed.
+
+---
 
 Restart VS Code, then test in Copilot Chat: *"Search AS help for mapp Motion"*
 

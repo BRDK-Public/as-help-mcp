@@ -30,18 +30,6 @@ When reporting a vulnerability, please include:
 - **Affected Versions**: Which versions are affected
 - **Suggested Fix**: If you have one, your suggested remediation
 
-### Response Timeline
-
-- **Acknowledgment**: We will acknowledge receipt of your report within 48 hours
-- **Initial Assessment**: We will provide an initial assessment within 7 days
-- **Resolution**: We aim to resolve critical vulnerabilities within 30 days
-
-### What to Expect
-
-- We will keep you informed of our progress
-- We will credit you in the security advisory (unless you prefer to remain anonymous)
-- We will not take legal action against you for responsibly disclosing the vulnerability
-
 ## Security Best Practices for Users
 
 ### Docker Deployment
