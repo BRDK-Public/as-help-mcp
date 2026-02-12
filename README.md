@@ -35,7 +35,7 @@ Add to `.vscode/mcp.json` in your workspace:
         "-v", "ashelp-data:/data/db",
         "-e", "AS_HELP_VERSION=6",
         "-e", "AS_HELP_FORCE_REBUILD=false",
-        "ghcr.io/brdk-github/as-help-mcp:latest"
+        "ghcr.io/brdk-public/as-help-mcp:latest"
       ]
     }
   }
@@ -189,7 +189,7 @@ The server supports configuration via both environment variables and command-lin
         "-v", "ashelp-data-4:/data/db",
         "-e", "AS_HELP_VERSION=4",
         "-e", "AS_HELP_FORCE_REBUILD=false",
-        "ghcr.io/brdk-github/as-help-mcp:latest"
+        "ghcr.io/brdk-public/as-help-mcp:latest"
       ]
     },
     "as-help-6": {
@@ -200,7 +200,7 @@ The server supports configuration via both environment variables and command-lin
         "-v", "ashelp-data-6:/data/db",
         "-e", "AS_HELP_VERSION=6",
         "-e", "AS_HELP_FORCE_REBUILD=false",
-        "ghcr.io/brdk-github/as-help-mcp:latest"
+        "ghcr.io/brdk-public/as-help-mcp:latest"
       ]
     }
   }

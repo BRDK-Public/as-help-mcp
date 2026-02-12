@@ -31,7 +31,7 @@ This project adheres to a [Code of Conduct](CODE_OF_CONDUCT.md). By participatin
 1. **Clone the repository:**
 
    ```bash
-   git clone https://github.com/BRDK-GitHub/as-help-mcp.git
+   git clone https://github.com/BRDK-Public/as-help-mcp.git
    cd as-help-mcp
    ```
 
@@ -167,7 +167,7 @@ uv run pytest tests/ -m "not slow"
 
 ## Reporting Issues
 
-Please use our [GitHub issue tracker](https://github.com/BRDK-GitHub/as-help-mcp/issues) to report bugs or request features. When you create a new issue, you will be prompted to choose from several templates that ensure all necessary information is provided.
+Please use our [GitHub issue tracker](https://github.com/BRDK-Public/as-help-mcp/issues) to report bugs or request features. When you create a new issue, you will be prompted to choose from several templates that ensure all necessary information is provided.
 
 ### Bug Reports
 
@@ -200,7 +200,7 @@ If you discover a security vulnerability, please follow our [Security Policy](SE
 
 If you have questions about contributing, feel free to:
 
-- Open a [Discussion](https://github.com/BRDK-GitHub/as-help-mcp/discussions)
+- Open a [Discussion](https://github.com/BRDK-Public/as-help-mcp/discussions)
 - Ask in the issue tracker with the `question` label
 
 Thank you for contributing!

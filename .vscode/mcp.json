@@ -19,7 +19,7 @@
         "-v", "ashelp-data:/data/db",
         "-e", "AS_HELP_FORCE_REBUILD=false",
         "-e", "AS_HELP_VERSION=6",
-        "ghcr.io/brdk-github/as-help-mcp:latest"
+        "ghcr.io/brdk-public/as-help-mcp:latest"
       ]
     } 
   }
