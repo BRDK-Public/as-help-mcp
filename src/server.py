@@ -4,6 +4,7 @@ This MCP server provides search and retrieval capabilities for B&R Automation St
 Optimized for thousands of help files with persistent indexing and fast startup.
 """
 
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -56,7 +57,7 @@ class SearchResult(BaseModel):
     online_help_url: str | None = Field(default=None, description="Direct link to B&R online help for this page")
     help_id: str | None = Field(default=None, description="HelpID if available")
     is_section: bool = Field(description="Whether this is a section (True) or page (False)")
-    score: float | None = Field(default=None, description="Search relevance score (lower is better)")
+    score: float | None = Field(default=None, description="Search relevance score (higher is better, RRF fusion)")
     breadcrumb_path: str | None = Field(default=None, description="Navigation path like 'Section > Subsection > Page'")
     category: str | None = Field(default=None, description="Top-level category (e.g., 'Motion', 'Hardware', 'Safety')")
     content_preview: str | None = Field(
@@ -145,12 +146,12 @@ async def app_lifespan(server: FastMCP):
     help_root = os.getenv("AS_HELP_ROOT", "/data/help")
     help_root_path = Path(help_root).resolve()
 
-    # Get database path for SQLite FTS5 index
+    # Get database path for LanceDB index directory
     # Default to /data/db for Docker volumes (not help root for read-only compatibility)
     if help_root.startswith("/data/"):
-        default_db_path = "/data/db/.ashelp_search.db"
+        default_db_path = "/data/db/.ashelp_lance"
     else:
-        default_db_path = str(help_root_path / ".ashelp_search.db")
+        default_db_path = str(help_root_path / ".ashelp_lance")
 
     db_path = Path(os.getenv("AS_HELP_DB_PATH", default_db_path)).resolve()
 
@@ -189,11 +190,21 @@ async def app_lifespan(server: FastMCP):
     for cat in categories:
         logger.info(f"  - {cat['title']}")
 
-    # Initialize search engine (builds or loads SQLite FTS5 index)
+    # Check for old SQLite index and log migration info
+    old_sqlite_db = db_path.parent / ".ashelp_search.db" if db_path.name == ".ashelp_lance" else None
+    if old_sqlite_db and old_sqlite_db.exists():
+        logger.info(f"Found old SQLite FTS5 index at {old_sqlite_db} — it can be safely deleted")
+        logger.info("Migrated from SQLite FTS5 to LanceDB hybrid search (RRF)")
+
+    # Initialize search engine (constructor is fast — just connects to LanceDB)
     logger.info("Initializing search engine...")
     search_engine = HelpSearchEngine(db_path=db_path, indexer=indexer, force_rebuild=force_rebuild)
 
-    logger.info("=== Server ready ===")
+    # Build/load the index in a background thread so the MCP server can respond
+    # to initialize immediately. The search tool will wait for readiness.
+    asyncio.get_running_loop().run_in_executor(None, search_engine.initialize)
+
+    logger.info("=== Server ready (search index loading in background) ===")
 
     # Yield context to the application
     context = AppContext(
@@ -214,7 +225,7 @@ mcp = FastMCP(  # pragma: no cover
         "- browse_section - Navigate into a category/section to see its children\n\n"  # pragma: no cover
         "*** THOROUGH RESEARCH WORKFLOW ***\n\n"  # pragma: no cover
         "For comprehensive answers, use MULTIPLE searches and retrieve MULTIPLE pages:\n\n"  # pragma: no cover
-        "1. search_help - Find pages by keyword. Returns titles/page_ids only, NO content.\n"  # pragma: no cover
+        "1. search_help - Find pages by keyword OR meaning (hybrid search). Returns titles/page_ids only, NO content.\n"  # pragma: no cover
         "2. get_page_by_id - Get FULL content. Call for EACH relevant page.\n"  # pragma: no cover
         "3. REPEAT - Search with different keywords if needed. Get more pages.\n\n"  # pragma: no cover
         "BEST PRACTICES:\n"  # pragma: no cover
@@ -222,6 +233,7 @@ mcp = FastMCP(  # pragma: no cover
         "- Use browse_section() to explore a category's structure before searching\n"  # pragma: no cover
         "- Complex questions need 2-5 page retrievals from different angles\n"  # pragma: no cover
         "- Search for the main topic, then related concepts (e.g., 'MC_BR_MoveAbsolute' then 'axis error handling')\n"  # pragma: no cover
+        "- The search understands meaning, not just keywords — try natural language queries\n"  # pragma: no cover
         "- If first search doesn't have what you need, try synonyms or related terms\n"  # pragma: no cover
         "- Retrieve pages that look relevant - reading 3 pages is better than guessing\n\n"  # pragma: no cover
         "WARNING: content_preview is ~100 chars - NEVER answer from previews alone.\n"  # pragma: no cover
@@ -262,6 +274,17 @@ def search_help(
     """
     app_ctx: AppContext = ctx.request_context.lifespan_context
 
+    # Wait for search index to be ready (building in background on first run)
+    if not app_ctx.search_engine.ready:
+        logger.info("Search index still building, waiting...")
+        ready = app_ctx.search_engine.wait_until_ready(timeout=900)
+        if not ready:
+            logger.warning("Search index not ready after timeout — returning empty results")
+            return SearchResults(query=query, results=[], total=0)
+        if app_ctx.search_engine._build_error:
+            logger.warning(f"Search index build failed: {app_ctx.search_engine._build_error}")
+            return SearchResults(query=query, results=[], total=0)
+
     # Handle FieldInfo objects when function called directly (not through FastMCP framework)
     # This supports both MCP tool invocation and direct test calls
     from pydantic.fields import FieldInfo
@@ -273,7 +296,7 @@ def search_help(
     if isinstance(category, FieldInfo):
         category = category.default
 
-    # Perform search (returns breadcrumb_path directly from FTS5 index)
+    # Perform search (returns breadcrumb_path directly from LanceDB index)
     results = app_ctx.search_engine.search(
         query=query, limit=limit, search_in_content=content_search, category=category
     )

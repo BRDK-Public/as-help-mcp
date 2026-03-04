@@ -19,6 +19,7 @@ WORKDIR /app
 # Install runtime dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
+    libgomp1 \
     libsqlite3-0 \
     libxml2 \
     libxslt1.1 && \
@@ -46,8 +47,8 @@ RUN mkdir -p /data/help /data/db
 # Expose port for SSE mode (optional)
 EXPOSE 8000
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+# Health check (start-period allows for first-run model download + index build)
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
     CMD python -c "import sys; sys.path.insert(0, '/app/src'); from server import mcp; print('OK')" || exit 1
 
 # Run the MCP server

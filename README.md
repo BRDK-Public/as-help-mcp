@@ -1,10 +1,11 @@
 # AS Help MCP Server
 
-MCP server for B&R Automation Studio help documentation search. Provides full-text search across all help pages using SQLite FTS5 with BM25 ranking.
+MCP server for B&R Automation Studio help documentation search. Provides hybrid semantic + keyword search using LanceDB with Reciprocal Rank Fusion (RRF).
 
 ## Features
 
-- Full-text search with BM25 ranking 
+- Hybrid search combining vector similarity and keyword matching via RRF
+- Local sentence-transformer embeddings (no API keys needed)
 - Category filtering and hierarchical browsing
 - Auto-generated links to B&R online help (AS4/AS6)
 - HelpID lookup for context-sensitive help integration
@@ -64,7 +65,7 @@ Update the volume path to match your AS installation:
         "--help-root",
         "C:\\Program Files (x86)\\BRAutomation\\AS6\\Help-en\\Data",
         "--db-path",
-        "..\\data\\as6\\.ashelp\\search.db",
+        "..\\data\\as6\\.ashelp_lance",
         "--metadata-dir",
         "..\\data\\as6\\.ashelp_metadata",
         "--as-version",
@@ -81,7 +82,7 @@ Update `--directory` to point to your cloned repository and adjust paths as need
 
 Restart VS Code, then test in Copilot Chat: *"Search AS help for mapp Motion"*
 
-**First run takes 5-10 minutes** to build the search index. Subsequent starts are instant.
+**First run takes 10-15 minutes** to build the search index (includes downloading the embedding model ~22MB and generating embeddings). Subsequent starts are instant.
 
 ---
 
@@ -96,10 +97,10 @@ cd as-help
 uv sync --extra test --extra dev
 
 # Run server with command line arguments (precedence over .env)
-uv run as-help-server --help-root "C:\BRAutomation\AS412\Help-en\Data" --db-path "data\.ashelp\search.db" --metadata-dir "data\.ashelp_metadata"
+uv run as-help-server --help-root "C:\BRAutomation\AS412\Help-en\Data" --db-path "data\.ashelp_lance" --metadata-dir "data\.ashelp_metadata"
 
 # Or use relative paths (automatically resolved)
-uv run as-help-server --db-path ./data/ashelp.db --metadata-dir ./data
+uv run as-help-server --db-path ./data/lance_index --metadata-dir ./data
 ```
 
 ### Option 2: Environment Variables (.env)
@@ -118,7 +119,7 @@ Run `uv run as-help-server --help` for full details.
 | Argument | Env Var Equivalent | Description |
 |----------|--------------------|-------------|
 | `--help-root` | `AS_HELP_ROOT` | Path to AS Help Data folder |
-| `--db-path` | `AS_HELP_DB_PATH` | Path to the SQLite database file |
+| `--db-path` | `AS_HELP_DB_PATH` | Path to the LanceDB directory |
 | `--metadata-dir` | `AS_HELP_METADATA_DIR` | Path to the indexing metadata directory |
 | `--as-version` | `AS_HELP_VERSION` | AS version for online help (`4` or `6`) |
 | `--force-rebuild` | `AS_HELP_FORCE_REBUILD` | Force a full index rebuild |
@@ -167,7 +168,7 @@ The server supports configuration via both environment variables and command-lin
 | `--help-root` | `AS_HELP_ROOT` | `/data/help` | Path to AS Help Data folder |
 | `--as-version` | `AS_HELP_VERSION` | `4` | AS version for online help (`4` or `6`) |
 | `--force-rebuild` | `AS_HELP_FORCE_REBUILD` | `false` | Force index rebuild |
-| `--db-path` | `AS_HELP_DB_PATH` | `{root}/.ashelp_search.db` | Database location |
+| `--db-path` | `AS_HELP_DB_PATH` | `{root}/.ashelp_lance` | LanceDB directory |
 | `--metadata-dir` | `AS_HELP_METADATA_DIR` | `{root}/.ashelp_metadata` | Metadata directory |
 
 ---
@@ -176,7 +177,7 @@ The server supports configuration via both environment variables and command-lin
 
 | Tool | Description |
 |------|-------------|
-| `search_help` | Full-text search with BM25 ranking and optional category filter |
+| `search_help` | Hybrid semantic + keyword search with RRF ranking and optional category filter |
 | `get_categories` | List top-level categories for filtering |
 | `browse_section` | Navigate help tree hierarchically |
 | `get_page_by_id` | Get full page content |

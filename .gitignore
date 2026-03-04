@@ -33,6 +33,7 @@ help_index/
 *.db-shm
 *.db-wal
 .ashelp_search.db
+.ashelp_lance/
 .ashelp_metadata/
 mcp_startup.log
 

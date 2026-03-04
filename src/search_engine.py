@@ -1,56 +1,112 @@
-"""SQLite FTS5 search engine with persistent indexing."""
+"""LanceDB hybrid search engine with RRF (Reciprocal Rank Fusion).
 
+Combines three search signals for superior relevance:
+1. Title vector similarity (semantic title match)
+2. Content vector similarity (semantic content match)
+3. Full-text keyword search (weight 1.5x)
+Results are fused using Reciprocal Rank Fusion (RRF).
+"""
+
+import json
 import logging
 import os
-import sqlite3
+import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import lancedb
+import pyarrow as pa
+
+from src.embeddings import EmbeddingService
 from src.indexer import HelpContentIndexer
 
 logger = logging.getLogger(__name__)
 
+# Standard RRF constant (from the original RRF paper)
+RRF_K = 60
+
+# RRF weights for each search signal
+WEIGHT_TITLE_VECTOR = 2.0
+WEIGHT_CONTENT_VECTOR = 1.0
+WEIGHT_FTS_KEYWORD = 1.5
+
 
 class HelpSearchEngine:
-    """Full-text search engine using SQLite FTS5."""
+    """Hybrid search engine using LanceDB with RRF fusion.
 
-    def __init__(self, db_path: Path, indexer: HelpContentIndexer, force_rebuild: bool = False):
+    Combines title vector search, content vector search, and full-text keyword
+    search via Reciprocal Rank Fusion for best-of-both-worlds relevance.
+    """
+
+    TABLE_NAME = "help_pages"
+
+    def __init__(
+        self,
+        db_path: Path,
+        indexer: HelpContentIndexer,
+        force_rebuild: bool = False,
+        embedding_service: EmbeddingService | None = None,
+    ):
         """Initialize search engine.
 
         Args:
-            db_path: Path to SQLite database file
+            db_path: Path to LanceDB directory
             indexer: HelpContentIndexer for accessing help data
             force_rebuild: Force rebuild even if valid index exists
+            embedding_service: Optional EmbeddingService instance (created internally if not provided)
         """
         self.db_path = Path(db_path)
         self.indexer = indexer
+        self.embedder = embedding_service or EmbeddingService()
+        self._ready = threading.Event()
+        self._build_error: Exception | None = None
 
-        # Ensure parent directory exists
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        # Ensure directory exists
+        self.db_path.mkdir(parents=True, exist_ok=True)
 
-        # Connect to database with thread safety for async MCP handlers
-        # check_same_thread=False is safe because we don't use multiple concurrent writers
-        # timeout=30 allows waiting for locks (important for Docker/volume mounts)
-        self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=30)
-        self.conn.row_factory = sqlite3.Row  # Enable column access by name
+        # Connect to LanceDB (directory-based, lightweight)
+        self.db = lancedb.connect(str(self.db_path))
 
-        # Enable WAL mode for better concurrent access on volume mounts
-        try:
-            self.conn.execute("PRAGMA journal_mode=WAL")
-            logger.info("SQLite WAL mode enabled for better concurrent access")
-        except Exception as e:  # pragma: no cover
-            logger.warning(f"Could not enable WAL mode: {e} (continuing with default journal)")  # pragma: no cover
+        # Metadata sidecar file for change detection
+        self._metadata_path = self.db_path / "_index_metadata.json"
 
         # Determine if we need to build the index
-        needs_build = force_rebuild or not self._index_exists() or self._needs_reindex()
+        self._needs_build = force_rebuild or not self._index_exists() or self._needs_reindex()
 
-        if needs_build:
-            logger.info("Building new search index...")
-            self._build_index()
-        else:
-            logger.info("Loading existing search index...")
-            self._load_index()
+    def initialize(self):
+        """Build or load the search index (may be slow on first run).
+
+        Call this after construction. Can be run in a background thread to
+        avoid blocking the MCP server startup.
+
+        Returns:
+            self, for convenience chaining in tests.
+        """
+        try:
+            if self._needs_build:
+                logger.info("Building new search index...")
+                self._build_index()
+            else:
+                logger.info("Loading existing search index...")
+                self._load_index()
+        except Exception as e:
+            self._build_error = e
+            logger.error(f"Search index initialization failed: {e}")
+            raise
+        finally:
+            self._ready.set()
+        return self
+
+    @property
+    def ready(self) -> bool:
+        """Whether the search index is ready for queries."""
+        return self._ready.is_set()
+
+    def wait_until_ready(self, timeout: float | None = None) -> bool:
+        """Block until the index is ready. Returns True if ready, False on timeout."""
+        return self._ready.wait(timeout=timeout)
 
     def __enter__(self):
         return self
@@ -60,74 +116,44 @@ class HelpSearchEngine:
         return False
 
     def _index_exists(self) -> bool:
-        """Check if FTS5 table exists and has data."""
-        cursor = self.conn.execute("""
-            SELECT name FROM sqlite_master
-            WHERE type='table' AND name='help_fts'
-        """)
-        if not cursor.fetchone():
+        """Check if LanceDB table exists and has data."""
+        try:
+            if self.TABLE_NAME not in self.db.list_tables().tables:
+                return False
+            table = self.db.open_table(self.TABLE_NAME)
+            if table.count_rows() == 0:
+                logger.info("LanceDB table exists but is empty - will rebuild")
+                return False
+            return True
+        except Exception:
             return False
 
-        # Also check if the table actually has data
-        cursor = self.conn.execute("SELECT COUNT(*) FROM help_fts")
-        count = cursor.fetchone()[0]
-        if count == 0:
-            logger.info("FTS5 table exists but is empty - will rebuild")  # pragma: no cover
-            return False  # pragma: no cover
-
-        return True
-
     def _needs_reindex(self) -> bool:
-        """Check if XML has changed since last index."""
-        cursor = self.conn.execute("""
-            SELECT name FROM sqlite_master
-            WHERE type='table' AND name='index_metadata'
-        """)
-        if not cursor.fetchone():
-            return True  # pragma: no cover
-
-        cursor = self.conn.execute("SELECT xml_hash FROM index_metadata LIMIT 1")
-        row = cursor.fetchone()
-        if not row:
-            return True  # pragma: no cover
-
-        return str(row[0]) != self.indexer._get_xml_hash()
-
-    def _create_tables(self):
-        """Create FTS5 table and metadata table."""
-        # Create FTS5 virtual table for search
-        # Note: category is stored as UNINDEXED for exact-match filtering (faster than LIKE on file_path)
-        self.conn.execute("""
-            CREATE VIRTUAL TABLE IF NOT EXISTS help_fts USING fts5(
-                page_id UNINDEXED,
-                title,
-                content,
-                file_path UNINDEXED,
-                help_id UNINDEXED,
-                is_section UNINDEXED,
-                breadcrumb_path UNINDEXED,
-                category UNINDEXED,
-                tokenize='porter unicode61'
+        """Check if XML or embedding model has changed since last index."""
+        if not self._metadata_path.exists():
+            return True
+        try:
+            with open(self._metadata_path) as f:
+                metadata = json.load(f)
+            return (
+                metadata.get("xml_hash") != self.indexer._get_xml_hash()
+                or metadata.get("embedding_model") != self.embedder.model_name
             )
-        """)
+        except (json.JSONDecodeError, KeyError, OSError):
+            return True
 
-        # Create metadata table for tracking changes
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS index_metadata (
-                xml_hash TEXT PRIMARY KEY,
-                indexed_at REAL,
-                page_count INTEGER,
-                help_id_count INTEGER
-            )
-        """)
-
-        # Don't commit here - let caller control transaction
-
-    def _load_index(self):
-        """Load existing search index."""
-        cursor = self.conn.execute("SELECT COUNT(*) FROM help_fts")
-        doc_count = cursor.fetchone()[0]
-        logger.info(f"Loaded search index with {doc_count} documents")
+    def _save_metadata(self):
+        """Save index metadata to JSON sidecar file."""
+        metadata = {
+            "xml_hash": self.indexer._get_xml_hash(),
+            "indexed_at": time.time(),
+            "page_count": len(self.indexer.pages),
+            "help_id_count": len(self.indexer.help_id_map),
+            "embedding_model": self.embedder.model_name,
+            "embedding_dimension": self.embedder.dimension,
+        }
+        with open(self._metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2)
 
     def _extract_text_for_page(self, page_id: str, page) -> tuple:
         """Extract text for a single page (used for parallel processing).
@@ -166,326 +192,258 @@ class HelpSearchEngine:
         )
 
     def _build_index(self):
-        """Build search index from help content with parallel text extraction."""
+        """Build search index with embeddings and LanceDB storage."""
         start_time = time.time()
 
-        # Close any existing connection and remove lock files to ensure clean state
-        # This is critical on Docker volume mounts where file locks can persist
-        try:
-            if self.conn:
-                self.conn.close()
-                logger.info("Closed existing connection for clean rebuild")
-        except Exception as e:  # pragma: no cover
-            logger.warning(f"Error closing existing connection: {e}")  # pragma: no cover
-
-        # Remove lock/journal files that might be stale (esp. on volume mounts)
-        for lock_file in [f"{self.db_path}-wal", f"{self.db_path}-shm", f"{self.db_path}.lock"]:
-            try:
-                lock_path = Path(lock_file)
-                if lock_path.exists():
-                    lock_path.unlink()  # pragma: no cover
-                    logger.info(f"Removed stale lock file: {lock_file}")  # pragma: no cover
-            except Exception as e:  # pragma: no cover
-                logger.warning(f"Could not remove lock file {lock_file}: {e}")  # pragma: no cover
-
-        # Reconnect with fresh connection
-        self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=30)
-        self.conn.row_factory = sqlite3.Row
-
-        # Enable WAL mode if not already enabled
-        try:
-            self.conn.execute("PRAGMA journal_mode=WAL")
-        except Exception as e:  # pragma: no cover
-            logger.warning(f"Could not enable WAL mode: {e}")  # pragma: no cover
-
-        cursor = self.conn.cursor()
-        cursor.execute("PRAGMA synchronous = OFF")  # Disable sync during build
-        cursor.execute("PRAGMA journal_mode = MEMORY")  # Keep journal in memory
-        cursor.execute("PRAGMA cache_size = -64000")  # 64MB cache
-        cursor.execute("PRAGMA temp_store = MEMORY")  # Store temp tables in memory
-
-        # Drop existing tables
-        cursor.execute("DROP TABLE IF EXISTS help_fts")
-        cursor.execute("DROP TABLE IF EXISTS index_metadata")
-
-        # Create tables
-        self._create_tables()
-
-        # Start single transaction for entire index
-        cursor.execute("BEGIN TRANSACTION")
-
-        # Disable FTS5 automerge during bulk insert (prevents slowdown at ~25k pages)
-        cursor.execute("INSERT INTO help_fts(help_fts, rank) VALUES('automerge', 0)")
-        cursor.execute("INSERT INTO help_fts(help_fts, rank) VALUES('crisismerge', 16384)")
-
-        # Prepare batch insert
-        indexed_count = 0
-        batch_size = 1000  # Larger batches since we're in one transaction
-        batch = []
-
-        logger.info(f"Indexing {len(self.indexer.pages)} pages...")
-
-        # Use ThreadPoolExecutor for parallel I/O operations
-        max_workers = int(os.cpu_count() or 4)
-        logger.info(f"Extracting text content in parallel using {max_workers} CPUs (this may take 1-2 minutes)...")
-
-        # Process in chunks to avoid memory buildup and FTS5 segment merge delays
         all_pages = list(self.indexer.pages.items())
+        max_workers = int(os.cpu_count() or 4)
+        logger.info(f"Extracting text for {len(all_pages)} pages using {max_workers} workers...")
 
-        try:
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                # Use map() with chunksize for memory-efficient streaming of results
-                # This avoids holding all 10K futures in memory at once
-                extraction_results = executor.map(
-                    lambda item: self._extract_text_for_page(item[0], item[1]),
-                    all_pages,
-                    chunksize=min(100, max(1, max_workers * 2)),
-                )
-
-                chunk_start_time = time.time()
-                chunk_indexed_start = 0
-
-                # Process results as they complete (streaming)
-                for result in extraction_results:
-                    try:
-                        batch.append(result)
-                        indexed_count += 1
-
-                        # Insert batch when full (no commit, still in transaction)
-                        if len(batch) >= batch_size:
-                            cursor.executemany(
-                                """
-                                INSERT INTO help_fts (page_id, title, content, file_path, help_id, is_section, breadcrumb_path, category)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                            """,
-                                batch,
-                            )
-                            batch = []
-
-                            if indexed_count % 5000 == 0:
-                                elapsed = time.time() - start_time
-                                pages_per_sec = indexed_count / elapsed
-                                recent_elapsed = time.time() - chunk_start_time
-                                recent_rate = (
-                                    (indexed_count - chunk_indexed_start) / recent_elapsed if recent_elapsed > 0 else 0
-                                )
-                                eta = (len(self.indexer.pages) - indexed_count) / pages_per_sec
-                                logger.info(
-                                    f"Indexed {indexed_count}/{len(self.indexer.pages)} pages... "
-                                    f"(avg: {pages_per_sec:.0f} p/s, recent: {recent_rate:.0f} p/s, ETA: {eta:.0f}s)"
-                                )
-
-                    except Exception as e:  # pragma: no cover
-                        # result[0] is page_id from _extract_text_for_page
-                        page_id = (
-                            result[0] if isinstance(result, tuple) and len(result) > 0 else "unknown"
-                        )  # pragma: no cover
-                        logger.warning(f"Failed to extract text for page {page_id}: {e}")  # pragma: no cover
-                        # Add empty entry to maintain progress
-                        page = self.indexer.pages.get(page_id)  # pragma: no cover
-                        if page:  # pragma: no cover
-                            breadcrumb_path = self.indexer.get_breadcrumb_string(page_id)  # pragma: no cover
-                            breadcrumb = self.indexer.get_breadcrumb(page_id)  # pragma: no cover
-                            category = breadcrumb[0].text if breadcrumb else ""  # pragma: no cover
-                            batch.append(  # pragma: no cover
-                                (  # pragma: no cover
-                                    page_id,  # pragma: no cover
-                                    page.text,  # pragma: no cover
-                                    "",  # empty content on error
-                                    page.file_path,  # pragma: no cover
-                                    page.help_id or "",  # pragma: no cover
-                                    1 if page.is_section else 0,  # pragma: no cover
-                                    breadcrumb_path,  # pragma: no cover
-                                    category,  # pragma: no cover
-                                )  # pragma: no cover
-                            )  # pragma: no cover
-                            indexed_count += 1  # pragma: no cover
-
-            # Insert remaining batch
-            if batch:
-                cursor.executemany(
-                    """
-                    INSERT INTO help_fts (page_id, title, content, file_path, help_id, is_section, breadcrumb_path, category)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                    batch,
-                )
-
-            # Save metadata
-            cursor.execute(
-                """
-                INSERT INTO index_metadata (xml_hash, indexed_at, page_count, help_id_count)
-                VALUES (?, ?, ?, ?)
-            """,
-                (self.indexer._get_xml_hash(), time.time(), len(self.indexer.pages), len(self.indexer.help_id_map)),
+        # Parallel text extraction (reuses existing pattern)
+        records = []
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            extraction_results = executor.map(
+                lambda item: self._extract_text_for_page(item[0], item[1]),
+                all_pages,
+                chunksize=min(100, max(1, max_workers * 2)),
             )
+            for i, result in enumerate(extraction_results):
+                records.append(result)
+                if (i + 1) % 5000 == 0:
+                    elapsed = time.time() - start_time
+                    logger.info(f"Extracted text for {i + 1}/{len(all_pages)} pages ({elapsed:.1f}s)")
 
-            # Commit the single transaction
-            cursor.execute("COMMIT")
+        text_time = time.time()
+        logger.info(f"Text extraction complete in {text_time - start_time:.1f}s ({len(records)} pages)")
 
-            # Re-enable automerge and optimize the FTS5 index
-            logger.info("Optimizing FTS5 index...")
-            cursor.execute("INSERT INTO help_fts(help_fts, rank) VALUES('automerge', 8)")
-            cursor.execute("INSERT INTO help_fts(help_fts) VALUES('optimize')")
-            self.conn.commit()
+        # Batch embed titles
+        titles = [r[1] for r in records]
+        logger.info("Embedding titles...")
+        title_vectors = self.embedder.embed_batch(titles)
 
-            # Restore safe settings
-            cursor.execute("PRAGMA synchronous = FULL")
-            cursor.execute("PRAGMA journal_mode = DELETE")
+        # Batch embed content (use title as fallback for sections with no content)
+        contents = [r[2] for r in records]
+        content_texts = [c if c else t for c, t in zip(contents, titles)]
+        logger.info("Embedding content...")
+        content_vectors = self.embedder.embed_batch(content_texts)
 
-            elapsed = time.time() - start_time
-            logger.info(
-                f"Search index built successfully in {elapsed:.1f}s ({indexed_count} documents)"
-            )  # pragma: no cover
+        embed_time = time.time()
+        logger.info(f"Embedding complete in {embed_time - text_time:.1f}s")
 
-        except Exception as e:  # pragma: no cover
-            try:  # pragma: no cover
-                if cursor:  # pragma: no cover
-                    cursor.execute("ROLLBACK")  # pragma: no cover
-            except Exception as rollback_error:  # pragma: no cover
-                logger.warning(f"Rollback failed: {rollback_error}")  # pragma: no cover
-            logger.error(f"Index build failed, rolled back: {e}")
-            raise
+        # Build PyArrow table with schema
+        dim = self.embedder.dimension
+        # Combined text column for FTS (native LanceDB FTS indexes one column)
+        search_texts = [f"{r[1]} {r[2]}" for r in records]
+
+        schema = pa.schema([
+            pa.field("page_id", pa.utf8()),
+            pa.field("title", pa.utf8()),
+            pa.field("content", pa.utf8()),
+            pa.field("search_text", pa.utf8()),
+            pa.field("file_path", pa.utf8()),
+            pa.field("help_id", pa.utf8()),
+            pa.field("is_section", pa.int32()),
+            pa.field("breadcrumb_path", pa.utf8()),
+            pa.field("category", pa.utf8()),
+            pa.field("title_vector", pa.list_(pa.float32(), dim)),
+            pa.field("content_vector", pa.list_(pa.float32(), dim)),
+        ])
+
+        data = {
+            "page_id": [r[0] for r in records],
+            "title": [r[1] for r in records],
+            "content": [r[2] for r in records],
+            "search_text": search_texts,
+            "file_path": [r[3] for r in records],
+            "help_id": [r[4] for r in records],
+            "is_section": [r[5] for r in records],
+            "breadcrumb_path": [r[6] for r in records],
+            "category": [r[7] for r in records],
+            "title_vector": title_vectors,
+            "content_vector": content_vectors,
+        }
+
+        table_data = pa.table(data, schema=schema)
+
+        logger.info("Creating LanceDB table...")
+        table = self.db.create_table(self.TABLE_NAME, table_data, mode="overwrite")
+
+        # Create FTS index on combined search text (native FTS supports single column)
+        logger.info("Creating FTS index...")
+        table.create_fts_index("search_text", replace=True)
+
+        # Save metadata for change detection
+        self._save_metadata()
+
+        elapsed = time.time() - start_time
+        logger.info(f"Search index built successfully in {elapsed:.1f}s ({len(records)} documents)")
+
+    def _load_index(self):
+        """Load existing search index and log stats."""
+        table = self.db.open_table(self.TABLE_NAME)
+        doc_count = table.count_rows()
+        logger.info(f"Loaded search index with {doc_count} documents")
+
+    @staticmethod
+    def _build_category_filter(category: str | None) -> str | None:
+        """Build a safe SQL where clause for category filtering.
+
+        Sanitizes input to prevent SQL injection in LanceDB filter expressions.
+        """
+        if not category:
+            return None
+        # Strip characters that could be used for SQL injection
+        safe = re.sub(r"[^\w\s.-]", "", category)
+        return f"lower(category) = '{safe.lower()}'"
+
+    def _vector_search(self, table, query_vector: list[float], column_name: str, limit: int, where_clause: str | None) -> list[dict]:
+        """Run vector similarity search on a specific column."""
+        try:
+            builder = table.search(query_vector, vector_column_name=column_name)
+            if where_clause:
+                builder = builder.where(where_clause)
+            return builder.limit(limit).to_list()
+        except Exception as e:
+            logger.warning(f"Vector search on {column_name} failed: {e}")
+            return []
+
+    def _fts_search(self, table, query: str, limit: int, where_clause: str | None) -> list[dict]:
+        """Run full-text keyword search with query sanitization."""
+        # Sanitize query: remove FTS special characters
+        sanitized = query
+        for char in '"\'*:(){}^+[]-':
+            sanitized = sanitized.replace(char, " ")
+
+        fts_keywords = {"and", "or", "not", "near"}
+        terms = [t.strip() for t in sanitized.split() if len(t.strip()) >= 2 and t.strip().lower() not in fts_keywords]
+
+        if not terms:
+            return []
+
+        fts_query = " ".join(terms)
+        try:
+            builder = table.search(fts_query, query_type="fts")
+            if where_clause:
+                builder = builder.where(where_clause)
+            return builder.limit(limit).to_list()
+        except Exception as e:
+            logger.warning(f"FTS search failed for '{fts_query}': {e}")
+            return []
+
+    @staticmethod
+    def _generate_snippet(content: str, query: str) -> str | None:
+        """Generate a text snippet around the first matching term."""
+        if not content:
+            return None
+
+        # Parse search terms from query
+        sanitized = query
+        for char in '"\'*:(){}^+[]-':
+            sanitized = sanitized.replace(char, " ")
+        terms = [t for t in sanitized.split() if len(t) >= 2]
+
+        if terms:
+            lower_content = content.lower()
+            best_pos = len(content)
+            for term in terms:
+                pos = lower_content.find(term.lower())
+                if 0 <= pos < best_pos:
+                    best_pos = pos
+            if best_pos < len(content):
+                start = max(0, best_pos - 40)
+                end = min(len(content), best_pos + 120)
+                return ("..." if start > 0 else "") + content[start:end] + ("..." if end < len(content) else "")
+
+        return content[:160] + ("..." if len(content) > 160 else "")
 
     def search(
         self, query: str, limit: int = 20, search_in_content: bool = True, category: str | None = None
     ) -> list[dict]:
-        """Search for help pages.
+        """Search for help pages using hybrid search with RRF fusion.
 
         Args:
-            query: Search query
+            query: Search query (keywords or natural language)
             limit: Maximum number of results
             search_in_content: Search in content (True) or titles only (False)
-            category: Optional category filter (matches start of file_path)
+            category: Optional category filter (case-insensitive)
 
         Returns:
-            List of search results with page_id, title, file_path, help_id, is_section, score
+            List of search results with page_id, title, file_path, help_id,
+            is_section, breadcrumb_path, category, score, snippet
         """
         if not query.strip():
             return []
 
-        # Sanitize query: remove FTS5 special characters that could break syntax
-        # See: https://www.sqlite.org/fts5.html#full_text_query_syntax
-        sanitized = query.replace('"', " ").replace("'", " ").replace("*", " ")
-        sanitized = sanitized.replace(":", " ").replace("(", " ").replace(")", " ")
-        sanitized = sanitized.replace("{", " ").replace("}", " ").replace("-", " ")
-        sanitized = sanitized.replace("^", " ").replace("+", " ")  # Boost and NEAR operators
-        sanitized = sanitized.replace("[", " ").replace("]", " ")  # Bracket syntax
+        table = self.db.open_table(self.TABLE_NAME)
+        where_clause = self._build_category_filter(category)
 
-        # Split into terms and filter out short terms and FTS5 keywords
-        fts5_keywords = {"and", "or", "not", "near"}  # Case-insensitive FTS5 operators
-        terms = [t.strip() for t in sanitized.split() if len(t.strip()) >= 2 and t.strip().lower() not in fts5_keywords]
-        if not terms:
-            return []
+        # Embed query for vector search
+        query_vector = self.embedder.embed_text(query)
 
-        # Build enhanced query with prefix matching for partial words
-        # e.g., "motor speed" -> '"motor"* "speed"*' to match "motors", "speeding", etc.
-        enhanced_terms = [f'"{term}"*' for term in terms]
+        # Fetch extra results for RRF fusion (fusing 3 lists needs headroom)
+        fetch_limit = min(limit * 3, 100)
 
-        # Build FTS5 query
+        # --- Three search legs ---
+
+        # 1. Title vector search (weight: WEIGHT_TITLE_VECTOR)
+        title_results = self._vector_search(table, query_vector, "title_vector", fetch_limit, where_clause)
+
+        # 2. Content vector search (weight: WEIGHT_CONTENT_VECTOR)
+        content_results = []
         if search_in_content:
-            fts_query = " ".join(enhanced_terms)
-        else:
-            fts_query = f"title : {' '.join(enhanced_terms)}"
+            content_results = self._vector_search(table, query_vector, "content_vector", fetch_limit, where_clause)
 
-        try:
-            # Build SQL query
-            sql = """
-                SELECT
-                    page_id,
-                    title,
-                    file_path,
-                    help_id,
-                    is_section,
-                    breadcrumb_path,
-                    category,
-                    bm25(help_fts, 10.0, 1.0) as score,
-                    snippet(help_fts, 2, '>>>', '<<<', '...', 32) as snippet
-                FROM help_fts
-                WHERE help_fts MATCH ?
-            """
-            params = [fts_query]
+        # 3. FTS keyword search (weight: WEIGHT_FTS_KEYWORD)
+        fts_results = self._fts_search(table, query, fetch_limit, where_clause)
 
-            # Add category filter if provided
-            # Uses dedicated category column for efficient exact matching (vs LIKE on file_path)
-            if category:
-                # Case-insensitive comparison using LOWER()
-                sql += " AND LOWER(category) = LOWER(?)"
-                params.append(category)
+        # --- RRF Fusion ---
+        rrf_scores: dict[str, float] = {}
+        page_data: dict[str, dict] = {}
 
-            sql += """
-                ORDER BY bm25(help_fts, 10.0, 1.0)
-                LIMIT ?
-            """
-            params.append(str(limit))
+        for rank, row in enumerate(title_results):
+            pid = row["page_id"]
+            rrf_scores[pid] = rrf_scores.get(pid, 0.0) + WEIGHT_TITLE_VECTOR / (RRF_K + rank + 1)
+            if pid not in page_data:
+                page_data[pid] = row
 
-            # Execute query
-            cursor = self.conn.execute(sql, params)
+        for rank, row in enumerate(content_results):
+            pid = row["page_id"]
+            rrf_scores[pid] = rrf_scores.get(pid, 0.0) + WEIGHT_CONTENT_VECTOR / (RRF_K + rank + 1)
+            if pid not in page_data:
+                page_data[pid] = row
 
-            results = []
-            for row in cursor:
-                results.append(
-                    {
-                        "page_id": row["page_id"],
-                        "title": row["title"],
-                        "file_path": row["file_path"],
-                        "help_id": row["help_id"] if row["help_id"] else None,
-                        "is_section": bool(row["is_section"]),
-                        "breadcrumb_path": row["breadcrumb_path"] if row["breadcrumb_path"] else None,
-                        "category": row["category"] if row["category"] else None,
-                        "score": abs(float(row["score"])),  # BM25 returns negative
-                        "snippet": row["snippet"] if row["snippet"] else None,
-                    }
-                )
+        for rank, row in enumerate(fts_results):
+            pid = row["page_id"]
+            rrf_scores[pid] = rrf_scores.get(pid, 0.0) + WEIGHT_FTS_KEYWORD / (RRF_K + rank + 1)
+            if pid not in page_data:
+                page_data[pid] = row
 
-            logger.info(f"Search for '{query}' (cat={category}) returned {len(results)} results")  # pragma: no cover
-            return results  # pragma: no cover
+        # Sort by RRF score (higher is better) and take top results
+        sorted_ids = sorted(rrf_scores.keys(), key=lambda pid: rrf_scores[pid], reverse=True)[:limit]
 
-        except sqlite3.OperationalError as e:  # pragma: no cover
-            logger.error(f"Search error for query '{query}': {e}")  # pragma: no cover
-            # Fallback: try simple OR search if enhanced query fails
-            try:  # pragma: no cover
-                fallback_terms = " OR ".join([f'"{t}"' for t in terms])  # pragma: no cover
-                sql = """# pragma: no cover
-                    SELECT page_id, title, file_path, help_id, is_section, breadcrumb_path,
-                           category, bm25(help_fts, 10.0, 1.0) as score,
-                           snippet(help_fts, 2, '>>>', '<<<', '...', 32) as snippet
-                    FROM help_fts WHERE help_fts MATCH ?
-                """  # pragma: no cover
-                params = [fallback_terms]  # pragma: no cover
+        # Build result dicts
+        results = []
+        for pid in sorted_ids:
+            row = page_data[pid]
+            snippet = self._generate_snippet(row.get("content", ""), query)
+            results.append({
+                "page_id": pid,
+                "title": row.get("title", ""),
+                "file_path": row.get("file_path", ""),
+                "help_id": row.get("help_id") or None,
+                "is_section": bool(row.get("is_section", 0)),
+                "breadcrumb_path": row.get("breadcrumb_path") or None,
+                "category": row.get("category") or None,
+                "score": rrf_scores[pid],
+                "snippet": snippet,
+            })
 
-                if category:  # pragma: no cover
-                    sql += " AND LOWER(category) = LOWER(?)"  # pragma: no cover
-                    params.append(category)  # pragma: no cover
-
-                sql += " ORDER BY bm25(help_fts, 10.0, 1.0) LIMIT ?"  # pragma: no cover
-                params.append(str(limit))  # pragma: no cover
-
-                cursor = self.conn.execute(sql, params)  # pragma: no cover
-                results = [  # pragma: no cover
-                    {  # pragma: no cover
-                        "page_id": r["page_id"],  # pragma: no cover
-                        "title": r["title"],  # pragma: no cover
-                        "file_path": r["file_path"],  # pragma: no cover
-                        "help_id": r["help_id"] or None,  # pragma: no cover
-                        "is_section": bool(r["is_section"]),  # pragma: no cover
-                        "breadcrumb_path": r["breadcrumb_path"] or None,  # pragma: no cover
-                        "category": r["category"] or None,  # pragma: no cover
-                        "score": abs(float(r["score"])),  # pragma: no cover
-                        "snippet": r["snippet"] or None,  # pragma: no cover
-                    }  # pragma: no cover
-                    for r in cursor  # pragma: no cover
-                ]  # pragma: no cover
-                logger.info(f"Fallback search returned {len(results)} results")  # pragma: no cover
-                return results
-            except Exception as e2:
-                logger.error(f"Fallback search also failed: {e2}")
-                return []
+        logger.info(f"Search for '{query}' (cat={category}) returned {len(results)} results")
+        return results
 
     def close(self):
         """Close database connection."""
-        if self.conn:
-            self.conn.close()
+        self.db = None
 
     def __del__(self):
         """Cleanup on deletion."""

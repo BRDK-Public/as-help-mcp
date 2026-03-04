@@ -1,11 +1,50 @@
 """Shared test fixtures and utilities."""
 
+import hashlib
 import xml.etree.ElementTree as ET
 from unittest.mock import MagicMock
 
 import pytest
 
+from src.embeddings import EmbeddingService
 from src.indexer import HelpContentIndexer, HelpPage
+
+
+class MockEmbeddingService(EmbeddingService):
+    """Mock embedding service that returns deterministic vectors without loading a real model.
+
+    Uses MD5 hash of input text to generate reproducible vectors. Identical texts
+    produce identical vectors, while different texts produce different vectors.
+    Uses dimension=8 for fast tests.
+    """
+
+    def __init__(self, dimension: int = 8):
+        # Skip parent __init__ entirely — no model loading
+        self.model_name = "mock-model"
+        self._model = None
+        self._dimension = dimension
+
+    @property
+    def dimension(self) -> int:
+        return self._dimension
+
+    def embed_text(self, text: str) -> list[float]:
+        h = hashlib.md5(text.encode()).digest()
+        vector = [float(h[i % len(h)]) / 255.0 for i in range(self._dimension)]
+        # Normalize to unit vector for cosine similarity
+        norm = sum(v * v for v in vector) ** 0.5
+        if norm > 0:
+            vector = [v / norm for v in vector]
+        return vector
+
+    def embed_batch(self, texts: list[str], batch_size: int = 256) -> list[list[float]]:
+        return [self.embed_text(t) for t in texts]
+
+
+@pytest.fixture
+def mock_embedding_service():
+    """Provide a MockEmbeddingService instance for tests."""
+    return MockEmbeddingService()
 
 
 @pytest.fixture

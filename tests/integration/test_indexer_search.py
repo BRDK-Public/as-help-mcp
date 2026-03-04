@@ -10,15 +10,16 @@ class TestIndexerSearchEngineIntegration:
     """Integration tests for indexer and search engine working together."""
 
     @pytest.fixture
-    def integrated_system(self, temp_help_dir, sample_xml, tmp_path):
+    def integrated_system(self, temp_help_dir, sample_xml, tmp_path, mock_embedding_service):
         """Create fully integrated indexer + search engine."""
         # Initialize and parse
         indexer = HelpContentIndexer(temp_help_dir)
         indexer.parse_xml_structure()
 
         # Build search index
-        db_path = tmp_path / "test_integration.db"
-        search_engine = HelpSearchEngine(db_path, indexer, force_rebuild=True)
+        db_path = tmp_path / "test_integration_lance"
+        search_engine = HelpSearchEngine(db_path, indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        search_engine.initialize()
 
         yield indexer, search_engine
 
@@ -78,14 +79,15 @@ class TestIndexerSearchEngineIntegration:
         assert result is not None
         assert result["help_id"] == "12345"
 
-    def test_reindex_detection_after_xml_change(self, temp_help_dir, sample_xml, tmp_path):
+    def test_reindex_detection_after_xml_change(self, temp_help_dir, sample_xml, tmp_path, mock_embedding_service):
         """Verify both indexer and search engine detect XML changes."""
         # Initial indexing
         indexer1 = HelpContentIndexer(temp_help_dir)
         indexer1.parse_xml_structure()
 
-        db_path = tmp_path / "test_reindex.db"
-        search_engine1 = HelpSearchEngine(db_path, indexer1, force_rebuild=True)
+        db_path = tmp_path / "test_reindex_lance"
+        search_engine1 = HelpSearchEngine(db_path, indexer1, force_rebuild=True, embedding_service=mock_embedding_service)
+        search_engine1.initialize()
         search_engine1.close()
 
         # Check indexer detects no change
@@ -105,7 +107,8 @@ class TestIndexerSearchEngineIntegration:
         indexer3.parse_xml_structure()
 
         # Search engine should also detect change
-        search_engine3 = HelpSearchEngine(db_path, indexer3, force_rebuild=False)
+        search_engine3 = HelpSearchEngine(db_path, indexer3, force_rebuild=False, embedding_service=mock_embedding_service)
+        search_engine3.initialize()
         # Would rebuild if hash mismatch detected
         search_engine3.close()
 
@@ -114,15 +117,16 @@ class TestMCPToolIntegration:
     """Integration tests for MCP tools using real indexer/search engine."""
 
     @pytest.fixture
-    def app_context(self, temp_help_dir, sample_xml, tmp_path):
+    def app_context(self, temp_help_dir, sample_xml, tmp_path, mock_embedding_service):
         """Create app context with real components."""
         from src.server import AppContext
 
         indexer = HelpContentIndexer(temp_help_dir)
         indexer.parse_xml_structure()
 
-        db_path = tmp_path / "test_mcp.db"
-        search_engine = HelpSearchEngine(db_path, indexer, force_rebuild=True)
+        db_path = tmp_path / "test_mcp_lance"
+        search_engine = HelpSearchEngine(db_path, indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        search_engine.initialize()
 
         context = AppContext(
             indexer=indexer,
@@ -213,6 +217,7 @@ class TestSearchAccuracy:
 
         db_path = tmp_path / "test_accuracy.db"
         search_engine = HelpSearchEngine(db_path, indexer, force_rebuild=True)
+        search_engine.initialize()
 
         yield indexer, search_engine
 
@@ -264,6 +269,7 @@ class TestBreadcrumbConsistency:
 
         db_path = tmp_path / "test_breadcrumb.db"
         search_engine = HelpSearchEngine(db_path, indexer, force_rebuild=True)
+        search_engine.initialize()
 
         yield indexer, search_engine
 
@@ -298,6 +304,7 @@ class TestPerformance:
 
         db_path = tmp_path / "test_perf.db"
         search_engine = HelpSearchEngine(db_path, indexer, force_rebuild=True)
+        search_engine.initialize()
 
         yield indexer, search_engine
 

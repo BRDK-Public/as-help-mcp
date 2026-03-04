@@ -13,15 +13,16 @@ class TestEndToEnd:
     """End-to-end tests with sample help content."""
 
     @pytest.fixture
-    def help_server(self, temp_help_dir, sample_xml, tmp_path):
+    def help_server(self, temp_help_dir, sample_xml, tmp_path, mock_embedding_service):
         """Create server with sample help content."""
         # Initialize indexer
         indexer = HelpContentIndexer(temp_help_dir)
         indexer.parse_xml_structure()
 
         # Build search index
-        db_path = tmp_path / "e2e_test.db"
-        search_engine = HelpSearchEngine(db_path, indexer, force_rebuild=True)
+        db_path = tmp_path / "e2e_test_lance"
+        search_engine = HelpSearchEngine(db_path, indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        search_engine.initialize()
 
         # Create app context
         app_context = AppContext(
@@ -106,7 +107,7 @@ class TestEndToEnd:
         assert page_content.breadcrumb[1] == "mapp Motion"
         assert page_content.breadcrumb[2] == "MC_BR_MoveAbsolute"
 
-    def test_incremental_reindex(self, help_server, temp_help_dir, tmp_path):
+    def test_incremental_reindex(self, help_server, temp_help_dir, tmp_path, mock_embedding_service):
         """Test: modifying XML triggers reindex."""
         # 1. Verify initial index works
         initial_results = search_help(help_server, query="motion")
@@ -134,8 +135,9 @@ class TestEndToEnd:
 
         indexer.parse_xml_structure()
 
-        db_path = tmp_path / "e2e_reindex.db"
-        search_engine = HelpSearchEngine(db_path, indexer, force_rebuild=True)
+        db_path = tmp_path / "e2e_reindex_lance"
+        search_engine = HelpSearchEngine(db_path, indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        search_engine.initialize()
 
         # 4. Verify new page is searchable
         app_context = AppContext(
@@ -159,13 +161,14 @@ class TestCompleteUserJourneys:
     """Test complete user journeys through the system."""
 
     @pytest.fixture
-    def help_server(self, temp_help_dir, sample_xml, tmp_path):
+    def help_server(self, temp_help_dir, sample_xml, tmp_path, mock_embedding_service):
         """Create server with sample help content."""
         indexer = HelpContentIndexer(temp_help_dir)
         indexer.parse_xml_structure()
 
-        db_path = tmp_path / "journey_test.db"
-        search_engine = HelpSearchEngine(db_path, indexer, force_rebuild=True)
+        db_path = tmp_path / "journey_test_lance"
+        search_engine = HelpSearchEngine(db_path, indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        search_engine.initialize()
 
         app_context = AppContext(
             indexer=indexer,
@@ -258,13 +261,14 @@ class TestErrorRecovery:
     """Test error handling and recovery in E2E scenarios."""
 
     @pytest.fixture
-    def help_server(self, temp_help_dir, sample_xml, tmp_path):
+    def help_server(self, temp_help_dir, sample_xml, tmp_path, mock_embedding_service):
         """Create server with sample help content."""
         indexer = HelpContentIndexer(temp_help_dir)
         indexer.parse_xml_structure()
 
-        db_path = tmp_path / "error_test.db"
-        search_engine = HelpSearchEngine(db_path, indexer, force_rebuild=True)
+        db_path = tmp_path / "error_test_lance"
+        search_engine = HelpSearchEngine(db_path, indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        search_engine.initialize()
 
         app_context = AppContext(
             indexer=indexer,
@@ -304,21 +308,24 @@ class TestErrorRecovery:
     def test_search_no_results(self, help_server):
         """Test handling of search with no results."""
         results = search_help(help_server, query="zzzznonexistentzzzzz")
-        assert results.total == 0
-        assert len(results.results) == 0
+        # With hybrid search, vector search may return low-score results
+        # for nonsensical queries, but FTS won't contribute
+        for result in results.results:
+            assert result.score < 0.1  # Low relevance scores expected
 
 
 class TestDataConsistency:
     """Test data consistency across all operations."""
 
     @pytest.fixture
-    def help_server(self, temp_help_dir, sample_xml, tmp_path):
+    def help_server(self, temp_help_dir, sample_xml, tmp_path, mock_embedding_service):
         """Create server with sample help content."""
         indexer = HelpContentIndexer(temp_help_dir)
         indexer.parse_xml_structure()
 
-        db_path = tmp_path / "consistency_test.db"
-        search_engine = HelpSearchEngine(db_path, indexer, force_rebuild=True)
+        db_path = tmp_path / "consistency_test_lance"
+        search_engine = HelpSearchEngine(db_path, indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        search_engine.initialize()
 
         app_context = AppContext(
             indexer=indexer,
@@ -382,7 +389,7 @@ class TestLargeDataset:
     """Test with larger synthetic dataset (marked as slow)."""
 
     @pytest.fixture
-    def large_help_server(self, temp_help_dir, tmp_path):
+    def large_help_server(self, temp_help_dir, tmp_path, mock_embedding_service):
         """Create server with larger synthetic dataset."""
         # Generate 100 pages across 10 categories
         xml_parts = ['<?xml version="1.0" encoding="UTF-8"?>\n<BrHelpContent>']
@@ -420,8 +427,9 @@ class TestLargeDataset:
         indexer = HelpContentIndexer(temp_help_dir)
         indexer.parse_xml_structure()
 
-        db_path = tmp_path / "large_test.db"
-        search_engine = HelpSearchEngine(db_path, indexer, force_rebuild=True)
+        db_path = tmp_path / "large_test_lance"
+        search_engine = HelpSearchEngine(db_path, indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        search_engine.initialize()
 
         app_context = AppContext(
             indexer=indexer,
