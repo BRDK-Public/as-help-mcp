@@ -138,71 +138,72 @@ class AppContext:
     online_help_base_url: str  # Base URL for online help links
 
 
+# Module-level singleton — initialized once, reused across all sessions
+_app_context = None
+
+
 @asynccontextmanager
 async def app_lifespan(server: FastMCP):
     """Manage application lifecycle - load and index help content on startup."""
+    global _app_context
 
-    # Get help root from environment (defaults to /data/help for Docker)
-    help_root = os.getenv("AS_HELP_ROOT", "/data/help")
-    help_root_path = Path(help_root).resolve()
+    if _app_context is None:
+        # Get help root from environment (defaults to /data/help for Docker)
+        help_root = os.getenv("AS_HELP_ROOT", "/data/help")
+        help_root_path = Path(help_root).resolve()
 
-    # Get database path for SQLite FTS5 index
-    # Default to /data/db for Docker volumes (not help root for read-only compatibility)
-    if help_root.startswith("/data/"):
-        default_db_path = "/data/db/.ashelp_search.db"
+        if help_root.startswith("/data/"):
+            default_db_path = "/data/db/.ashelp_search.db"
+        else:
+            default_db_path = str(help_root_path / ".ashelp_search.db")
+
+        db_path = Path(os.getenv("AS_HELP_DB_PATH", default_db_path)).resolve()
+        force_rebuild = os.getenv("AS_HELP_FORCE_REBUILD", "false").lower() == "true"
+
+        if help_root.startswith("/data/"):
+            default_metadata_dir = "/data/db/.ashelp_metadata"
+        else:
+            default_metadata_dir = str(help_root_path / ".ashelp_metadata")
+
+        metadata_dir = os.getenv("AS_HELP_METADATA_DIR", default_metadata_dir)
+        metadata_path = Path(metadata_dir).resolve()
+
+        as_version, online_help_base_url = get_as_version_config()
+
+        logger.info("=== B&R Help Server Startup ===")
+        logger.info(f"Help root: {help_root_path}")
+        logger.info(f"AS Version: {as_version}")
+        logger.info(f"Online help base: {online_help_base_url}")
+        logger.info(f"Database: {db_path}")
+        logger.info(f"Metadata dir: {metadata_path}")
+        logger.info(f"Force rebuild: {force_rebuild}")
+
+        logger.info("Initializing help indexer...")
+        indexer = HelpContentIndexer(help_root_path, metadata_dir=metadata_path)
+        indexer.parse_xml_structure()
+
+        categories = indexer.get_top_level_categories()
+        logger.info(f"Available top-level categories ({len(categories)}):")
+        for cat in categories:
+            logger.info(f"  - {cat['title']}")
+
+        logger.info("Initializing search engine...")
+        search_engine = HelpSearchEngine(db_path=db_path, indexer=indexer, force_rebuild=force_rebuild)
+
+        logger.info("=== Server ready ===")
+
+        _app_context = AppContext(
+            indexer=indexer,
+            search_engine=search_engine,
+            as_version=as_version,
+            online_help_base_url=online_help_base_url,
+        )
     else:
-        default_db_path = str(help_root_path / ".ashelp_search.db")
+        logger.info("=== Session reconnect (reusing cached context) ===")
 
-    db_path = Path(os.getenv("AS_HELP_DB_PATH", default_db_path)).resolve()
+    yield _app_context
 
-    # Check if force rebuild is requested
-    force_rebuild = os.getenv("AS_HELP_FORCE_REBUILD", "false").lower() == "true"
-
-    # Get metadata directory (separate from help root for read-only mounts)
-    # Default to /data/db for Docker volumes (not help root for read-only compatibility)
-    if help_root.startswith("/data/"):
-        default_metadata_dir = "/data/db/.ashelp_metadata"
-    else:
-        default_metadata_dir = str(help_root_path / ".ashelp_metadata")
-
-    metadata_dir = os.getenv("AS_HELP_METADATA_DIR", default_metadata_dir)
-    metadata_path = Path(metadata_dir).resolve()
-
-    # Get AS version from environment variable
-    as_version, online_help_base_url = get_as_version_config()
-
-    logger.info("=== B&R Help Server Startup ===")
-    logger.info(f"Help root: {help_root_path}")
-    logger.info(f"AS Version: {as_version}")
-    logger.info(f"Online help base: {online_help_base_url}")
-    logger.info(f"Database: {db_path}")
-    logger.info(f"Metadata dir: {metadata_path}")
-    logger.info(f"Force rebuild: {force_rebuild}")
-
-    # Initialize indexer (parses XML structure)
-    logger.info("Initializing help indexer...")
-    indexer = HelpContentIndexer(help_root_path, metadata_dir=metadata_path)
-    indexer.parse_xml_structure()
-
-    # Log available top-level categories
-    categories = indexer.get_top_level_categories()
-    logger.info(f"Available top-level categories ({len(categories)}):")
-    for cat in categories:
-        logger.info(f"  - {cat['title']}")
-
-    # Initialize search engine (builds or loads SQLite FTS5 index)
-    logger.info("Initializing search engine...")
-    search_engine = HelpSearchEngine(db_path=db_path, indexer=indexer, force_rebuild=force_rebuild)
-
-    logger.info("=== Server ready ===")
-
-    # Yield context to the application
-    context = AppContext(
-        indexer=indexer, search_engine=search_engine, as_version=as_version, online_help_base_url=online_help_base_url
-    )
-    yield context
-
-    logger.info("Shutting down help server")
+    logger.info("Session ended, resources kept alive for next connection")
 
 
 # Create FastMCP server with lifespan management
