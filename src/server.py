@@ -927,6 +927,8 @@ def main():
         help="AS version for online help (AS_HELP_VERSION). Default: 4",
     )
     parser.add_argument("--usage", action="store_true", help="Print usage examples and exit")
+    parser.add_argument("--http", action="store_true", help="Run as HTTP server (streamable-http transport) instead of stdio")
+    parser.add_argument("--port", type=int, default=3838, help="HTTP server port (default: 3838, only used with --http)")
 
     # Parse known args to allow them to be passed before or after FastMCP args
     args, _ = parser.parse_known_args()
@@ -942,9 +944,13 @@ def main():
     if args.as_version:
         os.environ["AS_HELP_VERSION"] = args.as_version
 
-    # Run with stdio transport by default (for local MCP clients like Claude Desktop)
-    # To run as HTTP server, use: mcp.run(transport="streamable-http")
-    mcp.run()
+    if args.http:
+        mcp.settings.port = args.port
+        logger.info(f"Starting HTTP server on 127.0.0.1:{args.port} (streamable-http transport)")
+        mcp.run(transport="streamable-http")
+    else:
+        # Run with stdio transport by default (for local MCP clients like Claude Desktop)
+        mcp.run()
 
 
 if __name__ == "__main__":
