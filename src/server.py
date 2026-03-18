@@ -4,10 +4,11 @@ This MCP server provides search and retrieval capabilities for B&R Automation St
 Optimized for thousands of help files with persistent indexing and fast startup.
 """
 
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -131,10 +132,11 @@ class SectionChildren(BaseModel):
 class AppContext:
     """Shared application context."""
 
-    indexer: HelpContentIndexer
-    search_engine: HelpSearchEngine
+    indexer: HelpContentIndexer | None
+    search_engine: HelpSearchEngine | None
     as_version: str  # '4', '6', or 'unknown'
     online_help_base_url: str  # Base URL for online help links
+    ready: asyncio.Event = field(default_factory=asyncio.Event)
 
 
 @asynccontextmanager
@@ -178,29 +180,46 @@ async def app_lifespan(server: FastMCP):
     logger.info(f"Metadata dir: {metadata_path}")
     logger.info(f"Force rebuild: {force_rebuild}")
 
-    # Initialize indexer (parses XML structure)
-    logger.info("Initializing help indexer...")
-    indexer = HelpContentIndexer(help_root_path, metadata_dir=metadata_path)
-    indexer.parse_xml_structure()
-
-    # Log available top-level categories
-    categories = indexer.get_top_level_categories()
-    logger.info(f"Available top-level categories ({len(categories)}):")
-    for cat in categories:
-        logger.info(f"  - {cat['title']}")
-
-    # Initialize search engine (builds or loads SQLite FTS5 index)
-    logger.info("Initializing search engine...")
-    search_engine = HelpSearchEngine(db_path=db_path, indexer=indexer, force_rebuild=force_rebuild)
-
-    logger.info("=== Server ready ===")
-
-    # Yield context to the application
+    # Create context with empty indexer/search_engine - will be populated in background
     context = AppContext(
-        indexer=indexer, search_engine=search_engine, as_version=as_version, online_help_base_url=online_help_base_url
+        indexer=None,
+        search_engine=None,
+        as_version=as_version,
+        online_help_base_url=online_help_base_url,
     )
+
+    async def _initialize():
+        """Run heavy initialization in a background thread so the server can accept connections immediately."""
+        def _blocking_init():
+            # Initialize indexer (parses XML structure)
+            logger.info("Initializing help indexer...")
+            indexer = HelpContentIndexer(help_root_path, metadata_dir=metadata_path)
+            indexer.parse_xml_structure()
+
+            # Log available top-level categories
+            categories = indexer.get_top_level_categories()
+            logger.info(f"Available top-level categories ({len(categories)}):")
+            for cat in categories:
+                logger.info(f"  - {cat['title']}")
+
+            # Initialize search engine (builds or loads SQLite FTS5 index)
+            logger.info("Initializing search engine...")
+            search_engine = HelpSearchEngine(db_path=db_path, indexer=indexer, force_rebuild=force_rebuild)
+            return indexer, search_engine
+
+        indexer, search_engine = await asyncio.to_thread(_blocking_init)
+        context.indexer = indexer
+        context.search_engine = search_engine
+        context.ready.set()
+        logger.info("=== Server ready ===")
+
+    init_task = asyncio.create_task(_initialize())
+
+    # Yield immediately so the server can respond to initialize/tools/list without waiting
     yield context
 
+    # Wait for background initialization to finish before shutting down
+    await init_task
     logger.info("Shutting down help server")
 
 
@@ -232,7 +251,7 @@ mcp = FastMCP(  # pragma: no cover
 
 
 @mcp.tool()
-def search_help(
+async def search_help(
     ctx: Context,
     query: str = Field(description="Search query (keywords or phrases). Try different keywords for better coverage."),
     limit: int = Field(
@@ -261,6 +280,7 @@ def search_help(
     You MUST call get_page_by_id to read actual content - previews are NOT enough.
     """
     app_ctx: AppContext = ctx.request_context.lifespan_context
+    await app_ctx.ready.wait()
 
     # Handle FieldInfo objects when function called directly (not through FastMCP framework)
     # This supports both MCP tool invocation and direct test calls
@@ -315,7 +335,7 @@ def search_help(
 
 
 @mcp.tool()
-def get_categories(ctx: Context) -> CategoriesResult:
+async def get_categories(ctx: Context) -> CategoriesResult:
     """Get all top-level categories from the help documentation.
 
     Returns the main navigation categories (e.g., Hardware, Motion, Safety, etc.).
@@ -327,6 +347,7 @@ def get_categories(ctx: Context) -> CategoriesResult:
     Each category can be explored further using browse_section(category_id).
     """
     app_ctx: AppContext = ctx.request_context.lifespan_context
+    await app_ctx.ready.wait()
 
     categories = app_ctx.indexer.get_top_level_categories()
 
@@ -338,7 +359,7 @@ def get_categories(ctx: Context) -> CategoriesResult:
 
 
 @mcp.tool()
-def browse_section(
+async def browse_section(
     ctx: Context,
     section_id: str = Field(
         description="ID of the section to browse (from get_categories or previous browse_section call)"
@@ -358,6 +379,7 @@ def browse_section(
     - Understanding the organization of a topic area
     """
     app_ctx: AppContext = ctx.request_context.lifespan_context
+    await app_ctx.ready.wait()
 
     # Get the parent section info
     parent = app_ctx.indexer.get_page_by_id(section_id)
@@ -377,7 +399,7 @@ def browse_section(
 
 
 @mcp.tool()
-def get_page_by_id(
+async def get_page_by_id(
     ctx: Context,
     page_id: str = Field(description="Page ID from search results. Call multiple times for different pages."),
     include_html: bool = Field(default=False, description="Include full HTML content (rarely needed)"),
@@ -394,6 +416,7 @@ def get_page_by_id(
     Don't hesitate to call this multiple times - reading 3-5 pages gives much better answers.
     """
     app_ctx: AppContext = ctx.request_context.lifespan_context
+    await app_ctx.ready.wait()
 
     page = app_ctx.indexer.get_page_by_id(page_id)
     if not page:
@@ -432,7 +455,7 @@ def get_page_by_id(
 
 
 @mcp.tool()
-def get_page_by_help_id(
+async def get_page_by_help_id(
     ctx: Context,
     help_id: str = Field(description="HelpID value (e.g., '3002099')"),
     include_html: bool = Field(default=False, description="Include full HTML content"),
@@ -448,6 +471,7 @@ def get_page_by_help_id(
     Breadcrumb is optional - use the dedicated get_breadcrumb tool for navigation.
     """
     app_ctx: AppContext = ctx.request_context.lifespan_context
+    await app_ctx.ready.wait()
 
     page = app_ctx.indexer.get_page_by_help_id(help_id)
     if not page:
@@ -503,6 +527,7 @@ async def get_breadcrumb(
     For most questions, the breadcrumb_path string in search results is sufficient.
     """
     app_ctx: AppContext = ctx.request_context.lifespan_context
+    await app_ctx.ready.wait()
 
     breadcrumb_pages = app_ctx.indexer.get_breadcrumb(page_id)
 
@@ -525,6 +550,7 @@ async def get_help_statistics(ctx: Context) -> dict[str, int]:
     Also includes parent-child relationship statistics.
     """
     app_ctx: AppContext = ctx.request_context.lifespan_context
+    await app_ctx.ready.wait()
 
     total_pages = len(app_ctx.indexer.pages)
     total_sections = sum(1 for p in app_ctx.indexer.pages.values() if p.is_section)
@@ -549,12 +575,13 @@ async def get_help_statistics(ctx: Context) -> dict[str, int]:
 
 # Resource for direct HTML file access
 @mcp.resource("help://page/{page_id}")
-def get_help_page_resource(page_id: str, ctx: Context) -> str:
+async def get_help_page_resource(page_id: str, ctx: Context) -> str:
     """Read the content of a specific help page.
 
     Returns the plain text content of the page.
     """
     app_ctx: AppContext = ctx.request_context.lifespan_context
+    await app_ctx.ready.wait()
 
     # Try to get plain text first (better for LLM)
     text = app_ctx.indexer.extract_plain_text(page_id)
@@ -570,12 +597,13 @@ def get_help_page_resource(page_id: str, ctx: Context) -> str:
 
 
 @mcp.resource("help://html/{page_id}")
-def get_page_html(page_id: str, ctx: Context) -> str:
+async def get_page_html(page_id: str, ctx: Context) -> str:
     """Get HTML content for a help page by its ID.
 
     Returns the raw HTML content from the help file.
     """
     app_ctx: AppContext = ctx.request_context.lifespan_context
+    await app_ctx.ready.wait()
 
     html_content = app_ctx.indexer.extract_html_content(page_id)
     if html_content:
