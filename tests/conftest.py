@@ -23,6 +23,11 @@ class MockEmbeddingService(EmbeddingService):
         self.model_name = "mock-model"
         self._model = None
         self._dimension = dimension
+        self._device = "cpu"
+
+    def _load_model(self):
+        """No-op for mock — model is never loaded."""
+        pass
 
     @property
     def dimension(self) -> int:
@@ -37,7 +42,7 @@ class MockEmbeddingService(EmbeddingService):
             vector = [v / norm for v in vector]
         return vector
 
-    def embed_batch(self, texts: list[str], batch_size: int = 64) -> list[list[float]]:
+    def embed_batch(self, texts: list[str], batch_size: int | None = None) -> list[list[float]]:
         return [self.embed_text(t) for t in texts]
 
 

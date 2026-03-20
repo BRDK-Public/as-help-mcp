@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -88,14 +89,22 @@ class HelpSearchEngine:
             self, for convenience chaining in tests.
         """
         try:
+            # Eagerly load embedding model so device/download info is visible
+            # before the slow text extraction phase.
+            if self._build_strategy in ("full", "incremental"):
+                self.embedder._load_model()
+
             if self._build_strategy == "full":
                 logger.info("Building new search index (full)...")
+                sys.stderr.flush()
                 self._build_index()
             elif self._build_strategy == "incremental":
                 logger.info("Performing incremental index update...")
+                sys.stderr.flush()
                 self._incremental_update()
             else:
                 logger.info("Loading existing search index...")
+                sys.stderr.flush()
                 self._load_index()
         except Exception as e:
             self._build_error = e
@@ -239,6 +248,7 @@ class HelpSearchEngine:
         all_pages = list(self.indexer.pages.items())
         max_workers = int(os.cpu_count() or 4)
         logger.info(f"Extracting text for {len(all_pages)} pages using {max_workers} workers...")
+        sys.stderr.flush()
 
         # Parallel text extraction (reuses existing pattern)
         records = []
@@ -253,9 +263,11 @@ class HelpSearchEngine:
                 if (i + 1) % 5000 == 0:
                     elapsed = time.time() - start_time
                     logger.info(f"Extracted text for {i + 1}/{len(all_pages)} pages ({elapsed:.1f}s)")
+                    sys.stderr.flush()
 
         text_time = time.time()
         logger.info(f"Text extraction complete in {text_time - start_time:.1f}s ({len(records)} pages)")
+        sys.stderr.flush()
 
         # Batch embed titles
         titles = [r[1] for r in records]

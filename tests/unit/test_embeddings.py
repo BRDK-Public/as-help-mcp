@@ -91,6 +91,7 @@ class TestEmbedBatch:
         mock_model.encode.return_value = np.zeros((3, 384))
         service._model = mock_model
         service._dimension = 384
+        service._device = "cpu"
         return service
 
     def test_embed_batch_empty_list(self, mock_service):
@@ -120,14 +121,15 @@ class TestEmbedBatch:
         mock_service._model.encode.assert_called_once()
         _, kwargs = mock_service._model.encode.call_args
         assert kwargs["batch_size"] == 32
-        assert kwargs["show_progress_bar"] is True
+        assert kwargs["show_progress_bar"] is False
 
 
 class TestLazyLoading:
     """Test lazy model loading behavior."""
 
+    @patch("torch.cuda.is_available", return_value=False)
     @patch("sentence_transformers.SentenceTransformer")
-    def test_dimension_triggers_load(self, mock_st_class):
+    def test_dimension_triggers_load(self, mock_st_class, _mock_cuda):
         """Verify accessing dimension triggers model load."""
         mock_model = MagicMock()
         mock_model.get_sentence_embedding_dimension.return_value = 384
@@ -138,10 +140,11 @@ class TestLazyLoading:
 
         dim = service.dimension
         assert dim == 384
-        mock_st_class.assert_called_once_with(DEFAULT_MODEL_NAME)
+        mock_st_class.assert_called_once_with(DEFAULT_MODEL_NAME, device="cpu")
 
+    @patch("torch.cuda.is_available", return_value=False)
     @patch("sentence_transformers.SentenceTransformer")
-    def test_model_loaded_once(self, mock_st_class):
+    def test_model_loaded_once(self, mock_st_class, _mock_cuda):
         """Verify model is only loaded once across multiple calls."""
         mock_model = MagicMock()
         mock_model.get_sentence_embedding_dimension.return_value = 384
