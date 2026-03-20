@@ -210,13 +210,13 @@ class TestSearchAccuracy:
     """Test search accuracy and ranking."""
 
     @pytest.fixture
-    def search_system(self, temp_help_dir, sample_xml, tmp_path):
+    def search_system(self, temp_help_dir, sample_xml, tmp_path, mock_embedding_service):
         """Create search system."""
         indexer = HelpContentIndexer(temp_help_dir)
         indexer.parse_xml_structure()
 
-        db_path = tmp_path / "test_accuracy.db"
-        search_engine = HelpSearchEngine(db_path, indexer, force_rebuild=True)
+        db_path = tmp_path / "test_accuracy_lance"
+        search_engine = HelpSearchEngine(db_path, indexer, force_rebuild=True, embedding_service=mock_embedding_service)
         search_engine.initialize()
 
         yield indexer, search_engine
@@ -262,13 +262,13 @@ class TestBreadcrumbConsistency:
     """Test breadcrumb consistency across components."""
 
     @pytest.fixture
-    def system(self, temp_help_dir, sample_xml, tmp_path):
+    def system(self, temp_help_dir, sample_xml, tmp_path, mock_embedding_service):
         """Create full system."""
         indexer = HelpContentIndexer(temp_help_dir)
         indexer.parse_xml_structure()
 
-        db_path = tmp_path / "test_breadcrumb.db"
-        search_engine = HelpSearchEngine(db_path, indexer, force_rebuild=True)
+        db_path = tmp_path / "test_breadcrumb_lance"
+        search_engine = HelpSearchEngine(db_path, indexer, force_rebuild=True, embedding_service=mock_embedding_service)
         search_engine.initialize()
 
         yield indexer, search_engine
@@ -297,13 +297,13 @@ class TestPerformance:
     """Test performance characteristics of integrated system."""
 
     @pytest.fixture
-    def system(self, temp_help_dir, sample_xml, tmp_path):
+    def system(self, temp_help_dir, sample_xml, tmp_path, mock_embedding_service):
         """Create system."""
         indexer = HelpContentIndexer(temp_help_dir)
         indexer.parse_xml_structure()
 
-        db_path = tmp_path / "test_perf.db"
-        search_engine = HelpSearchEngine(db_path, indexer, force_rebuild=True)
+        db_path = tmp_path / "test_perf_lance"
+        search_engine = HelpSearchEngine(db_path, indexer, force_rebuild=True, embedding_service=mock_embedding_service)
         search_engine.initialize()
 
         yield indexer, search_engine
