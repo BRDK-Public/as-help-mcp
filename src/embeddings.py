@@ -81,13 +81,35 @@ class EmbeddingService:
         max_chars = 2048
         truncated = [t[:max_chars] if len(t) > max_chars else t for t in texts]
 
-        logger.info(f"Embedding {len(truncated)} texts in batches of {batch_size}...")
+        total = len(truncated)
+        logger.info(f"Embedding {total} texts in batches of {batch_size}...")
         start = time.time()
-        embeddings = self._model.encode(  # type: ignore[union-attr]
-            truncated, batch_size=batch_size, show_progress_bar=False
-        )
-        elapsed = time.time() - start
-        rate = len(truncated) / elapsed if elapsed > 0 else 0
-        logger.info(f"Embedded {len(truncated)} texts in {elapsed:.1f}s ({rate:.0f} texts/s)")
 
-        return [e.tolist() for e in embeddings]
+        # Process in chunks so we can log progress between them.
+        # sentence-transformers' encode() only returns after processing the
+        # entire input, so we call it in manageable slices.
+        chunk_size = batch_size * 20  # ~5120 texts per progress update
+        all_embeddings: list[list[float]] = []
+
+        for offset in range(0, total, chunk_size):
+            chunk = truncated[offset : offset + chunk_size]
+            chunk_embeddings = self._model.encode(  # type: ignore[union-attr]
+                chunk, batch_size=batch_size, show_progress_bar=False
+            )
+            all_embeddings.extend(e.tolist() for e in chunk_embeddings)
+
+            done = min(offset + chunk_size, total)
+            elapsed = time.time() - start
+            rate = done / elapsed if elapsed > 0 else 0
+            if done < total:
+                eta = (total - done) / rate if rate > 0 else 0
+                logger.info(
+                    f"  Embedded {done}/{total} texts "
+                    f"({done * 100 // total}%, {rate:.0f} texts/s, ETA {eta:.0f}s)"
+                )
+
+        elapsed = time.time() - start
+        rate = total / elapsed if elapsed > 0 else 0
+        logger.info(f"Embedded {total} texts in {elapsed:.1f}s ({rate:.0f} texts/s)")
+
+        return all_embeddings

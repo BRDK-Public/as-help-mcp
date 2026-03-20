@@ -259,13 +259,13 @@ class HelpSearchEngine:
 
         # Batch embed titles
         titles = [r[1] for r in records]
-        logger.info("Embedding titles...")
+        logger.info(f"Embedding {len(titles)} titles...")
         title_vectors = self.embedder.embed_batch(titles)
 
         # Batch embed content (use title as fallback for sections with no content)
         contents = [r[2] for r in records]
         content_texts = [c if c else t for c, t in zip(contents, titles)]
-        logger.info("Embedding content...")
+        logger.info(f"Embedding {len(content_texts)} content texts...")
         content_vectors = self.embedder.embed_batch(content_texts)
 
         embed_time = time.time()
