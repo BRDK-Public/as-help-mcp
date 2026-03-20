@@ -202,7 +202,8 @@ async def app_lifespan(server: FastMCP):
 
     # Build/load the index in a background thread so the MCP server can respond
     # to initialize immediately. The search tool will wait for readiness.
-    asyncio.get_running_loop().run_in_executor(None, search_engine.initialize)
+    # Store the future so we can await it during shutdown for a clean exit.
+    init_future = asyncio.get_running_loop().run_in_executor(None, search_engine.initialize)
 
     logger.info("=== Server ready (search index loading in background) ===")
 
@@ -211,6 +212,16 @@ async def app_lifespan(server: FastMCP):
         indexer=indexer, search_engine=search_engine, as_version=as_version, online_help_base_url=online_help_base_url
     )
     yield context
+
+    # Wait for the background index thread to finish before exiting.
+    # Exceptions are already captured in search_engine._build_error, so suppress
+    # them here to avoid duplicate error reporting and asyncio warnings.
+    # Log at debug level so unexpected errors remain discoverable.
+    logger.info("Waiting for background index thread to complete...")
+    try:
+        await init_future
+    except Exception as exc:
+        logger.debug("Background index thread raised an exception during teardown: %s", exc)
 
     logger.info("Shutting down help server")
 
