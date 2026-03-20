@@ -120,6 +120,7 @@ class TestEmbedBatch:
         mock_service._model.encode.assert_called_once()
         _, kwargs = mock_service._model.encode.call_args
         assert kwargs["batch_size"] == 32
+        assert kwargs["show_progress_bar"] is True
 
 
 class TestLazyLoading:

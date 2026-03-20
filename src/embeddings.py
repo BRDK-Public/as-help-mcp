@@ -62,12 +62,13 @@ class EmbeddingService:
         embedding = self._model.encode(text, show_progress_bar=False)  # type: ignore[union-attr]
         return embedding.tolist()
 
-    def embed_batch(self, texts: list[str], batch_size: int = 256) -> list[list[float]]:
+    def embed_batch(self, texts: list[str], batch_size: int = 64) -> list[list[float]]:
         """Embed a batch of texts efficiently.
 
         Args:
             texts: List of texts to embed.
             batch_size: Batch size for encoding (adjust based on GPU/CPU memory).
+                        Default 64 is tuned for CPU; increase for GPU.
 
         Returns:
             List of embedding vectors, same order as input.
@@ -82,34 +83,17 @@ class EmbeddingService:
         truncated = [t[:max_chars] if len(t) > max_chars else t for t in texts]
 
         total = len(truncated)
-        logger.info(f"Embedding {total} texts in batches of {batch_size}...")
+        logger.info(f"Embedding {total} texts (batch_size={batch_size})...")
         start = time.time()
 
-        # Process in chunks so we can log progress between them.
-        # sentence-transformers' encode() only returns after processing the
-        # entire input, so we call it in manageable slices.
-        chunk_size = batch_size * 20  # ~5120 texts per progress update
-        all_embeddings: list[list[float]] = []
-
-        for offset in range(0, total, chunk_size):
-            chunk = truncated[offset : offset + chunk_size]
-            chunk_embeddings = self._model.encode(  # type: ignore[union-attr]
-                chunk, batch_size=batch_size, show_progress_bar=False
-            )
-            all_embeddings.extend(e.tolist() for e in chunk_embeddings)
-
-            done = min(offset + chunk_size, total)
-            elapsed = time.time() - start
-            rate = done / elapsed if elapsed > 0 else 0
-            if done < total:
-                eta = (total - done) / rate if rate > 0 else 0
-                logger.info(
-                    f"  Embedded {done}/{total} texts "
-                    f"({done * 100 // total}%, {rate:.0f} texts/s, ETA {eta:.0f}s)"
-                )
+        # show_progress_bar=True outputs tqdm to stderr, which is safe
+        # since MCP stdio transport uses stdout for JSON-RPC.
+        embeddings = self._model.encode(  # type: ignore[union-attr]
+            truncated, batch_size=batch_size, show_progress_bar=True
+        )
 
         elapsed = time.time() - start
         rate = total / elapsed if elapsed > 0 else 0
         logger.info(f"Embedded {total} texts in {elapsed:.1f}s ({rate:.0f} texts/s)")
 
-        return all_embeddings
+        return [e.tolist() for e in embeddings]

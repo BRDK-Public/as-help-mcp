@@ -37,7 +37,7 @@ class MockEmbeddingService(EmbeddingService):
             vector = [v / norm for v in vector]
         return vector
 
-    def embed_batch(self, texts: list[str], batch_size: int = 256) -> list[list[float]]:
+    def embed_batch(self, texts: list[str], batch_size: int = 64) -> list[list[float]]:
         return [self.embed_text(t) for t in texts]
 
 
