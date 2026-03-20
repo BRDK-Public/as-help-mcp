@@ -292,9 +292,6 @@ def search_help(
         if not ready:
             logger.warning("Search index not ready after timeout — returning empty results")
             return SearchResults(query=query, results=[], total=0)
-        if app_ctx.search_engine._build_error:
-            logger.warning(f"Search index build failed: {app_ctx.search_engine._build_error}")
-            return SearchResults(query=query, results=[], total=0)
 
     # Handle FieldInfo objects when function called directly (not through FastMCP framework)
     # This supports both MCP tool invocation and direct test calls
