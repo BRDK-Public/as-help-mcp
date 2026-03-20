@@ -125,13 +125,19 @@ See `_process_section()` and `_process_page()` in `indexer.py` for implementatio
 
 ### Index Rebuild Logic
 
-**Do NOT rebuild unnecessarily** - costs 1-2 minutes:
-1. Check metadata file exists (`_index_metadata.json` sidecar in LanceDB directory)
-2. Compare MD5 hash of current XML vs. stored hash
-3. Compare embedding model name vs. stored model
-4. Rebuild only if: `force_rebuild=True` OR hash mismatch OR model change OR no metadata
+**Three-tier strategy** — avoids unnecessary full rebuilds:
 
-See `needs_reindex()` in `indexer.py` and `_needs_reindex()` in `search_engine.py`.
+1. **No change** (most starts): XML hash matches + model unchanged → load index (<3s)
+2. **Incremental update** (AS service packs): XML hash changed, page fingerprints exist in metadata
+   - Diffs per-page fingerprints (`hash(title|file_path|parent_id|help_id|is_section)`)
+   - Deletes removed/changed rows from LanceDB, embeds & adds new/changed rows
+   - Falls back to full rebuild if >50% of pages changed
+   - Rebuilds FTS index after mutations
+3. **Full rebuild** (first run, model change, legacy metadata): Re-extracts, re-embeds, overwrites LanceDB table
+
+Per-page fingerprints are stored in `_index_metadata.json` alongside the XML hash and embedding model.
+
+See `_detect_build_strategy()` and `_incremental_update()` in `search_engine.py`.
 
 ### Content Extraction Strategy
 

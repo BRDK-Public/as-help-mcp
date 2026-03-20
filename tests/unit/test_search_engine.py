@@ -426,3 +426,314 @@ class TestSearchLimits:
 
         results = search_engine_with_data.search("motion", limit=5)
         assert len(results) <= 5
+
+
+class TestPageFingerprinting:
+    """Test page fingerprint generation."""
+
+    def test_fingerprints_cover_all_pages(self, initialized_indexer):
+        """Verify every page gets a fingerprint."""
+        fps = initialized_indexer.get_page_fingerprints()
+        assert set(fps.keys()) == set(initialized_indexer.pages.keys())
+
+    def test_fingerprints_are_deterministic(self, initialized_indexer):
+        """Verify same pages produce same fingerprints."""
+        fps1 = initialized_indexer.get_page_fingerprints()
+        fps2 = initialized_indexer.get_page_fingerprints()
+        assert fps1 == fps2
+
+    def test_fingerprint_changes_on_title_change(self, initialized_indexer):
+        """Verify fingerprint changes when page title changes."""
+        fps_before = initialized_indexer.get_page_fingerprints()
+        old_title = initialized_indexer.pages["x20di9371_page"].text
+        initialized_indexer.pages["x20di9371_page"].text = "New Title"
+        fps_after = initialized_indexer.get_page_fingerprints()
+        # Restore
+        initialized_indexer.pages["x20di9371_page"].text = old_title
+
+        assert fps_before["x20di9371_page"] != fps_after["x20di9371_page"]
+        # Other pages unchanged
+        assert fps_before["hardware_section"] == fps_after["hardware_section"]
+
+
+class TestBuildStrategyDetection:
+    """Test _detect_build_strategy logic."""
+
+    def test_full_rebuild_on_first_run(self, initialized_indexer, tmp_path, mock_embedding_service):
+        """Verify first run uses full build strategy."""
+        db_path = tmp_path / "new_lance"
+        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=False, embedding_service=mock_embedding_service)
+        assert engine._build_strategy == "full"
+
+    def test_none_when_unchanged(self, initialized_indexer, tmp_path, mock_embedding_service):
+        """Verify no rebuild when nothing changed."""
+        db_path = tmp_path / "test_lance"
+        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine.initialize()
+        engine.close()
+
+        engine2 = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=False, embedding_service=mock_embedding_service)
+        assert engine2._build_strategy == "none"
+
+    def test_incremental_when_xml_changed_with_fingerprints(self, initialized_indexer, tmp_path, mock_embedding_service):
+        """Verify incremental strategy when XML changed but fingerprints exist."""
+        db_path = tmp_path / "test_lance"
+        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine.initialize()
+        engine.close()
+
+        with patch.object(initialized_indexer, "_get_xml_hash", return_value="different_hash"):
+            engine2 = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=False, embedding_service=mock_embedding_service)
+            assert engine2._build_strategy == "incremental"
+
+    def test_full_when_model_changed(self, initialized_indexer, tmp_path, mock_embedding_service):
+        """Verify full rebuild when embedding model changes."""
+        db_path = tmp_path / "test_lance"
+        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine.initialize()
+        engine.close()
+
+        # Tamper with metadata to simulate model change
+        metadata_path = db_path / "_index_metadata.json"
+        with open(metadata_path) as f:
+            metadata = json.load(f)
+        metadata["embedding_model"] = "different-model"
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f)
+
+        engine2 = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=False, embedding_service=mock_embedding_service)
+        assert engine2._build_strategy == "full"
+
+    def test_full_when_no_fingerprints_stored(self, initialized_indexer, tmp_path, mock_embedding_service):
+        """Verify full rebuild when metadata has no fingerprints (legacy index)."""
+        db_path = tmp_path / "test_lance"
+        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine.initialize()
+        engine.close()
+
+        # Remove fingerprints from metadata to simulate legacy format
+        metadata_path = db_path / "_index_metadata.json"
+        with open(metadata_path) as f:
+            metadata = json.load(f)
+        metadata.pop("page_fingerprints", None)
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f)
+
+        with patch.object(initialized_indexer, "_get_xml_hash", return_value="different_hash"):
+            engine2 = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=False, embedding_service=mock_embedding_service)
+            assert engine2._build_strategy == "full"
+
+
+class TestIncrementalUpdate:
+    """Test incremental index update logic."""
+
+    def test_incremental_adds_new_page(self, temp_help_dir, tmp_path, mock_embedding_service):
+        """Verify incremental update adds a new page to the index."""
+        from src.indexer import HelpContentIndexer, HelpPage
+
+        # Build initial index
+        xml_content = """<?xml version="1.0" encoding="UTF-8"?>
+<BrHelpContent>
+    <Section Id="sec1" Text="Section" File="index.html">
+        <Page Id="page1" Text="Page One" File="hardware/x20di9371.html"/>
+    </Section>
+</BrHelpContent>"""
+        (temp_help_dir / "brhelpcontent.xml").write_text(xml_content, encoding="utf-8")
+
+        indexer = HelpContentIndexer(temp_help_dir)
+        indexer.parse_xml_structure()
+
+        db_path = tmp_path / "inc_lance"
+        engine = HelpSearchEngine(db_path, indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine.initialize()
+        engine.close()
+
+        # Add a new page to XML
+        xml_content2 = """<?xml version="1.0" encoding="UTF-8"?>
+<BrHelpContent>
+    <Section Id="sec1" Text="Section" File="index.html">
+        <Page Id="page1" Text="Page One" File="hardware/x20di9371.html"/>
+        <Page Id="page2" Text="Page Two" File="motion/overview.html"/>
+    </Section>
+</BrHelpContent>"""
+        (temp_help_dir / "brhelpcontent.xml").write_text(xml_content2, encoding="utf-8")
+
+        indexer2 = HelpContentIndexer(temp_help_dir)
+        indexer2.parse_xml_structure()
+
+        engine2 = HelpSearchEngine(db_path, indexer2, force_rebuild=False, embedding_service=mock_embedding_service)
+        assert engine2._build_strategy == "incremental"
+        engine2.initialize()
+
+        # Verify new page is searchable
+        table = engine2.db.open_table(engine2.TABLE_NAME)
+        assert table.count_rows() == 3  # sec1 + page1 + page2
+        engine2.close()
+
+    def test_incremental_removes_deleted_page(self, temp_help_dir, tmp_path, mock_embedding_service):
+        """Verify incremental update removes a deleted page from the index."""
+        from src.indexer import HelpContentIndexer
+
+        # Build with 2 pages
+        xml_content = """<?xml version="1.0" encoding="UTF-8"?>
+<BrHelpContent>
+    <Section Id="sec1" Text="Section" File="index.html">
+        <Page Id="page1" Text="Page One" File="hardware/x20di9371.html"/>
+        <Page Id="page2" Text="Page Two" File="motion/overview.html"/>
+    </Section>
+</BrHelpContent>"""
+        (temp_help_dir / "brhelpcontent.xml").write_text(xml_content, encoding="utf-8")
+
+        indexer = HelpContentIndexer(temp_help_dir)
+        indexer.parse_xml_structure()
+
+        db_path = tmp_path / "inc_lance"
+        engine = HelpSearchEngine(db_path, indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine.initialize()
+        engine.close()
+
+        # Remove page2 from XML
+        xml_content2 = """<?xml version="1.0" encoding="UTF-8"?>
+<BrHelpContent>
+    <Section Id="sec1" Text="Section" File="index.html">
+        <Page Id="page1" Text="Page One" File="hardware/x20di9371.html"/>
+    </Section>
+</BrHelpContent>"""
+        (temp_help_dir / "brhelpcontent.xml").write_text(xml_content2, encoding="utf-8")
+
+        indexer2 = HelpContentIndexer(temp_help_dir)
+        indexer2.parse_xml_structure()
+
+        engine2 = HelpSearchEngine(db_path, indexer2, force_rebuild=False, embedding_service=mock_embedding_service)
+        assert engine2._build_strategy == "incremental"
+        engine2.initialize()
+
+        table = engine2.db.open_table(engine2.TABLE_NAME)
+        assert table.count_rows() == 2  # sec1 + page1 (page2 removed)
+        engine2.close()
+
+    def test_incremental_updates_changed_page(self, temp_help_dir, tmp_path, mock_embedding_service):
+        """Verify incremental update re-indexes a page with changed title."""
+        from src.indexer import HelpContentIndexer
+
+        xml_content = """<?xml version="1.0" encoding="UTF-8"?>
+<BrHelpContent>
+    <Section Id="sec1" Text="Section" File="index.html">
+        <Page Id="page1" Text="Old Title" File="hardware/x20di9371.html"/>
+    </Section>
+</BrHelpContent>"""
+        (temp_help_dir / "brhelpcontent.xml").write_text(xml_content, encoding="utf-8")
+
+        indexer = HelpContentIndexer(temp_help_dir)
+        indexer.parse_xml_structure()
+
+        db_path = tmp_path / "inc_lance"
+        engine = HelpSearchEngine(db_path, indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine.initialize()
+        engine.close()
+
+        # Change page title
+        xml_content2 = """<?xml version="1.0" encoding="UTF-8"?>
+<BrHelpContent>
+    <Section Id="sec1" Text="Section" File="index.html">
+        <Page Id="page1" Text="New Title" File="hardware/x20di9371.html"/>
+    </Section>
+</BrHelpContent>"""
+        (temp_help_dir / "brhelpcontent.xml").write_text(xml_content2, encoding="utf-8")
+
+        indexer2 = HelpContentIndexer(temp_help_dir)
+        indexer2.parse_xml_structure()
+
+        engine2 = HelpSearchEngine(db_path, indexer2, force_rebuild=False, embedding_service=mock_embedding_service)
+        assert engine2._build_strategy == "incremental"
+        engine2.initialize()
+
+        # Verify updated title is in the index
+        table = engine2.db.open_table(engine2.TABLE_NAME)
+        rows = table.search().where("page_id = 'page1'").limit(1).to_list()
+        assert rows[0]["title"] == "New Title"
+        engine2.close()
+
+    def test_incremental_no_changes_is_noop(self, temp_help_dir, tmp_path, mock_embedding_service):
+        """Verify incremental update with same fingerprints is effectively a no-op."""
+        from src.indexer import HelpContentIndexer
+
+        xml_content = """<?xml version="1.0" encoding="UTF-8"?>
+<BrHelpContent>
+    <Section Id="sec1" Text="Section" File="index.html">
+        <Page Id="page1" Text="Page One" File="hardware/x20di9371.html"/>
+    </Section>
+</BrHelpContent>"""
+        (temp_help_dir / "brhelpcontent.xml").write_text(xml_content, encoding="utf-8")
+
+        indexer = HelpContentIndexer(temp_help_dir)
+        indexer.parse_xml_structure()
+
+        db_path = tmp_path / "inc_lance"
+        engine = HelpSearchEngine(db_path, indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine.initialize()
+        engine.close()
+
+        # Rewrite XML with same content but different whitespace → different MD5 but same fingerprints
+        xml_content2 = """<?xml version="1.0" encoding="UTF-8"?>
+<BrHelpContent>
+  <Section Id="sec1" Text="Section" File="index.html">
+    <Page Id="page1" Text="Page One" File="hardware/x20di9371.html"/>
+  </Section>
+</BrHelpContent>"""
+        (temp_help_dir / "brhelpcontent.xml").write_text(xml_content2, encoding="utf-8")
+
+        indexer2 = HelpContentIndexer(temp_help_dir)
+        indexer2.parse_xml_structure()
+
+        engine2 = HelpSearchEngine(db_path, indexer2, force_rebuild=False, embedding_service=mock_embedding_service)
+        assert engine2._build_strategy == "incremental"
+        engine2.initialize()
+
+        # Row count unchanged
+        table = engine2.db.open_table(engine2.TABLE_NAME)
+        assert table.count_rows() == 2  # sec1 + page1
+        engine2.close()
+
+    def test_incremental_falls_back_to_full_on_massive_change(self, temp_help_dir, tmp_path, mock_embedding_service):
+        """Verify >50% changed pages triggers full rebuild."""
+        from src.indexer import HelpContentIndexer
+
+        xml_content = """<?xml version="1.0" encoding="UTF-8"?>
+<BrHelpContent>
+    <Section Id="sec1" Text="Section" File="index.html">
+        <Page Id="page1" Text="Page One" File="hardware/x20di9371.html"/>
+        <Page Id="page2" Text="Page Two" File="motion/overview.html"/>
+    </Section>
+</BrHelpContent>"""
+        (temp_help_dir / "brhelpcontent.xml").write_text(xml_content, encoding="utf-8")
+
+        indexer = HelpContentIndexer(temp_help_dir)
+        indexer.parse_xml_structure()
+
+        db_path = tmp_path / "inc_lance"
+        engine = HelpSearchEngine(db_path, indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine.initialize()
+        engine.close()
+
+        # Replace all pages → >50% changed
+        xml_content2 = """<?xml version="1.0" encoding="UTF-8"?>
+<BrHelpContent>
+    <Section Id="sec_new" Text="New Section" File="index.html">
+        <Page Id="page_a" Text="Brand New A" File="hardware/x20di9371.html"/>
+        <Page Id="page_b" Text="Brand New B" File="motion/overview.html"/>
+    </Section>
+</BrHelpContent>"""
+        (temp_help_dir / "brhelpcontent.xml").write_text(xml_content2, encoding="utf-8")
+
+        indexer2 = HelpContentIndexer(temp_help_dir)
+        indexer2.parse_xml_structure()
+
+        engine2 = HelpSearchEngine(db_path, indexer2, force_rebuild=False, embedding_service=mock_embedding_service)
+        assert engine2._build_strategy == "incremental"
+        engine2.initialize()
+
+        # Should have done a full rebuild — verify all new pages present
+        table = engine2.db.open_table(engine2.TABLE_NAME)
+        assert table.count_rows() == 3  # sec_new + page_a + page_b
+        engine2.close()

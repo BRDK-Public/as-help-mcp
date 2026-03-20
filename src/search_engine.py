@@ -72,8 +72,11 @@ class HelpSearchEngine:
         # Metadata sidecar file for change detection
         self._metadata_path = self.db_path / "_index_metadata.json"
 
-        # Determine if we need to build the index
-        self._needs_build = force_rebuild or not self._index_exists() or self._needs_reindex()
+        # Determine build strategy: full, incremental, or none
+        if force_rebuild or not self._index_exists():
+            self._build_strategy = "full"
+        else:
+            self._build_strategy = self._detect_build_strategy()
 
     def initialize(self):
         """Build or load the search index (may be slow on first run).
@@ -85,9 +88,12 @@ class HelpSearchEngine:
             self, for convenience chaining in tests.
         """
         try:
-            if self._needs_build:
-                logger.info("Building new search index...")
+            if self._build_strategy == "full":
+                logger.info("Building new search index (full)...")
                 self._build_index()
+            elif self._build_strategy == "incremental":
+                logger.info("Performing incremental index update...")
+                self._incremental_update()
             else:
                 logger.info("Loading existing search index...")
                 self._load_index()
@@ -142,8 +148,42 @@ class HelpSearchEngine:
         except (json.JSONDecodeError, KeyError, OSError):
             return True
 
+    def _detect_build_strategy(self) -> str:
+        """Determine whether we need a full rebuild, incremental update, or nothing.
+
+        Returns:
+            "full" - No metadata, embedding model changed, or no stored fingerprints
+            "incremental" - XML changed but we have page fingerprints to diff against
+            "none" - Nothing changed
+        """
+        if not self._metadata_path.exists():
+            return "full"
+        try:
+            with open(self._metadata_path) as f:
+                metadata = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return "full"
+
+        # Embedding model change → must re-embed everything
+        if metadata.get("embedding_model") != self.embedder.model_name:
+            logger.info("Embedding model changed — full rebuild required")
+            return "full"
+
+        # XML unchanged → nothing to do
+        if metadata.get("xml_hash") == self.indexer._get_xml_hash():
+            return "none"
+
+        # XML changed — can we do incremental?
+        if metadata.get("page_fingerprints"):
+            logger.info("XML changed — incremental update possible")
+            return "incremental"
+
+        # XML changed but no stored fingerprints → full rebuild
+        logger.info("XML changed but no page fingerprints stored — full rebuild required")
+        return "full"
+
     def _save_metadata(self):
-        """Save index metadata to JSON sidecar file."""
+        """Save index metadata including per-page fingerprints to JSON sidecar file."""
         metadata = {
             "xml_hash": self.indexer._get_xml_hash(),
             "indexed_at": time.time(),
@@ -151,6 +191,7 @@ class HelpSearchEngine:
             "help_id_count": len(self.indexer.help_id_map),
             "embedding_model": self.embedder.model_name,
             "embedding_dimension": self.embedder.dimension,
+            "page_fingerprints": self.indexer.get_page_fingerprints(),
         }
         with open(self._metadata_path, "w") as f:
             json.dump(metadata, f, indent=2)
@@ -277,6 +318,141 @@ class HelpSearchEngine:
 
         elapsed = time.time() - start_time
         logger.info(f"Search index built successfully in {elapsed:.1f}s ({len(records)} documents)")
+
+    def _incremental_update(self):
+        """Incrementally update the index by diffing page fingerprints.
+
+        Compares stored per-page fingerprints against current ones to find
+        added, removed, and changed pages.  Only those pages are re-extracted,
+        re-embedded, and written to LanceDB.  The FTS index is rebuilt at the
+        end (required by LanceDB after row mutations).
+        """
+        start_time = time.time()
+
+        # Load old fingerprints from metadata
+        with open(self._metadata_path) as f:
+            metadata = json.load(f)
+        old_fps: dict[str, str] = metadata.get("page_fingerprints", {})
+
+        # Compute current fingerprints from the freshly-parsed XML
+        new_fps = self.indexer.get_page_fingerprints()
+
+        old_ids = set(old_fps.keys())
+        new_ids = set(new_fps.keys())
+
+        added = new_ids - old_ids
+        removed = old_ids - new_ids
+        changed = {pid for pid in (old_ids & new_ids) if old_fps[pid] != new_fps[pid]}
+
+        to_upsert = added | changed
+        to_delete = removed | changed  # delete old rows for changed pages, then re-add
+
+        logger.info(
+            f"Incremental diff: {len(added)} added, {len(removed)} removed, "
+            f"{len(changed)} changed, {len(new_ids) - len(to_upsert)} unchanged"
+        )
+
+        # If nothing changed (e.g. XML whitespace change), skip heavy work
+        if not to_upsert and not to_delete:
+            logger.info("No page-level changes detected — skipping update")
+            self._save_metadata()
+            return
+
+        # Fall back to full rebuild if >50% of pages changed (not worth incremental overhead)
+        if len(to_upsert) > len(new_ids) * 0.5:
+            logger.info(
+                f"Too many changes ({len(to_upsert)}/{len(new_ids)}) — falling back to full rebuild"
+            )
+            self._build_index()
+            return
+
+        table = self.db.open_table(self.TABLE_NAME)
+
+        # --- Delete removed and changed rows ---
+        if to_delete:
+            # Build safe filter: page_id IN ('id1', 'id2', ...)
+            # Process in batches to avoid oversized SQL expressions
+            delete_list = list(to_delete)
+            batch_size = 500
+            for i in range(0, len(delete_list), batch_size):
+                batch = delete_list[i : i + batch_size]
+                id_literals = ", ".join(f"'{pid}'" for pid in batch)
+                table.delete(f"page_id IN ({id_literals})")
+            logger.info(f"Deleted {len(to_delete)} rows from index")
+
+        # --- Extract text, embed, and insert new/changed pages ---
+        if to_upsert:
+            pages_to_index = [(pid, self.indexer.pages[pid]) for pid in to_upsert]
+            max_workers = int(os.cpu_count() or 4)
+
+            records = []
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                extraction_results = executor.map(
+                    lambda item: self._extract_text_for_page(item[0], item[1]),
+                    pages_to_index,
+                    chunksize=min(100, max(1, max_workers * 2)),
+                )
+                for result in extraction_results:
+                    records.append(result)
+
+            logger.info(f"Extracted text for {len(records)} pages")
+
+            # Embed
+            titles = [r[1] for r in records]
+            title_vectors = self.embedder.embed_batch(titles)
+
+            contents = [r[2] for r in records]
+            content_texts = [c if c else t for c, t in zip(contents, titles)]
+            content_vectors = self.embedder.embed_batch(content_texts)
+
+            # Build PyArrow table matching existing schema
+            dim = self.embedder.dimension
+            search_texts = [f"{r[1]} {r[2]}" for r in records]
+
+            data = {
+                "page_id": [r[0] for r in records],
+                "title": [r[1] for r in records],
+                "content": [r[2] for r in records],
+                "search_text": search_texts,
+                "file_path": [r[3] for r in records],
+                "help_id": [r[4] for r in records],
+                "is_section": [r[5] for r in records],
+                "breadcrumb_path": [r[6] for r in records],
+                "category": [r[7] for r in records],
+                "title_vector": title_vectors,
+                "content_vector": content_vectors,
+            }
+
+            schema = pa.schema([
+                pa.field("page_id", pa.utf8()),
+                pa.field("title", pa.utf8()),
+                pa.field("content", pa.utf8()),
+                pa.field("search_text", pa.utf8()),
+                pa.field("file_path", pa.utf8()),
+                pa.field("help_id", pa.utf8()),
+                pa.field("is_section", pa.int32()),
+                pa.field("breadcrumb_path", pa.utf8()),
+                pa.field("category", pa.utf8()),
+                pa.field("title_vector", pa.list_(pa.float32(), dim)),
+                pa.field("content_vector", pa.list_(pa.float32(), dim)),
+            ])
+
+            new_data = pa.table(data, schema=schema)
+            table.add(new_data)
+            logger.info(f"Added {len(records)} rows to index")
+
+        # Rebuild FTS index (required after row mutations)
+        logger.info("Rebuilding FTS index...")
+        table.create_fts_index("search_text", replace=True)
+
+        # Save updated metadata with new fingerprints
+        self._save_metadata()
+
+        elapsed = time.time() - start_time
+        logger.info(
+            f"Incremental update complete in {elapsed:.1f}s "
+            f"(+{len(added)} -{len(removed)} ~{len(changed)} pages)"
+        )
 
     def _load_index(self):
         """Load existing search index and log stats."""

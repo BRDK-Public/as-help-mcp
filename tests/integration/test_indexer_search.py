@@ -338,3 +338,95 @@ class TestPerformance:
 
         # Later searches shouldn't be slower
         assert times[-1] <= times[0] * 2  # Allow 2x tolerance
+
+
+class TestIncrementalUpdateIntegration:
+    """Integration tests for incremental index updates."""
+
+    def test_add_page_then_search(self, temp_help_dir, sample_xml, tmp_path, mock_embedding_service):
+        """Verify a page added via incremental update is searchable."""
+        indexer = HelpContentIndexer(temp_help_dir)
+        indexer.parse_xml_structure()
+
+        db_path = tmp_path / "inc_integ_lance"
+        engine = HelpSearchEngine(db_path, indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine.initialize()
+        initial_count = engine.db.open_table(engine.TABLE_NAME).count_rows()
+        engine.close()
+
+        # Add a new page to the XML
+        new_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<BrHelpContent>
+    <Section Id="hardware_section" Text="Hardware" File="index.html">
+        <Page Id="x20di9371_page" Text="X20DI9371" File="hardware/x20di9371.html">
+            <Identifiers><HelpID Value="12345"/></Identifiers>
+        </Page>
+        <Page Id="new_page" Text="Brand New Module" File="hardware/x20di9371.html"/>
+    </Section>
+    <Section Id="motion_section" Text="Motion" File="motion/overview.html">
+        <Identifiers><HelpID Value="20000"/></Identifiers>
+        <Section Id="mapp_motion_section" Text="mapp Motion" File="motion/overview.html">
+            <Page Id="mc_moveabs_page" Text="MC_BR_MoveAbsolute" File="motion/mapp_motion/mc_br_moveabsolute.html">
+                <Identifiers><HelpID Value="20100"/></Identifiers>
+            </Page>
+        </Section>
+    </Section>
+</BrHelpContent>"""
+        (temp_help_dir / "brhelpcontent.xml").write_text(new_xml, encoding="utf-8")
+
+        indexer2 = HelpContentIndexer(temp_help_dir)
+        indexer2.parse_xml_structure()
+
+        engine2 = HelpSearchEngine(db_path, indexer2, force_rebuild=False, embedding_service=mock_embedding_service)
+        assert engine2._build_strategy == "incremental"
+        engine2.initialize()
+
+        # One more row
+        new_count = engine2.db.open_table(engine2.TABLE_NAME).count_rows()
+        assert new_count == initial_count + 1
+
+        # Searchable
+        results = engine2.search("Brand New Module")
+        assert any(r["page_id"] == "new_page" for r in results)
+        engine2.close()
+
+    def test_remove_page_then_search(self, temp_help_dir, sample_xml, tmp_path, mock_embedding_service):
+        """Verify a page removed via incremental update is no longer searchable."""
+        indexer = HelpContentIndexer(temp_help_dir)
+        indexer.parse_xml_structure()
+
+        db_path = tmp_path / "inc_integ_lance"
+        engine = HelpSearchEngine(db_path, indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine.initialize()
+        initial_count = engine.db.open_table(engine.TABLE_NAME).count_rows()
+        engine.close()
+
+        # Remove x20di9371_page from the XML
+        new_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<BrHelpContent>
+    <Section Id="hardware_section" Text="Hardware" File="index.html"/>
+    <Section Id="motion_section" Text="Motion" File="motion/overview.html">
+        <Identifiers><HelpID Value="20000"/></Identifiers>
+        <Section Id="mapp_motion_section" Text="mapp Motion" File="motion/overview.html">
+            <Page Id="mc_moveabs_page" Text="MC_BR_MoveAbsolute" File="motion/mapp_motion/mc_br_moveabsolute.html">
+                <Identifiers><HelpID Value="20100"/></Identifiers>
+            </Page>
+        </Section>
+    </Section>
+</BrHelpContent>"""
+        (temp_help_dir / "brhelpcontent.xml").write_text(new_xml, encoding="utf-8")
+
+        indexer2 = HelpContentIndexer(temp_help_dir)
+        indexer2.parse_xml_structure()
+
+        engine2 = HelpSearchEngine(db_path, indexer2, force_rebuild=False, embedding_service=mock_embedding_service)
+        assert engine2._build_strategy == "incremental"
+        engine2.initialize()
+
+        new_count = engine2.db.open_table(engine2.TABLE_NAME).count_rows()
+        assert new_count == initial_count - 1
+
+        # Removed page should not appear in results
+        results = engine2.search("X20DI9371")
+        assert not any(r["page_id"] == "x20di9371_page" for r in results)
+        engine2.close()
