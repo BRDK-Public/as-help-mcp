@@ -15,7 +15,9 @@
         "--metadata-dir",
         "..\\data\\as6\\.ashelp_metadata",
         "--as-version",
-        "6"
+        "6",
+        "--force-rebuild",
+        "true"
       ]
     },
      "as-help-local": {

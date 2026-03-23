@@ -737,3 +737,112 @@ class TestIncrementalUpdate:
         table = engine2.db.open_table(engine2.TABLE_NAME)
         assert table.count_rows() == 3  # sec_new + page_a + page_b
         engine2.close()
+
+
+class TestBuildResume:
+    """Test chunked build with resume support."""
+
+    def test_resume_detected_after_interrupted_build(self, initialized_indexer, tmp_path, mock_embedding_service):
+        """Verify resume strategy is detected when build was interrupted."""
+        db_path = tmp_path / "resume_lance"
+        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+
+        # Simulate an interrupted build: write progress marker + partial table
+        engine._save_build_progress()
+        # Build one chunk manually (all pages in test data fit in one chunk)
+        all_pages = list(engine.indexer.pages.items())
+        partial = all_pages[:1]  # Only index the first page
+        records = [engine._extract_text_for_page(pid, page) for pid, page in partial]
+        title_vecs = engine.embedder.embed_batch([r[1] for r in records])
+        content_vecs = engine.embedder.embed_batch([r[2] if r[2] else r[1] for r in records])
+        chunk_data = engine._records_to_arrow(records, title_vecs, content_vecs)
+        engine.db.create_table(engine.TABLE_NAME, chunk_data)
+        engine.close()
+
+        # New engine should detect the resumable partial build
+        engine2 = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=False, embedding_service=mock_embedding_service)
+        assert engine2._build_strategy == "resume"
+        engine2.close()
+
+    def test_resume_completes_build(self, initialized_indexer, tmp_path, mock_embedding_service):
+        """Verify resume finishes indexing remaining pages."""
+        db_path = tmp_path / "resume_lance"
+        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+
+        # Simulate interrupted build with 1 page done
+        engine._save_build_progress()
+        all_pages = list(engine.indexer.pages.items())
+        partial = all_pages[:1]
+        records = [engine._extract_text_for_page(pid, page) for pid, page in partial]
+        title_vecs = engine.embedder.embed_batch([r[1] for r in records])
+        content_vecs = engine.embedder.embed_batch([r[2] if r[2] else r[1] for r in records])
+        chunk_data = engine._records_to_arrow(records, title_vecs, content_vecs)
+        engine.db.create_table(engine.TABLE_NAME, chunk_data)
+        engine.close()
+
+        # Resume should complete the build
+        engine2 = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=False, embedding_service=mock_embedding_service)
+        assert engine2._build_strategy == "resume"
+        engine2.initialize()
+
+        # All pages should now be indexed
+        table = engine2.db.open_table(engine2.TABLE_NAME)
+        assert table.count_rows() == len(initialized_indexer.pages)
+
+        # Progress marker should be cleaned up
+        assert not engine2._build_progress_path.exists()
+        # Metadata should be saved
+        assert engine2._metadata_path.exists()
+        engine2.close()
+
+    def test_no_resume_when_xml_changed(self, initialized_indexer, tmp_path, mock_embedding_service):
+        """Verify resume is skipped when XML hash doesn't match (data changed)."""
+        db_path = tmp_path / "resume_lance"
+        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+
+        # Simulate interrupted build
+        engine._save_build_progress()
+        records = [engine._extract_text_for_page(pid, page) for pid, page in list(engine.indexer.pages.items())[:1]]
+        title_vecs = engine.embedder.embed_batch([r[1] for r in records])
+        content_vecs = engine.embedder.embed_batch([r[2] if r[2] else r[1] for r in records])
+        chunk_data = engine._records_to_arrow(records, title_vecs, content_vecs)
+        engine.db.create_table(engine.TABLE_NAME, chunk_data)
+        engine.close()
+
+        # Change XML hash — resume should not be possible
+        with patch.object(initialized_indexer, "_get_xml_hash", return_value="different_hash"):
+            engine2 = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=False, embedding_service=mock_embedding_service)
+            # Should NOT be resume (XML changed since the partial build)
+            assert engine2._build_strategy != "resume"
+            engine2.close()
+
+    def test_force_rebuild_ignores_resume(self, initialized_indexer, tmp_path, mock_embedding_service):
+        """Verify force_rebuild=True ignores resumable partial build."""
+        db_path = tmp_path / "resume_lance"
+        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+
+        # Simulate interrupted build
+        engine._save_build_progress()
+        records = [engine._extract_text_for_page(pid, page) for pid, page in list(engine.indexer.pages.items())[:1]]
+        title_vecs = engine.embedder.embed_batch([r[1] for r in records])
+        content_vecs = engine.embedder.embed_batch([r[2] if r[2] else r[1] for r in records])
+        chunk_data = engine._records_to_arrow(records, title_vecs, content_vecs)
+        engine.db.create_table(engine.TABLE_NAME, chunk_data)
+        engine.close()
+
+        engine2 = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        assert engine2._build_strategy == "full"
+        engine2.close()
+
+    def test_build_status_tracks_chunks(self, initialized_indexer, tmp_path, mock_embedding_service):
+        """Verify build status updates during chunked build."""
+        db_path = tmp_path / "status_lance"
+        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine.initialize()
+
+        status = engine.build_status
+        assert status["state"] == "ready"
+        assert status["pages_total"] == len(initialized_indexer.pages)
+        assert status["pages_processed"] == len(initialized_indexer.pages)
+        assert status["elapsed_seconds"] is not None
+        engine.close()

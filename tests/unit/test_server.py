@@ -358,9 +358,20 @@ class TestGetHelpStatisticsTool:
     @pytest.fixture
     def mock_context(self, mock_indexer):
         """Create mock context."""
+        mock_search_engine = MagicMock()
+        mock_search_engine.build_status = {
+            "state": "ready",
+            "build_type": "none",
+            "phase": "complete",
+            "pages_total": 3,
+            "pages_processed": 3,
+            "elapsed_seconds": 0.5,
+            "incremental_stats": None,
+            "error": None,
+        }
         app_context = AppContext(
             indexer=mock_indexer,
-            search_engine=MagicMock(),
+            search_engine=mock_search_engine,
             as_version="4",
             online_help_base_url="https://help.br-automation.com/#/en/4/",
         )
@@ -384,9 +395,12 @@ class TestGetHelpStatisticsTool:
         assert "help_id_mappings" in result
         assert "pages_with_parents" in result
         assert "root_items" in result
+        assert "index_status" in result
 
         assert result["total_pages"] == 3  # from mock_indexer
         assert result["help_id_mappings"] == 1
+        assert result["index_status"]["state"] == "ready"
+        assert result["index_status"]["build_type"] == "none"
 
     @pytest.mark.asyncio
     async def test_get_help_statistics_regular_pages_calculation(self, mock_context):

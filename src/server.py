@@ -46,6 +46,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Suppress noisy HTTP request logging from sentence-transformers/huggingface
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
+
 
 # Pydantic models for structured output
 class SearchResult(BaseModel):
@@ -71,6 +75,10 @@ class SearchResults(BaseModel):
     query: str = Field(description="The search query")
     results: list[SearchResult] = Field(description="List of matching pages")
     total: int = Field(description="Total number of results returned")
+    status_message: str | None = Field(
+        default=None,
+        description="Status message when index is not ready (e.g., building). Call get_help_statistics for details.",
+    )
 
 
 class PageContent(BaseModel):
@@ -193,7 +201,7 @@ async def app_lifespan(server: FastMCP):
     # Check for old SQLite index and log migration info
     old_sqlite_db = db_path.parent / ".ashelp_search.db" if db_path.name == ".ashelp_lance" else None
     if old_sqlite_db and old_sqlite_db.exists():
-        logger.info(f"Found old SQLite FTS5 index at {old_sqlite_db} — it can be safely deleted")
+        logger.info(f"Found old SQLite FTS5 index at {old_sqlite_db} - it can be safely deleted")
         logger.info("Migrated from SQLite FTS5 to LanceDB hybrid search (RRF)")
 
     # Initialize search engine (constructor is fast — just connects to LanceDB)
@@ -203,9 +211,17 @@ async def app_lifespan(server: FastMCP):
     # Build/load the index in a background thread so the MCP server can respond
     # to initialize immediately. The search tool will wait for readiness.
     # Store the future so we can await it during shutdown for a clean exit.
+    build_type = search_engine.build_status["build_type"]
     init_future = asyncio.get_running_loop().run_in_executor(None, search_engine.initialize)
 
-    logger.info("=== Server ready (search index loading in background) ===")
+    if build_type == "none":
+        logger.info("=== Server ready (loading existing index) ===")
+    elif build_type == "resume":
+        logger.info("=== Server ready (resuming interrupted index build in background) ===")
+    elif build_type == "incremental":
+        logger.info("=== Server ready (incremental index update running in background) ===")
+    else:
+        logger.info(f"=== Server ready ({build_type} index build running in background - this may take several minutes) ===")
 
     # Yield context to the application
     context = AppContext(
@@ -282,16 +298,34 @@ def search_help(
     - Check breadcrumb_path to understand page context before retrieving
 
     You MUST call get_page_by_id to read actual content - previews are NOT enough.
+
+    NOTE: If the search index is still building, this returns empty results with a status message.
+    Call get_help_statistics to check build progress, then retry when ready.
     """
     app_ctx: AppContext = ctx.request_context.lifespan_context
 
-    # Wait for search index to be ready (building in background on first run)
+    # Return immediately with status if index is still building (don't block the tool call)
     if not app_ctx.search_engine.ready:
-        logger.info("Search index still building, waiting...")
-        ready = app_ctx.search_engine.wait_until_ready(timeout=900)
-        if not ready:
-            logger.warning("Search index not ready after timeout — returning empty results")
-            return SearchResults(query=query, results=[], total=0)
+        status = app_ctx.search_engine.build_status
+        phase = status["phase"]
+        build_type = status["build_type"]
+        processed = status["pages_processed"]
+        total = status["pages_total"]
+        elapsed = status.get("elapsed_seconds")
+
+        progress = f"{processed}/{total} pages" if total else phase
+        elapsed_str = f", {elapsed:.0f}s elapsed" if elapsed else ""
+
+        if status.get("error"):
+            msg = f"Index build failed: {status['error']}"
+        else:
+            msg = (
+                f"Search index is building ({build_type}): {phase} - {progress}{elapsed_str}. "
+                f"Call get_help_statistics to check progress, then retry search."
+            )
+
+        logger.info(f"Search called while building: {msg}")
+        return SearchResults(query=query, results=[], total=0, status_message=msg)
 
     # Handle FieldInfo objects when function called directly (not through FastMCP framework)
     # This supports both MCP tool invocation and direct test calls
@@ -549,11 +583,11 @@ async def get_breadcrumb(
 
 
 @mcp.tool()
-async def get_help_statistics(ctx: Context) -> dict[str, int]:
-    """Get statistics about the indexed help content.
+async def get_help_statistics(ctx: Context) -> dict:
+    """Get statistics about the indexed help content and current index build status.
 
     Returns counts of total pages, sections, and HelpID mappings.
-    Also includes parent-child relationship statistics.
+    Also includes index build status (state, build type, phase, progress).
     """
     app_ctx: AppContext = ctx.request_context.lifespan_context
 
@@ -565,17 +599,41 @@ async def get_help_statistics(ctx: Context) -> dict[str, int]:
     pages_with_parents = sum(1 for p in app_ctx.indexer.pages.values() if p.parent_id is not None)
     root_pages = sum(1 for p in app_ctx.indexer.pages.values() if p.parent_id is None)
 
+    # Get index build status
+    build_status = app_ctx.search_engine.build_status
+
     await ctx.info(f"Statistics: {total_pages} total, {total_sections} sections, {total_help_ids} HelpIDs")
     await ctx.info(f"Hierarchy: {pages_with_parents} with parents, {root_pages} root items")
+    await ctx.info(
+        f"Index: state={build_status['state']}, type={build_status['build_type']}, "
+        f"phase={build_status['phase']}"
+    )
 
-    return {
+    result: dict = {
         "total_pages": total_pages,
         "total_sections": total_sections,
         "regular_pages": total_pages - total_sections,
         "help_id_mappings": total_help_ids,
         "pages_with_parents": pages_with_parents,
         "root_items": root_pages,
+        "index_status": {
+            "state": build_status["state"],
+            "build_type": build_status["build_type"],
+            "phase": build_status["phase"],
+            "pages_total": build_status["pages_total"],
+            "pages_processed": build_status["pages_processed"],
+            "elapsed_seconds": build_status["elapsed_seconds"],
+        },
     }
+
+    # Include incremental stats when available
+    if build_status.get("incremental_stats"):
+        result["index_status"]["incremental_stats"] = build_status["incremental_stats"]
+
+    if build_status.get("error"):
+        result["index_status"]["error"] = build_status["error"]
+
+    return result
 
 
 # Resource for direct HTML file access
@@ -923,7 +981,15 @@ def main():
         "--metadata-dir",
         help="Path to metadata directory (AS_HELP_METADATA_DIR). Example: './metadata'",
     )
-    parser.add_argument("--force-rebuild", action="store_true", help="Force index rebuild (AS_HELP_FORCE_REBUILD)")
+    parser.add_argument(
+        "--force-rebuild",
+        type=lambda v: v.lower() in ("true", "1", "yes"),
+        nargs="?",
+        const=True,
+        default=None,
+        metavar="BOOL",
+        help="Force index rebuild: true/false (AS_HELP_FORCE_REBUILD). Omit value for true.",
+    )
     parser.add_argument(
         "--as-version",
         choices=["4", "6"],
@@ -940,8 +1006,8 @@ def main():
         os.environ["AS_HELP_DB_PATH"] = str(Path(args.db_path).resolve())
     if args.metadata_dir:
         os.environ["AS_HELP_METADATA_DIR"] = str(Path(args.metadata_dir).resolve())
-    if args.force_rebuild:
-        os.environ["AS_HELP_FORCE_REBUILD"] = "true"
+    if args.force_rebuild is not None:
+        os.environ["AS_HELP_FORCE_REBUILD"] = "true" if args.force_rebuild else "false"
     if args.as_version:
         os.environ["AS_HELP_VERSION"] = args.as_version
 

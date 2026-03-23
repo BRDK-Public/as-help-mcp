@@ -33,6 +33,9 @@ WEIGHT_TITLE_VECTOR = 2.0
 WEIGHT_CONTENT_VECTOR = 1.0
 WEIGHT_FTS_KEYWORD = 1.5
 
+# Number of pages per chunk during index build (saves progress after each chunk)
+BUILD_CHUNK_SIZE = 5000
+
 
 class HelpSearchEngine:
     """Hybrid search engine using LanceDB with RRF fusion.
@@ -64,6 +67,19 @@ class HelpSearchEngine:
         self._ready = threading.Event()
         self._build_error: Exception | None = None
 
+        # Build status tracking (thread-safe via GIL for simple dict updates)
+        self._build_status: dict = {
+            "state": "initializing",  # initializing | building | ready | error
+            "build_type": None,       # full | incremental | none
+            "phase": "",              # current phase description
+            "pages_total": 0,
+            "pages_processed": 0,
+            "started_at": None,
+            "completed_at": None,
+            "error": None,
+            "incremental_stats": None, # {added, removed, changed, unchanged} for incremental builds
+        }
+
         # Ensure directory exists
         self.db_path.mkdir(parents=True, exist_ok=True)
 
@@ -73,11 +89,20 @@ class HelpSearchEngine:
         # Metadata sidecar file for change detection
         self._metadata_path = self.db_path / "_index_metadata.json"
 
-        # Determine build strategy: full, incremental, or none
-        if force_rebuild or not self._index_exists():
+        # Build progress marker for resume support
+        self._build_progress_path = self.db_path / "_build_progress.json"
+
+        # Determine build strategy: full, resume, incremental, or none
+        if force_rebuild:
+            self._build_strategy = "full"
+        elif self._has_resumable_build():
+            self._build_strategy = "resume"
+        elif not self._index_exists():
             self._build_strategy = "full"
         else:
             self._build_strategy = self._detect_build_strategy()
+
+        self._build_status["build_type"] = self._build_strategy
 
     def initialize(self):
         """Build or load the search index (may be slow on first run).
@@ -89,25 +114,44 @@ class HelpSearchEngine:
             self, for convenience chaining in tests.
         """
         try:
+            self._build_status["started_at"] = time.time()
+            self._build_status["state"] = "building"
+            self._build_status["pages_total"] = len(self.indexer.pages)
+
             # Eagerly load embedding model so device/download info is visible
             # before the slow text extraction phase.
-            if self._build_strategy in ("full", "incremental"):
+            if self._build_strategy in ("full", "incremental", "resume"):
+                self._build_status["phase"] = "loading embedding model"
+                logger.info(f"Loading embedding model ({len(self.indexer.pages)} pages to process)...")
+                sys.stderr.flush()
                 self.embedder._load_model()
 
             if self._build_strategy == "full":
                 logger.info("Building new search index (full)...")
                 sys.stderr.flush()
                 self._build_index()
+            elif self._build_strategy == "resume":
+                resume_ids = self._get_indexed_page_ids()
+                logger.info(f"Resuming interrupted build ({len(resume_ids)} pages already indexed)...")
+                sys.stderr.flush()
+                self._build_index(resume_ids=resume_ids)
             elif self._build_strategy == "incremental":
                 logger.info("Performing incremental index update...")
                 sys.stderr.flush()
                 self._incremental_update()
             else:
+                self._build_status["phase"] = "loading existing index"
                 logger.info("Loading existing search index...")
                 sys.stderr.flush()
                 self._load_index()
+
+            self._build_status["state"] = "ready"
+            self._build_status["phase"] = "complete"
+            self._build_status["completed_at"] = time.time()
         except Exception as e:
             self._build_error = e
+            self._build_status["state"] = "error"
+            self._build_status["error"] = str(e)
             logger.error(f"Search index initialization failed: {e}")
             raise
         finally:
@@ -118,6 +162,19 @@ class HelpSearchEngine:
     def ready(self) -> bool:
         """Whether the search index is ready for queries."""
         return self._ready.is_set()
+
+    @property
+    def build_status(self) -> dict:
+        """Current build status snapshot (safe to read from any thread)."""
+        status = dict(self._build_status)
+        # Add elapsed time for in-progress builds
+        if status["started_at"] and not status["completed_at"]:
+            status["elapsed_seconds"] = round(time.time() - status["started_at"], 1)
+        elif status["started_at"] and status["completed_at"]:
+            status["elapsed_seconds"] = round(status["completed_at"] - status["started_at"], 1)
+        else:
+            status["elapsed_seconds"] = None
+        return status
 
     def wait_until_ready(self, timeout: float | None = None) -> bool:
         """Block until the index is ready. Returns True if ready, False on timeout."""
@@ -175,7 +232,7 @@ class HelpSearchEngine:
 
         # Embedding model change → must re-embed everything
         if metadata.get("embedding_model") != self.embedder.model_name:
-            logger.info("Embedding model changed — full rebuild required")
+            logger.info("Embedding model changed - full rebuild required")
             return "full"
 
         # XML unchanged → nothing to do
@@ -184,11 +241,11 @@ class HelpSearchEngine:
 
         # XML changed — can we do incremental?
         if metadata.get("page_fingerprints"):
-            logger.info("XML changed — incremental update possible")
+            logger.info("XML changed - incremental update possible")
             return "incremental"
 
         # XML changed but no stored fingerprints → full rebuild
-        logger.info("XML changed but no page fingerprints stored — full rebuild required")
+        logger.info("XML changed but no page fingerprints stored - full rebuild required")
         return "full"
 
     def _save_metadata(self):
@@ -241,54 +298,59 @@ class HelpSearchEngine:
             category,
         )
 
-    def _build_index(self):
-        """Build search index with embeddings and LanceDB storage."""
-        start_time = time.time()
-
-        all_pages = list(self.indexer.pages.items())
-        max_workers = int(os.cpu_count() or 4)
-        logger.info(f"Extracting text for {len(all_pages)} pages using {max_workers} workers...")
-        sys.stderr.flush()
-
-        # Parallel text extraction (reuses existing pattern)
-        records = []
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            extraction_results = executor.map(
-                lambda item: self._extract_text_for_page(item[0], item[1]),
-                all_pages,
-                chunksize=min(100, max(1, max_workers * 2)),
+    def _has_resumable_build(self) -> bool:
+        """Check if there's a partial build from an interrupted session that can be resumed."""
+        if not self._build_progress_path.exists():
+            return False
+        try:
+            if self.TABLE_NAME not in self.db.list_tables().tables:
+                return False
+            table = self.db.open_table(self.TABLE_NAME)
+            if table.count_rows() == 0:
+                return False
+            with open(self._build_progress_path) as f:
+                progress = json.load(f)
+            return (
+                progress.get("xml_hash") == self.indexer._get_xml_hash()
+                and progress.get("embedding_model") == self.embedder.model_name
             )
-            for i, result in enumerate(extraction_results):
-                records.append(result)
-                if (i + 1) % 5000 == 0:
-                    elapsed = time.time() - start_time
-                    logger.info(f"Extracted text for {i + 1}/{len(all_pages)} pages ({elapsed:.1f}s)")
-                    sys.stderr.flush()
+        except (json.JSONDecodeError, OSError, Exception):
+            return False
 
-        text_time = time.time()
-        logger.info(f"Text extraction complete in {text_time - start_time:.1f}s ({len(records)} pages)")
-        sys.stderr.flush()
+    def _save_build_progress(self):
+        """Save marker that a build is in progress (for resume detection on restart)."""
+        progress = {
+            "xml_hash": self.indexer._get_xml_hash(),
+            "embedding_model": self.embedder.model_name,
+        }
+        with open(self._build_progress_path, "w") as f:
+            json.dump(progress, f)
 
-        # Batch embed titles
-        titles = [r[1] for r in records]
-        logger.info(f"Embedding {len(titles)} titles...")
-        title_vectors = self.embedder.embed_batch(titles)
+    def _clear_build_progress(self):
+        """Remove build progress marker (build completed successfully)."""
+        if self._build_progress_path.exists():
+            self._build_progress_path.unlink()
 
-        # Batch embed content (use title as fallback for sections with no content)
-        contents = [r[2] for r in records]
-        content_texts = [c if c else t for c, t in zip(contents, titles)]
-        logger.info(f"Embedding {len(content_texts)} content texts...")
-        content_vectors = self.embedder.embed_batch(content_texts)
+    def _get_indexed_page_ids(self) -> set[str]:
+        """Get set of page_ids already in the LanceDB table."""
+        try:
+            table = self.db.open_table(self.TABLE_NAME)
+            # Read only page_id column via lance scanner to avoid loading vectors
+            try:
+                arrow_table = table.to_lance().to_table(columns=["page_id"])
+                return set(arrow_table["page_id"].to_pylist())
+            except (AttributeError, Exception):
+                # Fallback: read full table (slower but always works)
+                df = table.to_pandas()
+                return set(df["page_id"].tolist())
+        except Exception as e:
+            logger.warning(f"Could not read existing page IDs: {e}")
+            return set()
 
-        embed_time = time.time()
-        logger.info(f"Embedding complete in {embed_time - text_time:.1f}s")
-
-        # Build PyArrow table with schema
+    def _get_table_schema(self) -> pa.Schema:
+        """Get the PyArrow schema for the LanceDB help_pages table."""
         dim = self.embedder.dimension
-        # Combined text column for FTS (native LanceDB FTS indexes one column)
-        search_texts = [f"{r[1]} {r[2]}" for r in records]
-
-        schema = pa.schema([
+        return pa.schema([
             pa.field("page_id", pa.utf8()),
             pa.field("title", pa.utf8()),
             pa.field("content", pa.utf8()),
@@ -302,6 +364,9 @@ class HelpSearchEngine:
             pa.field("content_vector", pa.list_(pa.float32(), dim)),
         ])
 
+    def _records_to_arrow(self, records, title_vectors, content_vectors) -> pa.Table:
+        """Convert extracted records + embeddings to a PyArrow table."""
+        search_texts = [f"{r[1]} {r[2]}" for r in records]
         data = {
             "page_id": [r[0] for r in records],
             "title": [r[1] for r in records],
@@ -315,21 +380,120 @@ class HelpSearchEngine:
             "title_vector": title_vectors,
             "content_vector": content_vectors,
         }
+        return pa.table(data, schema=self._get_table_schema())
 
-        table_data = pa.table(data, schema=schema)
+    def _build_index(self, resume_ids: set[str] | None = None):
+        """Build search index in chunks with resume support.
 
-        logger.info("Creating LanceDB table...")
-        table = self.db.create_table(self.TABLE_NAME, table_data, mode="overwrite")
+        Processes pages in chunks of BUILD_CHUNK_SIZE, writing each chunk to
+        LanceDB immediately.  If the server is killed mid-build, the next
+        start detects the partial table and resumes where it left off.
 
-        # Create FTS index on combined search text (native FTS supports single column)
+        Args:
+            resume_ids: Set of page_ids already indexed (for resume). None for fresh build.
+        """
+        start_time = time.time()
+        all_pages = list(self.indexer.pages.items())
+        total_pages = len(all_pages)
+
+        # For resume: skip already-indexed pages
+        if resume_ids:
+            pages_to_process = [(pid, page) for pid, page in all_pages if pid not in resume_ids]
+            already_done = total_pages - len(pages_to_process)
+            table_created = True  # Table exists from the interrupted build
+            logger.info(f"Resuming: {already_done} already indexed, {len(pages_to_process)} remaining")
+        else:
+            pages_to_process = all_pages
+            already_done = 0
+            table_created = False
+            # Clean start - drop any leftover partial table
+            try:
+                if self.TABLE_NAME in self.db.list_tables().tables:
+                    self.db.drop_table(self.TABLE_NAME)
+            except Exception:
+                pass
+
+        self._build_status["pages_total"] = total_pages
+        self._build_status["pages_processed"] = already_done
+
+        if not pages_to_process:
+            logger.info("All pages already indexed, finalizing...")
+            self._finalize_build(start_time, total_pages)
+            return
+
+        # Save progress marker so we can resume if interrupted
+        self._save_build_progress()
+
+        # Cap workers to avoid starving the MCP event loop / stdio transport
+        max_workers = min(int(os.cpu_count() or 4), 10)
+        remaining = len(pages_to_process)
+        total_chunks = (remaining + BUILD_CHUNK_SIZE - 1) // BUILD_CHUNK_SIZE
+
+        logger.info(f"Processing {remaining} pages in {total_chunks} chunks ({max_workers} workers)...")
+        sys.stderr.flush()
+
+        for chunk_start in range(0, remaining, BUILD_CHUNK_SIZE):
+            chunk = pages_to_process[chunk_start:chunk_start + BUILD_CHUNK_SIZE]
+            chunk_num = chunk_start // BUILD_CHUNK_SIZE + 1
+            chunk_time = time.time()
+
+            # 1. Extract text
+            self._build_status["phase"] = f"extracting text (chunk {chunk_num}/{total_chunks})"
+            records = []
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                extraction_results = executor.map(
+                    lambda item: self._extract_text_for_page(item[0], item[1]),
+                    chunk,
+                    chunksize=min(100, max(1, max_workers * 2)),
+                )
+                for result in extraction_results:
+                    records.append(result)
+
+            # 2. Embed titles
+            titles = [r[1] for r in records]
+            self._build_status["phase"] = f"embedding (chunk {chunk_num}/{total_chunks})"
+            title_vectors = self.embedder.embed_batch(titles)
+
+            # 3. Embed content (use title as fallback for sections)
+            contents = [r[2] for r in records]
+            content_texts = [c if c else t for c, t in zip(contents, titles)]
+            content_vectors = self.embedder.embed_batch(content_texts)
+
+            # 4. Write chunk to LanceDB
+            chunk_data = self._records_to_arrow(records, title_vectors, content_vectors)
+            self._build_status["phase"] = f"saving (chunk {chunk_num}/{total_chunks})"
+
+            if not table_created:
+                self.db.create_table(self.TABLE_NAME, chunk_data)
+                table_created = True
+            else:
+                table = self.db.open_table(self.TABLE_NAME)
+                table.add(chunk_data)
+
+            processed = already_done + chunk_start + len(chunk)
+            self._build_status["pages_processed"] = processed
+            chunk_elapsed = time.time() - chunk_time
+            logger.info(
+                f"Chunk {chunk_num}/{total_chunks}: {processed}/{total_pages} pages ({chunk_elapsed:.1f}s)"
+            )
+            sys.stderr.flush()
+
+        self._finalize_build(start_time, total_pages)
+
+    def _finalize_build(self, start_time: float, total_pages: int):
+        """Create FTS index and save metadata after all chunks are written."""
+        table = self.db.open_table(self.TABLE_NAME)
+
+        self._build_status["phase"] = "creating FTS index"
         logger.info("Creating FTS index...")
         table.create_fts_index("search_text", replace=True)
 
-        # Save metadata for change detection
         self._save_metadata()
+        self._clear_build_progress()
 
+        self._build_status["pages_processed"] = total_pages
         elapsed = time.time() - start_time
-        logger.info(f"Search index built successfully in {elapsed:.1f}s ({len(records)} documents)")
+        logger.info(f"Search index built successfully in {elapsed:.1f}s ({total_pages} documents)")
 
     def _incremental_update(self):
         """Incrementally update the index by diffing page fingerprints.
@@ -359,6 +523,15 @@ class HelpSearchEngine:
         to_upsert = added | changed
         to_delete = removed | changed  # delete old rows for changed pages, then re-add
 
+        self._build_status["incremental_stats"] = {
+            "added": len(added),
+            "removed": len(removed),
+            "changed": len(changed),
+            "unchanged": len(new_ids) - len(to_upsert),
+        }
+        self._build_status["pages_total"] = len(to_upsert)
+        self._build_status["phase"] = "computing diff"
+
         logger.info(
             f"Incremental diff: {len(added)} added, {len(removed)} removed, "
             f"{len(changed)} changed, {len(new_ids) - len(to_upsert)} unchanged"
@@ -366,14 +539,14 @@ class HelpSearchEngine:
 
         # If nothing changed (e.g. XML whitespace change), skip heavy work
         if not to_upsert and not to_delete:
-            logger.info("No page-level changes detected — skipping update")
+            logger.info("No page-level changes detected - skipping update")
             self._save_metadata()
             return
 
         # Fall back to full rebuild if >50% of pages changed (not worth incremental overhead)
         if len(to_upsert) > len(new_ids) * 0.5:
             logger.info(
-                f"Too many changes ({len(to_upsert)}/{len(new_ids)}) — falling back to full rebuild"
+                f"Too many changes ({len(to_upsert)}/{len(new_ids)}) - falling back to full rebuild"
             )
             self._build_index()
             return
@@ -382,6 +555,7 @@ class HelpSearchEngine:
 
         # --- Delete removed and changed rows ---
         if to_delete:
+            self._build_status["phase"] = "deleting old rows"
             # Build safe filter: page_id IN ('id1', 'id2', ...)
             # Process in batches to avoid oversized SQL expressions
             delete_list = list(to_delete)
@@ -394,6 +568,7 @@ class HelpSearchEngine:
 
         # --- Extract text, embed, and insert new/changed pages ---
         if to_upsert:
+            self._build_status["phase"] = "extracting text"
             pages_to_index = [(pid, self.indexer.pages[pid]) for pid in to_upsert]
             max_workers = int(os.cpu_count() or 4)
 
@@ -408,52 +583,24 @@ class HelpSearchEngine:
                     records.append(result)
 
             logger.info(f"Extracted text for {len(records)} pages")
+            self._build_status["pages_processed"] = len(records)
 
             # Embed
             titles = [r[1] for r in records]
+            self._build_status["phase"] = "embedding titles"
             title_vectors = self.embedder.embed_batch(titles)
 
             contents = [r[2] for r in records]
             content_texts = [c if c else t for c, t in zip(contents, titles)]
+            self._build_status["phase"] = "embedding content"
             content_vectors = self.embedder.embed_batch(content_texts)
 
-            # Build PyArrow table matching existing schema
-            dim = self.embedder.dimension
-            search_texts = [f"{r[1]} {r[2]}" for r in records]
-
-            data = {
-                "page_id": [r[0] for r in records],
-                "title": [r[1] for r in records],
-                "content": [r[2] for r in records],
-                "search_text": search_texts,
-                "file_path": [r[3] for r in records],
-                "help_id": [r[4] for r in records],
-                "is_section": [r[5] for r in records],
-                "breadcrumb_path": [r[6] for r in records],
-                "category": [r[7] for r in records],
-                "title_vector": title_vectors,
-                "content_vector": content_vectors,
-            }
-
-            schema = pa.schema([
-                pa.field("page_id", pa.utf8()),
-                pa.field("title", pa.utf8()),
-                pa.field("content", pa.utf8()),
-                pa.field("search_text", pa.utf8()),
-                pa.field("file_path", pa.utf8()),
-                pa.field("help_id", pa.utf8()),
-                pa.field("is_section", pa.int32()),
-                pa.field("breadcrumb_path", pa.utf8()),
-                pa.field("category", pa.utf8()),
-                pa.field("title_vector", pa.list_(pa.float32(), dim)),
-                pa.field("content_vector", pa.list_(pa.float32(), dim)),
-            ])
-
-            new_data = pa.table(data, schema=schema)
+            new_data = self._records_to_arrow(records, title_vectors, content_vectors)
             table.add(new_data)
             logger.info(f"Added {len(records)} rows to index")
 
         # Rebuild FTS index (required after row mutations)
+        self._build_status["phase"] = "rebuilding FTS index"
         logger.info("Rebuilding FTS index...")
         table.create_fts_index("search_text", replace=True)
 
