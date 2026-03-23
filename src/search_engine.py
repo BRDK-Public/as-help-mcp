@@ -161,7 +161,9 @@ class HelpSearchEngine:
     @property
     def ready(self) -> bool:
         """Whether the search index is ready for queries."""
-        return self._ready.is_set()
+        # _ready is set in finally{} for both success and error to unblock waiters.
+        # A usable index requires explicit ready state.
+        return self._ready.is_set() and self._build_status.get("state") == "ready"
 
     @property
     def build_status(self) -> dict:

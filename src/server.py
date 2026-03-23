@@ -7,6 +7,7 @@ Optimized for thousands of help files with persistent indexing and fast startup.
 import asyncio
 import logging
 import os
+from argparse import ArgumentTypeError
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,6 +37,24 @@ def get_as_version_config() -> tuple[str, str]:
 
     # Default to AS4 (most common)
     return "4", "https://help.br-automation.com/#/en/4/"
+
+
+def _build_online_help_url(base_url: str, file_path: str | None) -> str | None:
+    """Build normalized online help URL from a relative file path."""
+    if not file_path:
+        return None
+    normalized_path = file_path.replace("\\", "/")
+    return f"{base_url}{normalized_path}"
+
+
+def _parse_bool_arg(value: str) -> bool:
+    """Parse strict boolean CLI values for argparse."""
+    normalized = value.strip().lower()
+    if normalized in ("true", "1", "yes"):
+        return True
+    if normalized in ("false", "0", "no"):
+        return False
+    raise ArgumentTypeError(f"Invalid boolean value: '{value}'. Use true/false.")
 
 
 # Configure logging - use stderr so it doesn't interfere with stdio transport
@@ -304,13 +323,15 @@ def search_help(
     """
     app_ctx: AppContext = ctx.request_context.lifespan_context
 
-    # Return immediately with status if index is still building (don't block the tool call)
-    if not app_ctx.search_engine.ready:
-        status = app_ctx.search_engine.build_status
-        phase = status["phase"]
-        build_type = status["build_type"]
-        processed = status["pages_processed"]
-        total = status["pages_total"]
+    # Return immediately with status when the index is not queryable.
+    # This covers both active builds and failed initialization.
+    status = app_ctx.search_engine.build_status
+    state = status.get("state")
+    if state != "ready":
+        phase = status.get("phase", "")
+        build_type = status.get("build_type", "unknown")
+        processed = status.get("pages_processed", 0)
+        total = status.get("pages_total", 0)
         elapsed = status.get("elapsed_seconds")
 
         progress = f"{processed}/{total} pages" if total else phase
@@ -346,20 +367,16 @@ def search_help(
     # Convert to SearchResult models
     search_results = []
     for r in results:
-        # Get a tiny preview - intentionally truncated to force get_page_by_id usage
+        # Use snippet precomputed by search engine to avoid extra disk I/O per result.
+        # Keep previews intentionally short and incomplete to drive get_page_by_id usage.
         content_preview = None
         if not r["is_section"]:
-            full_text = app_ctx.indexer.extract_plain_text(r["page_id"])
-            if full_text:
-                # Only show first 100 chars - useless for answering, just proves content exists
-                content_preview = full_text[:100].strip() + "... [TRUNCATED - call get_page_by_id for full content]"
+            snippet = r.get("snippet")
+            if snippet:
+                content_preview = snippet.strip() + "... [TRUNCATED - call get_page_by_id for full content]"
 
         # Build online help URL from file path
-        online_help_url = None
-        if r["file_path"]:
-            # Normalize path separators and build URL
-            normalized_path = r["file_path"].replace("\\", "/")
-            online_help_url = f"{app_ctx.online_help_base_url}{normalized_path}"
+        online_help_url = _build_online_help_url(app_ctx.online_help_base_url, r.get("file_path"))
 
         result = SearchResult(
             page_id=r["page_id"],
@@ -479,10 +496,7 @@ def get_page_by_id(
         breadcrumb = [p.text for p in breadcrumb_pages]
 
     # Build online help URL
-    online_help_url = None
-    if page.file_path:
-        normalized_path = page.file_path.replace("\\", "/")
-        online_help_url = f"{app_ctx.online_help_base_url}{normalized_path}"
+    online_help_url = _build_online_help_url(app_ctx.online_help_base_url, page.file_path)
 
     return PageContent(
         page_id=page.id,
@@ -533,10 +547,7 @@ def get_page_by_help_id(
         breadcrumb = [p.text for p in breadcrumb_pages]
 
     # Build online help URL
-    online_help_url = None
-    if page.file_path:
-        normalized_path = page.file_path.replace("\\", "/")
-        online_help_url = f"{app_ctx.online_help_base_url}{normalized_path}"
+    online_help_url = _build_online_help_url(app_ctx.online_help_base_url, page.file_path)
 
     return PageContent(
         page_id=page.id,
@@ -983,7 +994,7 @@ def main():
     )
     parser.add_argument(
         "--force-rebuild",
-        type=lambda v: v.lower() in ("true", "1", "yes"),
+        type=_parse_bool_arg,
         nargs="?",
         const=True,
         default=None,

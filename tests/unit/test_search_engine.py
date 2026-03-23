@@ -846,3 +846,22 @@ class TestBuildResume:
         assert status["pages_processed"] == len(initialized_indexer.pages)
         assert status["elapsed_seconds"] is not None
         engine.close()
+
+
+class TestReadyStateSemantics:
+    """Test query-readiness behavior when initialization fails."""
+
+    def test_ready_is_false_when_initialize_fails(self, initialized_indexer, tmp_path, mock_embedding_service):
+        """Verify waiters are unblocked but ready remains False on initialization failure."""
+        db_path = tmp_path / "error_lance"
+        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+
+        with patch.object(engine, "_build_index", side_effect=RuntimeError("boom")):
+            with pytest.raises(RuntimeError, match="boom"):
+                engine.initialize()
+
+        # Event is set to release waiters, but index is not queryable.
+        assert engine.wait_until_ready(timeout=0.0) is True
+        assert engine.ready is False
+        assert engine.build_status["state"] == "error"
+        engine.close()
