@@ -17,7 +17,7 @@
         "--as-version",
         "6",
         "--force-rebuild",
-        "true"
+        "false"
       ]
     },
      "as-help-local": {

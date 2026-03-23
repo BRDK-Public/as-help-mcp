@@ -123,6 +123,24 @@ class TestEmbedBatch:
         assert kwargs["batch_size"] == 32
         assert kwargs["show_progress_bar"] is False
 
+    def test_embed_batch_uses_env_batch_size(self, mock_service, monkeypatch):
+        """Verify AS_HELP_EMBED_BATCH_SIZE overrides default auto batch size."""
+        monkeypatch.setenv("AS_HELP_EMBED_BATCH_SIZE", "128")
+
+        mock_service.embed_batch(["a", "b", "c"])
+
+        _, kwargs = mock_service._model.encode.call_args
+        assert kwargs["batch_size"] == 128
+
+    def test_embed_batch_invalid_env_batch_size_falls_back_default(self, mock_service, monkeypatch):
+        """Verify invalid AS_HELP_EMBED_BATCH_SIZE falls back to device default."""
+        monkeypatch.setenv("AS_HELP_EMBED_BATCH_SIZE", "not-a-number")
+
+        mock_service.embed_batch(["a", "b", "c"])
+
+        _, kwargs = mock_service._model.encode.call_args
+        assert kwargs["batch_size"] == 64
+
 
 class TestLazyLoading:
     """Test lazy model loading behavior."""

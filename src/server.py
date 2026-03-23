@@ -258,6 +258,7 @@ async def app_lifespan(server: FastMCP):
     except Exception as exc:
         logger.debug("Background index thread raised an exception during teardown: %s", exc)
 
+    search_engine.close()
     logger.info("Shutting down help server")
 
 
@@ -1006,6 +1007,16 @@ def main():
         choices=["4", "6"],
         help="AS version for online help (AS_HELP_VERSION). Default: 4",
     )
+    parser.add_argument(
+        "--embedding-device",
+        choices=["cpu", "cuda", "mps"],
+        help="Force embedding device (AS_HELP_EMBEDDING_DEVICE). Optional.",
+    )
+    parser.add_argument(
+        "--embed-batch-size",
+        type=int,
+        help="Embedding batch size override (AS_HELP_EMBED_BATCH_SIZE). Optional.",
+    )
     parser.add_argument("--usage", action="store_true", help="Print usage examples and exit")
 
     # Parse known args to allow them to be passed before or after FastMCP args
@@ -1021,6 +1032,25 @@ def main():
         os.environ["AS_HELP_FORCE_REBUILD"] = "true" if args.force_rebuild else "false"
     if args.as_version:
         os.environ["AS_HELP_VERSION"] = args.as_version
+    if args.embedding_device:
+        os.environ["AS_HELP_EMBEDDING_DEVICE"] = args.embedding_device
+    if args.embed_batch_size is not None:
+        if args.embed_batch_size <= 0:
+            raise ValueError("--embed-batch-size must be > 0")
+        os.environ["AS_HELP_EMBED_BATCH_SIZE"] = str(args.embed_batch_size)
+
+    # Pre-import heavy ML libraries BEFORE mcp.run() starts the stdio transport.
+    # These imports probe terminal state (tqdm) and load large native libraries (torch).
+    # When done inside a background thread after stdio is captured, they stall for
+    # minutes due to contention with the MCP transport's stdin/stdout handling.
+    # Doing it here (before stdio captures stdin/stdout) takes ~6s and the modules
+    # are then cached in sys.modules for the background thread.
+    import time as _t
+    _t0 = _t.monotonic()
+    logger.info("Pre-loading ML libraries (before stdio transport)...")
+    import torch  # noqa: F401
+    import sentence_transformers  # noqa: F401
+    logger.info("ML libraries loaded in %.1fs", _t.monotonic() - _t0)
 
     # Run with stdio transport by default (for local MCP clients like Claude Desktop)
     # To run as HTTP server, use: mcp.run(transport="streamable-http")

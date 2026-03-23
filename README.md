@@ -123,6 +123,8 @@ Run `uv run as-help-server --help` for full details.
 | `--metadata-dir` | `AS_HELP_METADATA_DIR` | Path to the indexing metadata directory |
 | `--as-version` | `AS_HELP_VERSION` | AS version for online help (`4` or `6`) |
 | `--force-rebuild` | `AS_HELP_FORCE_REBUILD` | Force a full index rebuild |
+| `--embedding-device` | `AS_HELP_EMBEDDING_DEVICE` | Optional embedding device override (`cpu`, `cuda`, `mps`) |
+| `--embed-batch-size` | `AS_HELP_EMBED_BATCH_SIZE` | Optional embedding batch size override (integer > 0) |
 
 ### Option 3: Docker Compose
 
@@ -170,6 +172,50 @@ The server supports configuration via both environment variables and command-lin
 | `--force-rebuild` | `AS_HELP_FORCE_REBUILD` | `false` | Force index rebuild |
 | `--db-path` | `AS_HELP_DB_PATH` | `{root}/.ashelp_lance` | LanceDB directory |
 | `--metadata-dir` | `AS_HELP_METADATA_DIR` | `{root}/.ashelp_metadata` | Metadata directory |
+| `--embedding-device` | `AS_HELP_EMBEDDING_DEVICE` | `auto` | Embedding device: auto-detect CUDA/MPS/CPU (override optional) |
+| `--embed-batch-size` | `AS_HELP_EMBED_BATCH_SIZE` | `auto` | Embedding batch size (auto if unset) |
+
+## Performance And GPU (Automatic By Default)
+
+The server auto-detects the best embedding device:
+
+1. `cuda` if available
+2. `mps` on Apple Silicon
+3. `cpu` fallback
+
+No configuration is required for automatic GPU usage.
+
+Optional overrides are available for troubleshooting or benchmarking:
+
+```bash
+uv run as-help-server --embedding-device cuda --embed-batch-size 512
+```
+
+Recommended batch sizes:
+
+- GPU (`cuda`): start with `--embed-batch-size 512` (increase if VRAM allows)
+- CPU: start with `--embed-batch-size 128`
+
+## Troubleshooting Slow Model Import
+
+If startup repeatedly shows:
+
+`Still loading embedding model (importing sentence_transformers)...`
+
+for a long time, use this checklist:
+
+1. Ensure only one `as-help-server` process is running.
+2. Wait for first-run import/download to complete once (cold environment can be slow).
+3. Set `HF_TOKEN` to improve Hugging Face download rate limits.
+4. Temporarily force CPU to verify GPU stack health:
+
+```bash
+uv run as-help-server --embedding-device cpu
+```
+
+5. If CPU works and CUDA hangs, update NVIDIA driver / CUDA runtime / PyTorch CUDA build alignment.
+
+The server now logs periodic model-load heartbeat messages and uses a cross-process build lock to avoid duplicate heavy rebuilds.
 
 ---
 

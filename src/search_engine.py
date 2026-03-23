@@ -46,6 +46,10 @@ class HelpSearchEngine:
 
     TABLE_NAME = "help_pages"
 
+    # Class-level tracking of active db_paths in this process (for same-process detection)
+    _active_db_paths: set[str] = set()
+    _active_db_paths_lock = threading.Lock()
+
     def __init__(
         self,
         db_path: Path,
@@ -91,6 +95,15 @@ class HelpSearchEngine:
 
         # Build progress marker for resume support
         self._build_progress_path = self.db_path / "_build_progress.json"
+        # Build lock to avoid concurrent heavy rebuild/model-load in multiple processes
+        self._build_lock_path = self.db_path / "_build.lock"
+        self._build_lock_owned = False
+
+        # Per-db-path instance lock: prevents multiple servers using the same database.
+        # Different db paths (e.g. AS4 vs AS6) can run concurrently.
+        self._instance_lock_path = self.db_path / "_instance.lock"
+        self._instance_lock_owned = False
+        self._acquire_instance_lock()
 
         # Determine build strategy: full, resume, incremental, or none
         if force_rebuild:
@@ -117,6 +130,9 @@ class HelpSearchEngine:
             self._build_status["started_at"] = time.time()
             self._build_status["state"] = "building"
             self._build_status["pages_total"] = len(self.indexer.pages)
+
+            if self._build_strategy in ("full", "incremental", "resume"):
+                self._acquire_build_lock()
 
             # Eagerly load embedding model so device/download info is visible
             # before the slow text extraction phase.
@@ -155,6 +171,7 @@ class HelpSearchEngine:
             logger.error(f"Search index initialization failed: {e}")
             raise
         finally:
+            self._release_build_lock()
             self._ready.set()
         return self
 
@@ -328,6 +345,169 @@ class HelpSearchEngine:
         with open(self._build_progress_path, "w") as f:
             json.dump(progress, f)
 
+    # ------------------------------------------------------------------
+    # Instance lock: one server per db_path
+    # ------------------------------------------------------------------
+
+    def _acquire_instance_lock(self):
+        """Acquire a per-db-path instance lock. Raises if another live server holds it."""
+        resolved = str(self.db_path.resolve())
+
+        # Same-process check (e.g. two engines in the same Python process)
+        with self._active_db_paths_lock:
+            if resolved in self._active_db_paths:
+                raise RuntimeError(
+                    f"Another HelpSearchEngine in this process is already using "
+                    f"database at {self.db_path}. Close it first, "
+                    f"or use a different --db-path for each help root."
+                )
+
+        # Cross-process check via lock file
+        lock_info = self._read_instance_lock()
+        if lock_info is not None:
+            other_pid = lock_info.get("pid")
+            if other_pid and self._is_process_alive(other_pid) and other_pid != os.getpid():
+                raise RuntimeError(
+                    f"Another as-help-server (PID {other_pid}) is already using "
+                    f"database at {self.db_path}. Stop the other instance first, "
+                    f"or use a different --db-path for each help root."
+                )
+            # Stale lock from a dead process -- safe to overwrite
+            if other_pid and other_pid != os.getpid():
+                logger.debug("Overwriting stale instance lock (PID %s no longer running)", other_pid)
+
+        self._write_instance_lock()
+        with self._active_db_paths_lock:
+            self._active_db_paths.add(resolved)
+        self._instance_lock_owned = True
+        logger.info("Acquired instance lock for %s (PID %s)", self.db_path, os.getpid())
+
+    def _release_instance_lock(self):
+        """Release instance lock if owned by this process."""
+        if not self._instance_lock_owned:
+            return
+        try:
+            self._instance_lock_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            resolved = str(self.db_path.resolve())
+            with self._active_db_paths_lock:
+                self._active_db_paths.discard(resolved)
+        except Exception:
+            pass
+        finally:
+            self._instance_lock_owned = False
+
+    def _read_instance_lock(self) -> dict | None:
+        """Read instance lock file, or None if absent/corrupt."""
+        try:
+            with open(self._instance_lock_path) as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError, ValueError):
+            return None
+
+    def _write_instance_lock(self):
+        """Write current PID to instance lock file."""
+        with open(self._instance_lock_path, "w") as f:
+            json.dump({"pid": os.getpid(), "started_at": time.time()}, f)
+
+    @staticmethod
+    def _is_process_alive(pid: int) -> bool:
+        """Check whether a process with the given PID is still running."""
+        if sys.platform == "win32":
+            import ctypes
+            from ctypes import wintypes
+            kernel32 = ctypes.windll.kernel32
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                return False
+            try:
+                exit_code = wintypes.DWORD()
+                if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                    return exit_code.value == STILL_ACTIVE
+                return False
+            finally:
+                kernel32.CloseHandle(handle)
+        try:
+            os.kill(pid, 0)
+            return True
+        except (OSError, ProcessLookupError):
+            return False
+
+    # ------------------------------------------------------------------
+    # Build lock: serialises heavy rebuild/model-load across processes
+    # ------------------------------------------------------------------
+
+    def _acquire_build_lock(self, timeout_seconds: int = 1800):
+        """Acquire a file-based lock so only one process runs heavy build work."""
+        if self._build_lock_owned:
+            return
+
+        start = time.time()
+        warned = False
+
+        while True:
+            try:
+                fd = os.open(str(self._build_lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                with os.fdopen(fd, "w") as f:
+                    json.dump({"pid": os.getpid(), "started_at": time.time()}, f)
+                self._build_lock_owned = True
+                logger.info("Acquired build lock")
+                return
+            except FileExistsError:
+                # Reap stale lock files from crashed processes.
+                try:
+                    lock_data = json.loads(self._build_lock_path.read_text())
+                    lock_pid = lock_data.get("pid")
+                except (OSError, json.JSONDecodeError, ValueError):
+                    lock_pid = None
+
+                # If we hold the instance lock, we know no other live server
+                # is using this db path — any build lock is leftover from a crash.
+                if self._instance_lock_owned:
+                    logger.warning("Removing stale build lock (this process holds instance lock)")
+                    self._build_lock_path.unlink(missing_ok=True)
+                    continue
+
+                # Check if the lock holder is still alive
+                if lock_pid and not self._is_process_alive(lock_pid):
+                    logger.warning("Removing stale build lock (PID %s no longer running)", lock_pid)
+                    self._build_lock_path.unlink(missing_ok=True)
+                    continue
+
+                # Fallback: reap very old locks (e.g. PID was recycled)
+                try:
+                    age = time.time() - self._build_lock_path.stat().st_mtime
+                    if age > 6 * 3600:
+                        logger.warning("Removing stale build lock older than 6h")
+                        self._build_lock_path.unlink(missing_ok=True)
+                        continue
+                except OSError:
+                    pass
+
+                if not warned:
+                    logger.info("Another as-help-server instance is rebuilding. Waiting for build lock...")
+                    warned = True
+
+                if time.time() - start > timeout_seconds:
+                    raise TimeoutError("Timed out waiting for build lock")
+
+                time.sleep(2)
+
+    def _release_build_lock(self):
+        """Release build lock if owned by this process."""
+        if not self._build_lock_owned:
+            return
+        try:
+            self._build_lock_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        finally:
+            self._build_lock_owned = False
+
     def _clear_build_progress(self):
         """Remove build progress marker (build completed successfully)."""
         if self._build_progress_path.exists():
@@ -383,6 +563,32 @@ class HelpSearchEngine:
             "content_vector": content_vectors,
         }
         return pa.table(data, schema=self._get_table_schema())
+
+    def _build_content_vectors(self, records, title_vectors) -> list[list[float]]:
+        """Build content vectors efficiently.
+
+        For sections (empty content), we reuse title vectors instead of embedding
+        the same title text again. For regular pages, we embed only non-empty
+        content strings.
+        """
+        content_indices: list[int] = []
+        content_texts: list[str] = []
+
+        for idx, record in enumerate(records):
+            content = record[2]
+            if content:
+                content_indices.append(idx)
+                content_texts.append(content)
+
+        # Default: reuse title vectors (especially useful for section rows)
+        content_vectors = list(title_vectors)
+
+        if content_texts:
+            embedded_contents = self.embedder.embed_batch(content_texts)
+            for idx, vec in zip(content_indices, embedded_contents):
+                content_vectors[idx] = vec
+
+        return content_vectors
 
     def _build_index(self, resume_ids: set[str] | None = None):
         """Build search index in chunks with resume support.
@@ -456,10 +662,8 @@ class HelpSearchEngine:
             self._build_status["phase"] = f"embedding (chunk {chunk_num}/{total_chunks})"
             title_vectors = self.embedder.embed_batch(titles)
 
-            # 3. Embed content (use title as fallback for sections)
-            contents = [r[2] for r in records]
-            content_texts = [c if c else t for c, t in zip(contents, titles)]
-            content_vectors = self.embedder.embed_batch(content_texts)
+            # 3. Embed content (reuse title vectors for section rows)
+            content_vectors = self._build_content_vectors(records, title_vectors)
 
             # 4. Write chunk to LanceDB
             chunk_data = self._records_to_arrow(records, title_vectors, content_vectors)
@@ -592,10 +796,8 @@ class HelpSearchEngine:
             self._build_status["phase"] = "embedding titles"
             title_vectors = self.embedder.embed_batch(titles)
 
-            contents = [r[2] for r in records]
-            content_texts = [c if c else t for c, t in zip(contents, titles)]
             self._build_status["phase"] = "embedding content"
-            content_vectors = self.embedder.embed_batch(content_texts)
+            content_vectors = self._build_content_vectors(records, title_vectors)
 
             new_data = self._records_to_arrow(records, title_vectors, content_vectors)
             table.add(new_data)
@@ -779,7 +981,8 @@ class HelpSearchEngine:
         return results
 
     def close(self):
-        """Close database connection."""
+        """Close database connection and release instance lock."""
+        self._release_instance_lock()
         self.db = None
 
     def __del__(self):

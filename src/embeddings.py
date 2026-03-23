@@ -3,6 +3,7 @@
 import logging
 import os
 import sys
+import threading
 import time
 
 logger = logging.getLogger(__name__)
@@ -30,32 +31,102 @@ class EmbeddingService:
         self._model = None
         self._dimension: int | None = None
         self._device: str | None = None
+        self._load_lock = threading.Lock()
 
     def _load_model(self):
         """Lazy-load the sentence-transformer model on first use."""
         if self._model is not None:
             return
 
-        import torch
-        from sentence_transformers import SentenceTransformer
+        with self._load_lock:
+            if self._model is not None:
+                return
 
-        # Auto-detect best available device
-        if torch.cuda.is_available():
-            device = "cuda"
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            device = "mps"
-        else:
-            device = "cpu"
+            start = time.time()
+            heartbeat_stop = threading.Event()
+            phase = {"name": "starting"}
+            import_warned = {"value": False}
 
-        logger.info(f"Loading embedding model '{self.model_name}' on {device} (first use may download ~22MB)...")
-        _flush_logs()
-        start = time.time()
-        self._model = SentenceTransformer(self.model_name, device=device)
-        self._dimension = self._model.get_sentence_embedding_dimension()
-        self._device = device
-        elapsed = time.time() - start
-        logger.info(f"Embedding model loaded in {elapsed:.1f}s (device={device}, dimension={self._dimension})")
-        _flush_logs()
+            # Emit periodic heartbeat logs so users can see activity even if
+            # imports or model initialization are slow.
+            def _heartbeat():
+                while not heartbeat_stop.wait(10):
+                    elapsed = time.time() - start
+                    logger.info(
+                        f"Still loading embedding model ({phase['name']})... {elapsed:.0f}s elapsed"
+                    )
+                    if (
+                        not import_warned["value"]
+                        and phase["name"] == "importing sentence_transformers"
+                        and elapsed >= 120
+                    ):
+                        logger.warning(
+                            "sentence_transformers import is unusually slow. "
+                            "Ensure only one as-help-server instance is running. "
+                            "See README troubleshooting section for acceleration options."
+                        )
+                        import_warned["value"] = True
+                    _flush_logs()
+
+            heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
+            heartbeat_thread.start()
+
+            try:
+                phase["name"] = "importing torch"
+                logger.info("Embedding load phase: importing torch")
+                _flush_logs()
+                import torch
+
+                phase["name"] = "importing sentence_transformers"
+                logger.info("Embedding load phase: importing sentence_transformers")
+                _flush_logs()
+
+                # Skip optional transformer backends we do not use.
+                # This reduces import overhead and avoids unnecessary framework initialization.
+                os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+                os.environ.setdefault("TRANSFORMERS_NO_FLAX", "1")
+                os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+                from sentence_transformers import SentenceTransformer
+
+                # Allow explicit device override for troubleshooting.
+                forced_device = os.getenv("AS_HELP_EMBEDDING_DEVICE", "").strip().lower()
+                if forced_device in ("cpu", "cuda", "mps"):
+                    device = forced_device
+                    logger.info(f"Embedding device forced via AS_HELP_EMBEDDING_DEVICE={device}")
+                    _flush_logs()
+                else:
+                    phase["name"] = "detecting device"
+                    logger.info("Embedding load phase: detecting device")
+                    _flush_logs()
+                    # Auto-detect best available device
+                    if torch.cuda.is_available():
+                        device = "cuda"
+                    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                        device = "mps"
+                    else:
+                        device = "cpu"
+
+                logger.info(
+                    f"Loading embedding model '{self.model_name}' on {device} "
+                    "(first use may download ~22MB)..."
+                )
+                _flush_logs()
+
+                phase["name"] = f"initializing model ({device})"
+                self._model = SentenceTransformer(self.model_name, device=device)
+
+                phase["name"] = "reading model metadata"
+                self._dimension = self._model.get_sentence_embedding_dimension()
+                self._device = device
+                elapsed = time.time() - start
+                logger.info(
+                    f"Embedding model loaded in {elapsed:.1f}s "
+                    f"(device={device}, dimension={self._dimension})"
+                )
+                _flush_logs()
+            finally:
+                heartbeat_stop.set()
 
     @property
     def dimension(self) -> int:
@@ -99,7 +170,22 @@ class EmbeddingService:
 
         # Auto-select batch size based on device if not specified
         if batch_size is None:
-            batch_size = 256 if self._device in ("cuda", "mps") else 64
+            configured = os.getenv("AS_HELP_EMBED_BATCH_SIZE", "").strip()
+            if configured:
+                try:
+                    configured_size = int(configured)
+                    if configured_size > 0:
+                        batch_size = configured_size
+                    else:
+                        raise ValueError("batch size must be > 0")
+                except ValueError:
+                    logger.warning(
+                        f"Invalid AS_HELP_EMBED_BATCH_SIZE='{configured}', "
+                        "falling back to default"
+                    )
+                    batch_size = 256 if self._device in ("cuda", "mps") else 64
+            else:
+                batch_size = 256 if self._device in ("cuda", "mps") else 64
 
         # Truncate long texts
         max_chars = 2048

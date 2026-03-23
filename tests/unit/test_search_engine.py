@@ -865,3 +865,66 @@ class TestReadyStateSemantics:
         assert engine.ready is False
         assert engine.build_status["state"] == "error"
         engine.close()
+
+
+class TestInstanceLock:
+    """Test per-db-path instance lock prevents duplicate servers."""
+
+    def test_second_instance_same_db_path_raises(self, initialized_indexer, tmp_path, mock_embedding_service):
+        """A second engine on the same db_path should fail while the first is alive."""
+        db_path = tmp_path / "lock_lance"
+        engine1 = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+
+        with pytest.raises(RuntimeError, match="already using"):
+            HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+
+        engine1.close()
+
+    def test_instance_lock_released_on_close(self, initialized_indexer, tmp_path, mock_embedding_service):
+        """After close(), a new engine should acquire the lock successfully."""
+        db_path = tmp_path / "lock_lance"
+        engine1 = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine1.close()
+
+        # Should succeed now
+        engine2 = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine2.close()
+
+    def test_different_db_paths_allowed(self, initialized_indexer, tmp_path, mock_embedding_service):
+        """Different db paths should be able to run concurrently."""
+        db1 = tmp_path / "lance_as4"
+        db2 = tmp_path / "lance_as6"
+        engine1 = HelpSearchEngine(db1, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine2 = HelpSearchEngine(db2, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+
+        # Both acquired locks successfully
+        assert engine1._instance_lock_owned
+        assert engine2._instance_lock_owned
+
+        engine1.close()
+        engine2.close()
+
+    def test_stale_lock_from_dead_process_overwritten(self, initialized_indexer, tmp_path, mock_embedding_service):
+        """A lock file from a dead PID should be overwritten."""
+        db_path = tmp_path / "stale_lance"
+        db_path.mkdir(parents=True, exist_ok=True)
+
+        # Write a lock with a PID that definitely doesn't exist
+        lock_path = db_path / "_instance.lock"
+        import json
+        with open(lock_path, "w") as f:
+            json.dump({"pid": 99999999, "started_at": 0}, f)
+
+        # Should succeed — stale lock is overwritten
+        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        assert engine._instance_lock_owned
+        engine.close()
+
+    def test_context_manager_releases_instance_lock(self, initialized_indexer, tmp_path, mock_embedding_service):
+        """Instance lock should be released when using context manager."""
+        db_path = tmp_path / "ctx_lance"
+        with HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service) as engine:
+            assert engine._instance_lock_owned
+
+        # Lock should be released, file gone
+        assert not (db_path / "_instance.lock").exists()
