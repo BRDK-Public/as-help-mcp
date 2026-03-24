@@ -1,10 +1,16 @@
 """Embedding service for semantic search using sentence-transformers."""
 
+from __future__ import annotations
+
 import logging
 import os
 import sys
 import threading
 import time
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from sentence_transformers import SentenceTransformer
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +34,7 @@ class EmbeddingService:
                         env var or 'all-MiniLM-L6-v2'.
         """
         self.model_name = model_name or os.getenv("AS_HELP_EMBEDDING_MODEL", DEFAULT_MODEL_NAME)
-        self._model = None
+        self._model: SentenceTransformer | None = None
         self._dimension: int | None = None
         self._device: str | None = None
         self._load_lock = threading.Lock()

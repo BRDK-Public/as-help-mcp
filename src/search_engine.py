@@ -237,7 +237,7 @@ class HelpSearchEngine:
         try:
             with open(self._metadata_path) as f:
                 metadata = json.load(f)
-            return (
+            return (  # type: ignore[no-any-return]
                 metadata.get("xml_hash") != self.indexer._get_xml_hash()
                 or metadata.get("embedding_model") != self.embedder.model_name
             )
@@ -340,7 +340,7 @@ class HelpSearchEngine:
                 return False
             with open(self._build_progress_path) as f:
                 progress = json.load(f)
-            return (
+            return (  # type: ignore[no-any-return]
                 progress.get("xml_hash") == self.indexer._get_xml_hash()
                 and progress.get("embedding_model") == self.embedder.model_name
             )
@@ -414,7 +414,7 @@ class HelpSearchEngine:
         """Read instance lock file, or None if absent/corrupt."""
         try:
             with open(self._instance_lock_path) as f:
-                return json.load(f)
+                return json.load(f)  # type: ignore[no-any-return]
         except (OSError, json.JSONDecodeError, ValueError):
             return None
 
@@ -998,7 +998,7 @@ class HelpSearchEngine:
             builder = table.search(query_vector, vector_column_name=column_name)
             if where_clause:
                 builder = builder.where(where_clause)
-            return builder.limit(limit).to_list()
+            return builder.limit(limit).to_list()  # type: ignore[no-any-return]
         except Exception as e:
             logger.warning(f"Vector search on {column_name} failed: {e}")
             return []
@@ -1021,7 +1021,7 @@ class HelpSearchEngine:
             builder = table.search(fts_query, query_type="fts")
             if where_clause:
                 builder = builder.where(where_clause)
-            return builder.limit(limit).to_list()
+            return builder.limit(limit).to_list()  # type: ignore[no-any-return]
         except Exception as e:
             logger.warning(f"FTS search failed for '{fts_query}': {e}")
             return []

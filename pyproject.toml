@@ -25,6 +25,8 @@ test = [
     "pytest-cov>=4.1.0",
     "ruff>=0.8.0",
     "mypy>=1.13.0",
+    "lxml-stubs>=0.5.1",
+    "types-defusedxml>=0.7.0.20250822",
 ]
 dev = [
     "lxml-stubs>=0.5.1",
@@ -99,6 +101,19 @@ warn_redundant_casts = true
 warn_unused_ignores = true
 warn_no_return = true
 strict_equality = true
+
+[[tool.mypy.overrides]]
+module = [
+    "lancedb",
+    "lancedb.*",
+    "pyarrow",
+    "pyarrow.*",
+    "sentence_transformers",
+    "sentence_transformers.*",
+    "torch",
+    "torch.*",
+]
+ignore_missing_imports = true
 
 [tool.uv]
 # CPU-only PyTorch by default (~200 MB instead of ~2.4 GiB).
