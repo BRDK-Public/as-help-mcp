@@ -75,6 +75,8 @@ hidden_imports = [
     # Async support
     "asyncio",
     "concurrent.futures",
+    # Numeric (required by lancedb)
+    "numpy",
 ]
 
 a = Analysis(
@@ -90,7 +92,6 @@ a = Analysis(
         # Exclude unnecessary modules to reduce binary size
         "tkinter",
         "matplotlib",
-        "numpy",
         "pandas",
         "PIL",
         "scipy",
