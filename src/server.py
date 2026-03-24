@@ -94,6 +94,10 @@ class SearchResults(BaseModel):
     query: str = Field(description="The search query")
     results: list[SearchResult] = Field(description="List of matching pages")
     total: int = Field(description="Total number of results returned")
+    search_mode: str | None = Field(
+        default=None,
+        description="Search mode: 'hybrid' (semantic + keyword) or 'keyword' (keyword only, vectors still building)",
+    )
     status_message: str | None = Field(
         default=None,
         description="Status message when index is not ready (e.g., building). Call get_help_statistics for details.",
@@ -325,10 +329,10 @@ def search_help(
     app_ctx: AppContext = ctx.request_context.lifespan_context
 
     # Return immediately with status when the index is not queryable.
-    # This covers both active builds and failed initialization.
+    # fts_ready allows keyword-only search while vectors are still building.
     status = app_ctx.search_engine.build_status
     state = status.get("state")
-    if state != "ready":
+    if state not in ("ready", "fts_ready"):
         phase = status.get("phase", "")
         build_type = status.get("build_type", "unknown")
         processed = status.get("pages_processed", 0)
@@ -394,7 +398,21 @@ def search_help(
 
         search_results.append(result)
 
-    return SearchResults(query=query, results=search_results, total=len(search_results))
+    # Determine search mode from results (all results share the same mode)
+    search_mode = results[0].get("search_mode", "hybrid") if results else "hybrid"
+
+    # Add status message when running in degraded keyword-only mode
+    status_msg = None
+    if search_mode == "keyword":
+        status_msg = (
+            "Semantic search is still loading — results are keyword-only. "
+            "Retry later for better relevance ranking."
+        )
+
+    return SearchResults(
+        query=query, results=search_results, total=len(search_results),
+        search_mode=search_mode, status_message=status_msg,
+    )
 
 
 @mcp.tool()

@@ -69,11 +69,12 @@ class HelpSearchEngine:
         self.indexer = indexer
         self.embedder = embedding_service or EmbeddingService()
         self._ready = threading.Event()
+        self._fts_ready = threading.Event()
         self._build_error: Exception | None = None
 
         # Build status tracking (thread-safe via GIL for simple dict updates)
         self._build_status: dict = {
-            "state": "initializing",  # initializing | building | ready | error
+            "state": "initializing",  # initializing | building | fts_ready | ready | error
             "build_type": None,       # full | incremental | none
             "phase": "",              # current phase description
             "pages_total": 0,
@@ -120,6 +121,10 @@ class HelpSearchEngine:
     def initialize(self):
         """Build or load the search index (may be slow on first run).
 
+        For full/resume builds, uses a two-phase approach:
+        - Phase 1: Extract text → write with zero vectors → build FTS → keyword search available
+        - Phase 2: Load embedding model → embed → overwrite table → full hybrid search
+
         Call this after construction. Can be run in a background thread to
         avoid blocking the MCP server startup.
 
@@ -134,25 +139,20 @@ class HelpSearchEngine:
             if self._build_strategy in ("full", "incremental", "resume"):
                 self._acquire_build_lock()
 
-            # Eagerly load embedding model so device/download info is visible
-            # before the slow text extraction phase.
-            if self._build_strategy in ("full", "incremental", "resume"):
-                self._build_status["phase"] = "loading embedding model"
-                logger.info(f"Loading embedding model ({len(self.indexer.pages)} pages to process)...")
-                sys.stderr.flush()
-                self.embedder._load_model()
-
             if self._build_strategy == "full":
-                logger.info("Building new search index (full)...")
+                logger.info("Building new search index (full, two-phase)...")
                 sys.stderr.flush()
-                self._build_index()
+                self._build_index_two_phase()
             elif self._build_strategy == "resume":
                 resume_ids = self._get_indexed_page_ids()
                 logger.info(f"Resuming interrupted build ({len(resume_ids)} pages already indexed)...")
                 sys.stderr.flush()
-                self._build_index(resume_ids=resume_ids)
+                self._build_index_two_phase(resume_ids=resume_ids)
             elif self._build_strategy == "incremental":
-                logger.info("Performing incremental index update...")
+                # Existing index already has FTS — make it available immediately
+                self._fts_ready.set()
+                self._build_status["state"] = "fts_ready"
+                logger.info("Performing incremental index update (keyword search available)...")
                 sys.stderr.flush()
                 self._incremental_update()
             else:
@@ -160,6 +160,8 @@ class HelpSearchEngine:
                 logger.info("Loading existing search index...")
                 sys.stderr.flush()
                 self._load_index()
+                # Existing index: both FTS and vectors are ready
+                self._fts_ready.set()
 
             self._build_status["state"] = "ready"
             self._build_status["phase"] = "complete"
@@ -177,10 +179,19 @@ class HelpSearchEngine:
 
     @property
     def ready(self) -> bool:
-        """Whether the search index is ready for queries."""
+        """Whether the search index is fully ready (hybrid search with vectors)."""
         # _ready is set in finally{} for both success and error to unblock waiters.
         # A usable index requires explicit ready state.
         return self._ready.is_set() and self._build_status.get("state") == "ready"
+
+    @property
+    def fts_ready(self) -> bool:
+        """Whether keyword (FTS) search is available.
+
+        True when the FTS index exists and can serve keyword queries,
+        even if vector embeddings are still being computed.
+        """
+        return self._fts_ready.is_set() and self._build_status.get("state") in ("fts_ready", "ready")
 
     @property
     def build_status(self) -> dict:
@@ -590,6 +601,152 @@ class HelpSearchEngine:
 
         return content_vectors
 
+    def _build_index_two_phase(self, resume_ids: set[str] | None = None):
+        """Build search index in two phases: FTS-first, then vectors.
+
+        Phase 1: Extract text → write to LanceDB with zero vectors → build FTS index
+                 → set _fts_ready (keyword search available immediately)
+        Phase 2: Load embedding model → compute real vectors → overwrite table
+                 → rebuild FTS → set _ready (full hybrid search)
+
+        Args:
+            resume_ids: Set of page_ids already indexed (for resume). None for fresh build.
+        """
+        start_time = time.time()
+        all_pages = list(self.indexer.pages.items())
+        total_pages = len(all_pages)
+
+        if resume_ids:
+            pages_to_process = [(pid, page) for pid, page in all_pages if pid not in resume_ids]
+            already_done = total_pages - len(pages_to_process)
+            table_created = True
+            logger.info(f"Resuming: {already_done} already indexed, {len(pages_to_process)} remaining")
+        else:
+            pages_to_process = all_pages
+            already_done = 0
+            table_created = False
+            try:
+                if self.TABLE_NAME in self.db.list_tables().tables:
+                    self.db.drop_table(self.TABLE_NAME)
+            except Exception:
+                pass
+
+        self._build_status["pages_total"] = total_pages
+        self._build_status["pages_processed"] = already_done
+
+        if not pages_to_process:
+            logger.info("All pages already indexed, finalizing...")
+            self._finalize_build(start_time, total_pages)
+            self._fts_ready.set()
+            self._build_status["state"] = "fts_ready"
+            return
+
+        self._save_build_progress()
+
+        max_workers = min(int(os.cpu_count() or 4), 10)
+        remaining = len(pages_to_process)
+        total_chunks = (remaining + BUILD_CHUNK_SIZE - 1) // BUILD_CHUNK_SIZE
+        dim = self.embedder.dimension
+
+        # ── Phase 1: Extract text, write with zero vectors, build FTS ──
+        logger.info(f"Phase 1: Extracting text for {remaining} pages ({total_chunks} chunks)...")
+        sys.stderr.flush()
+
+        all_records: list[tuple] = []
+
+        for chunk_start in range(0, remaining, BUILD_CHUNK_SIZE):
+            chunk = pages_to_process[chunk_start:chunk_start + BUILD_CHUNK_SIZE]
+            chunk_num = chunk_start // BUILD_CHUNK_SIZE + 1
+
+            self._build_status["phase"] = f"extracting text (chunk {chunk_num}/{total_chunks})"
+            records = []
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                extraction_results = executor.map(
+                    lambda item: self._extract_text_for_page(item[0], item[1]),
+                    chunk,
+                    chunksize=min(100, max(1, max_workers * 2)),
+                )
+                for result in extraction_results:
+                    records.append(result)
+
+            all_records.extend(records)
+
+            # Write chunk with zero vectors
+            zero_title_vectors = [[0.0] * dim for _ in records]
+            zero_content_vectors = [[0.0] * dim for _ in records]
+            chunk_data = self._records_to_arrow(records, zero_title_vectors, zero_content_vectors)
+
+            self._build_status["phase"] = f"saving text (chunk {chunk_num}/{total_chunks})"
+            if not table_created:
+                self.db.create_table(self.TABLE_NAME, chunk_data)
+                table_created = True
+            else:
+                table = self.db.open_table(self.TABLE_NAME)
+                table.add(chunk_data)
+
+            processed = already_done + chunk_start + len(chunk)
+            self._build_status["pages_processed"] = processed
+            logger.info(f"Phase 1 chunk {chunk_num}/{total_chunks}: {processed}/{total_pages} pages")
+            sys.stderr.flush()
+
+        # Build FTS index → keyword search available
+        self._build_status["phase"] = "creating FTS index (keyword search)"
+        logger.info("Creating FTS index...")
+        table = self.db.open_table(self.TABLE_NAME)
+        table.create_fts_index("search_text", replace=True)
+
+        self._fts_ready.set()
+        self._build_status["state"] = "fts_ready"
+        phase1_elapsed = time.time() - start_time
+        logger.info(f"Phase 1 complete in {phase1_elapsed:.1f}s — keyword search is now available")
+        sys.stderr.flush()
+
+        # ── Phase 2: Load embedding model, compute real vectors, overwrite table ──
+        self._build_status["phase"] = "loading embedding model"
+        logger.info("Phase 2: Loading embedding model...")
+        sys.stderr.flush()
+        self.embedder._load_model()
+
+        # Embed in chunks to avoid excessive memory usage
+        logger.info(f"Phase 2: Embedding {len(all_records)} pages...")
+        all_title_vectors: list[list[float]] = []
+        all_content_vectors: list[list[float]] = []
+
+        for chunk_start in range(0, len(all_records), BUILD_CHUNK_SIZE):
+            chunk_records = all_records[chunk_start:chunk_start + BUILD_CHUNK_SIZE]
+            chunk_num = chunk_start // BUILD_CHUNK_SIZE + 1
+
+            titles = [r[1] for r in chunk_records]
+            self._build_status["phase"] = f"embedding (chunk {chunk_num}/{total_chunks})"
+            title_vectors = self.embedder.embed_batch(titles)
+            content_vectors = self._build_content_vectors(chunk_records, title_vectors)
+
+            all_title_vectors.extend(title_vectors)
+            all_content_vectors.extend(content_vectors)
+
+            logger.info(f"Phase 2 embedding chunk {chunk_num}/{total_chunks}")
+            sys.stderr.flush()
+
+        # Overwrite the table with real vectors
+        self._build_status["phase"] = "writing vectors to index"
+        logger.info("Writing vectors to index...")
+        full_data = self._records_to_arrow(all_records, all_title_vectors, all_content_vectors)
+        self.db.drop_table(self.TABLE_NAME)
+        self.db.create_table(self.TABLE_NAME, full_data)
+
+        # Rebuild FTS after table overwrite
+        self._build_status["phase"] = "rebuilding FTS index"
+        logger.info("Rebuilding FTS index...")
+        table = self.db.open_table(self.TABLE_NAME)
+        table.create_fts_index("search_text", replace=True)
+
+        self._save_metadata()
+        self._clear_build_progress()
+
+        self._build_status["pages_processed"] = total_pages
+        elapsed = time.time() - start_time
+        logger.info(f"Phase 2 complete — full hybrid search ready in {elapsed:.1f}s ({total_pages} documents)")
+
     def _build_index(self, resume_ids: set[str] | None = None):
         """Build search index in chunks with resume support.
 
@@ -900,6 +1057,9 @@ class HelpSearchEngine:
     ) -> list[dict]:
         """Search for help pages using hybrid search with RRF fusion.
 
+        When the index is in fts_ready state (vectors not yet computed), falls
+        back to keyword-only search. Once fully ready, uses full hybrid RRF.
+
         Args:
             query: Search query (keywords or natural language)
             limit: Maximum number of results
@@ -908,7 +1068,7 @@ class HelpSearchEngine:
 
         Returns:
             List of search results with page_id, title, file_path, help_id,
-            is_section, breadcrumb_path, category, score, snippet
+            is_section, breadcrumb_path, category, score, snippet, search_mode
         """
         if not query.strip():
             return []
@@ -916,49 +1076,57 @@ class HelpSearchEngine:
         table = self.db.open_table(self.TABLE_NAME)
         where_clause = self._build_category_filter(category)
 
-        # Embed query for vector search
-        query_vector = self.embedder.embed_text(query)
+        # Determine search mode based on readiness
+        use_vectors = self.ready  # Full hybrid only when vectors are computed
 
-        # Fetch extra results for RRF fusion (fusing 3 lists needs headroom)
-        fetch_limit = min(limit * 3, 100)
+        if use_vectors:
+            # Full hybrid search: vectors + FTS with RRF fusion
+            query_vector = self.embedder.embed_text(query)
+            fetch_limit = min(limit * 3, 100)
 
-        # --- Three search legs ---
+            title_results = self._vector_search(table, query_vector, "title_vector", fetch_limit, where_clause)
+            content_results = []
+            if search_in_content:
+                content_results = self._vector_search(table, query_vector, "content_vector", fetch_limit, where_clause)
+            fts_results = self._fts_search(table, query, fetch_limit, where_clause)
 
-        # 1. Title vector search (weight: WEIGHT_TITLE_VECTOR)
-        title_results = self._vector_search(table, query_vector, "title_vector", fetch_limit, where_clause)
+            # RRF Fusion
+            rrf_scores: dict[str, float] = {}
+            page_data: dict[str, dict] = {}
 
-        # 2. Content vector search (weight: WEIGHT_CONTENT_VECTOR)
-        content_results = []
-        if search_in_content:
-            content_results = self._vector_search(table, query_vector, "content_vector", fetch_limit, where_clause)
+            for rank, row in enumerate(title_results):
+                pid = row["page_id"]
+                rrf_scores[pid] = rrf_scores.get(pid, 0.0) + WEIGHT_TITLE_VECTOR / (RRF_K + rank + 1)
+                if pid not in page_data:
+                    page_data[pid] = row
 
-        # 3. FTS keyword search (weight: WEIGHT_FTS_KEYWORD)
-        fts_results = self._fts_search(table, query, fetch_limit, where_clause)
+            for rank, row in enumerate(content_results):
+                pid = row["page_id"]
+                rrf_scores[pid] = rrf_scores.get(pid, 0.0) + WEIGHT_CONTENT_VECTOR / (RRF_K + rank + 1)
+                if pid not in page_data:
+                    page_data[pid] = row
 
-        # --- RRF Fusion ---
-        rrf_scores: dict[str, float] = {}
-        page_data: dict[str, dict] = {}
+            for rank, row in enumerate(fts_results):
+                pid = row["page_id"]
+                rrf_scores[pid] = rrf_scores.get(pid, 0.0) + WEIGHT_FTS_KEYWORD / (RRF_K + rank + 1)
+                if pid not in page_data:
+                    page_data[pid] = row
 
-        for rank, row in enumerate(title_results):
-            pid = row["page_id"]
-            rrf_scores[pid] = rrf_scores.get(pid, 0.0) + WEIGHT_TITLE_VECTOR / (RRF_K + rank + 1)
-            if pid not in page_data:
+            sorted_ids = sorted(rrf_scores.keys(), key=lambda pid: rrf_scores[pid], reverse=True)[:limit]
+            search_mode = "hybrid"
+        else:
+            # FTS-only mode (vectors not yet available)
+            fts_results = self._fts_search(table, query, limit, where_clause)
+            rrf_scores = {}
+            page_data = {}
+
+            for rank, row in enumerate(fts_results):
+                pid = row["page_id"]
+                rrf_scores[pid] = WEIGHT_FTS_KEYWORD / (RRF_K + rank + 1)
                 page_data[pid] = row
 
-        for rank, row in enumerate(content_results):
-            pid = row["page_id"]
-            rrf_scores[pid] = rrf_scores.get(pid, 0.0) + WEIGHT_CONTENT_VECTOR / (RRF_K + rank + 1)
-            if pid not in page_data:
-                page_data[pid] = row
-
-        for rank, row in enumerate(fts_results):
-            pid = row["page_id"]
-            rrf_scores[pid] = rrf_scores.get(pid, 0.0) + WEIGHT_FTS_KEYWORD / (RRF_K + rank + 1)
-            if pid not in page_data:
-                page_data[pid] = row
-
-        # Sort by RRF score (higher is better) and take top results
-        sorted_ids = sorted(rrf_scores.keys(), key=lambda pid: rrf_scores[pid], reverse=True)[:limit]
+            sorted_ids = sorted(rrf_scores.keys(), key=lambda pid: rrf_scores[pid], reverse=True)[:limit]
+            search_mode = "keyword"
 
         # Build result dicts
         results = []
@@ -975,9 +1143,10 @@ class HelpSearchEngine:
                 "category": row.get("category") or None,
                 "score": rrf_scores[pid],
                 "snippet": snippet,
+                "search_mode": search_mode,
             })
 
-        logger.info(f"Search for '{query}' (cat={category}) returned {len(results)} results")
+        logger.info(f"Search for '{query}' (cat={category}, mode={search_mode}) returned {len(results)} results")
         return results
 
     def close(self):

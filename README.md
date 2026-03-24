@@ -175,15 +175,23 @@ The server supports configuration via both environment variables and command-lin
 | `--embedding-device` | `AS_HELP_EMBEDDING_DEVICE` | `auto` | Embedding device: auto-detect CUDA/MPS/CPU (override optional) |
 | `--embed-batch-size` | `AS_HELP_EMBED_BATCH_SIZE` | `auto` | Embedding batch size (auto if unset) |
 
-## Performance And GPU (Automatic By Default)
+## Performance And GPU Acceleration
 
-The server auto-detects the best embedding device:
+By default, the server installs **CPU-only PyTorch** (~200 MB) and runs embeddings on CPU. This works out of the box with no extra configuration.
 
-1. `cuda` if available
+### Optional: Enable CUDA GPU Acceleration
+
+If you have an NVIDIA GPU and want faster embedding (especially for first-time index builds), install with the `cuda` extra:
+
+```bash
+uv sync --extra cuda
+```
+
+This downloads the CUDA-enabled PyTorch (~2.4 GiB) and enables GPU-accelerated embeddings. The server auto-detects the best device at startup:
+
+1. `cuda` if available (requires `--extra cuda` install)
 2. `mps` on Apple Silicon
 3. `cpu` fallback
-
-No configuration is required for automatic GPU usage.
 
 Optional overrides are available for troubleshooting or benchmarking:
 

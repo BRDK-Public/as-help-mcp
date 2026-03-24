@@ -19,9 +19,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-cuda = [
-    "torch>=2.0.0",
-]
 test = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
@@ -104,15 +101,15 @@ warn_no_return = true
 strict_equality = true
 
 [tool.uv]
-# PyTorch CUDA wheels are only available from PyTorch's own index.
-# This is used when installing with: uv sync --extra cuda
+# CPU-only PyTorch by default (~200 MB instead of ~2.4 GiB).
+# For CUDA GPU acceleration, see README.md.
 [[tool.uv.index]]
-name = "pytorch-cu124"
-url = "https://download.pytorch.org/whl/cu124"
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu124", marker = "extra == 'cuda'" }
+torch = { index = "pytorch-cpu" }
 
 [build-system]
 requires = ["hatchling"]

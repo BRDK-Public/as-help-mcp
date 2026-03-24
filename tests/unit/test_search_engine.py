@@ -856,7 +856,7 @@ class TestReadyStateSemantics:
         db_path = tmp_path / "error_lance"
         engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
 
-        with patch.object(engine, "_build_index", side_effect=RuntimeError("boom")):
+        with patch.object(engine, "_build_index_two_phase", side_effect=RuntimeError("boom")):
             with pytest.raises(RuntimeError, match="boom"):
                 engine.initialize()
 
