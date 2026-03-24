@@ -24,7 +24,7 @@ uv run pytest tests/e2e/
 
 - `unit/` - Unit tests for individual modules
   - `test_indexer.py` - Tests for XML parsing and indexing logic
-  - `test_search_engine.py` - Tests for search and FTS5 operations
+  - `test_search_engine.py` - Tests for LanceDB hybrid search with RRF
   - `test_server.py` - Tests for MCP server tools
   
 - `integration/` - Integration tests for components working together

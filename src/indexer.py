@@ -78,6 +78,23 @@ class HelpContentIndexer:
         """Calculate MD5 hash of brhelpcontent.xml for change detection."""
         return hashlib.md5(self.xml_path.read_bytes(), usedforsecurity=False).hexdigest()
 
+    def get_page_fingerprints(self) -> dict[str, str]:
+        """Compute a fingerprint for each page from its XML metadata.
+
+        The fingerprint is a short hash of (title, file_path, parent_id, help_id,
+        is_section).  Two fingerprints differ whenever B&R regenerates a page's
+        entry in brhelpcontent.xml, which reliably signals that the page content
+        changed as well.
+
+        Returns:
+            Dict mapping page_id -> hex fingerprint string.
+        """
+        fingerprints: dict[str, str] = {}
+        for page_id, page in self.pages.items():
+            key = f"{page.text}|{page.file_path}|{page.parent_id}|{page.help_id}|{page.is_section}"
+            fingerprints[page_id] = hashlib.md5(key.encode(), usedforsecurity=False).hexdigest()
+        return fingerprints
+
     def _load_metadata(self) -> dict[str, str | int] | None:
         """Load index metadata if it exists."""
         if self.metadata_path.exists():

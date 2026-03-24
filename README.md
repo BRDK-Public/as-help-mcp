@@ -1,10 +1,11 @@
 # AS Help MCP Server
 
-MCP server for B&R Automation Studio help documentation search. Provides full-text search across all help pages using SQLite FTS5 with BM25 ranking.
+MCP server for B&R Automation Studio help documentation search. Provides hybrid semantic + keyword search using LanceDB with Reciprocal Rank Fusion (RRF).
 
 ## Features
 
-- Full-text search with BM25 ranking 
+- Hybrid search combining vector similarity and keyword matching via RRF
+- Local sentence-transformer embeddings (no API keys needed)
 - Category filtering and hierarchical browsing
 - Auto-generated links to B&R online help (AS4/AS6)
 - HelpID lookup for context-sensitive help integration
@@ -64,7 +65,7 @@ Update the volume path to match your AS installation:
         "--help-root",
         "C:\\Program Files (x86)\\BRAutomation\\AS6\\Help-en\\Data",
         "--db-path",
-        "..\\data\\as6\\.ashelp\\search.db",
+        "..\\data\\as6\\.ashelp_lance",
         "--metadata-dir",
         "..\\data\\as6\\.ashelp_metadata",
         "--as-version",
@@ -81,7 +82,7 @@ Update `--directory` to point to your cloned repository and adjust paths as need
 
 Restart VS Code, then test in Copilot Chat: *"Search AS help for mapp Motion"*
 
-**First run takes 5-10 minutes** to build the search index. Subsequent starts are instant.
+**First run takes 10-15 minutes** to build the search index (includes downloading the embedding model ~22MB and generating embeddings). Subsequent starts are instant.
 
 ---
 
@@ -96,10 +97,10 @@ cd as-help
 uv sync --extra test --extra dev
 
 # Run server with command line arguments (precedence over .env)
-uv run as-help-server --help-root "C:\BRAutomation\AS412\Help-en\Data" --db-path "data\.ashelp\search.db" --metadata-dir "data\.ashelp_metadata"
+uv run as-help-server --help-root "C:\BRAutomation\AS412\Help-en\Data" --db-path "data\.ashelp_lance" --metadata-dir "data\.ashelp_metadata"
 
 # Or use relative paths (automatically resolved)
-uv run as-help-server --db-path ./data/ashelp.db --metadata-dir ./data
+uv run as-help-server --db-path ./data/lance_index --metadata-dir ./data
 ```
 
 ### Option 2: Environment Variables (.env)
@@ -118,10 +119,12 @@ Run `uv run as-help-server --help` for full details.
 | Argument | Env Var Equivalent | Description |
 |----------|--------------------|-------------|
 | `--help-root` | `AS_HELP_ROOT` | Path to AS Help Data folder |
-| `--db-path` | `AS_HELP_DB_PATH` | Path to the SQLite database file |
+| `--db-path` | `AS_HELP_DB_PATH` | Path to the LanceDB directory |
 | `--metadata-dir` | `AS_HELP_METADATA_DIR` | Path to the indexing metadata directory |
 | `--as-version` | `AS_HELP_VERSION` | AS version for online help (`4` or `6`) |
 | `--force-rebuild` | `AS_HELP_FORCE_REBUILD` | Force a full index rebuild |
+| `--embedding-device` | `AS_HELP_EMBEDDING_DEVICE` | Optional embedding device override (`cpu`, `cuda`, `mps`) |
+| `--embed-batch-size` | `AS_HELP_EMBED_BATCH_SIZE` | Optional embedding batch size override (integer > 0) |
 
 ### Option 3: Docker Compose
 
@@ -167,8 +170,60 @@ The server supports configuration via both environment variables and command-lin
 | `--help-root` | `AS_HELP_ROOT` | `/data/help` | Path to AS Help Data folder |
 | `--as-version` | `AS_HELP_VERSION` | `4` | AS version for online help (`4` or `6`) |
 | `--force-rebuild` | `AS_HELP_FORCE_REBUILD` | `false` | Force index rebuild |
-| `--db-path` | `AS_HELP_DB_PATH` | `{root}/.ashelp_search.db` | Database location |
+| `--db-path` | `AS_HELP_DB_PATH` | `{root}/.ashelp_lance` | LanceDB directory |
 | `--metadata-dir` | `AS_HELP_METADATA_DIR` | `{root}/.ashelp_metadata` | Metadata directory |
+| `--embedding-device` | `AS_HELP_EMBEDDING_DEVICE` | `auto` | Embedding device: auto-detect CUDA/MPS/CPU (override optional) |
+| `--embed-batch-size` | `AS_HELP_EMBED_BATCH_SIZE` | `auto` | Embedding batch size (auto if unset) |
+
+## Performance And GPU Acceleration
+
+By default, the server installs **CPU-only PyTorch** (~200 MB) and runs embeddings on CPU. This works out of the box with no extra configuration.
+
+### Optional: Enable CUDA GPU Acceleration
+
+If you have an NVIDIA GPU and want faster embedding (especially for first-time index builds), install with the `cuda` extra:
+
+```bash
+uv sync --extra cuda
+```
+
+This downloads the CUDA-enabled PyTorch (~2.4 GiB) and enables GPU-accelerated embeddings. The server auto-detects the best device at startup:
+
+1. `cuda` if available (requires `--extra cuda` install)
+2. `mps` on Apple Silicon
+3. `cpu` fallback
+
+Optional overrides are available for troubleshooting or benchmarking:
+
+```bash
+uv run as-help-server --embedding-device cuda --embed-batch-size 512
+```
+
+Recommended batch sizes:
+
+- GPU (`cuda`): start with `--embed-batch-size 512` (increase if VRAM allows)
+- CPU: start with `--embed-batch-size 128`
+
+## Troubleshooting Slow Model Import
+
+If startup repeatedly shows:
+
+`Still loading embedding model (importing sentence_transformers)...`
+
+for a long time, use this checklist:
+
+1. Ensure only one `as-help-server` process is running.
+2. Wait for first-run import/download to complete once (cold environment can be slow).
+3. Set `HF_TOKEN` to improve Hugging Face download rate limits.
+4. Temporarily force CPU to verify GPU stack health:
+
+```bash
+uv run as-help-server --embedding-device cpu
+```
+
+5. If CPU works and CUDA hangs, update NVIDIA driver / CUDA runtime / PyTorch CUDA build alignment.
+
+The server now logs periodic model-load heartbeat messages and uses a cross-process build lock to avoid duplicate heavy rebuilds.
 
 ---
 
@@ -176,7 +231,7 @@ The server supports configuration via both environment variables and command-lin
 
 | Tool | Description |
 |------|-------------|
-| `search_help` | Full-text search with BM25 ranking and optional category filter |
+| `search_help` | Hybrid semantic + keyword search with RRF ranking and optional category filter |
 | `get_categories` | List top-level categories for filtering |
 | `browse_section` | Navigate help tree hierarchically |
 | `get_page_by_id` | Get full page content |

@@ -2,29 +2,39 @@
 
 ## Project Overview
 
-This is a **Model Context Protocol (MCP) server** that provides full-text search and retrieval for B&R Automation Studio help documentation. Built with Python 3.12+, FastMCP SDK, and SQLite FTS5 for production-grade search performance.
+This is a **Model Context Protocol (MCP) server** that provides hybrid semantic + keyword search and retrieval for B&R Automation Studio help documentation. Built with Python 3.12+, FastMCP SDK, LanceDB for vector + FTS storage, and sentence-transformers for local embeddings.
 
-**Key Architecture Decision:** SQLite FTS5 was chosen over Whoosh/other libraries because it's built into Python, actively maintained, blazingly fast, and requires zero external dependencies for 100K+ local files.
+**Key Architecture Decision:** LanceDB was chosen for hybrid search (vector + full-text) with Reciprocal Rank Fusion (RRF). Sentence-transformers (`all-MiniLM-L6-v2`) provides local embeddings — no API keys needed.
 
 ## Core Architecture
 
-### Three-Layer Design
+### Four-Layer Design
 
 1. **`indexer.py`** - XML Parser & HTML Extractor
    - Parses `brhelpcontent.xml` (abbreviated tags: `S`=Section, `P`=Page, `t`=Text, `p`=File, `I`=Identifiers)
    - Builds in-memory page tree with parent-child relationships
    - Extracts breadcrumbs with **cycle detection** and **depth limit (100)**
    - Uses **lxml** for fast HTML text extraction (2-3x faster than BeautifulSoup)
-   - Uses MD5 hash for change detection (stored in `.ashelp_metadata/index_metadata.json`)
+   - Uses MD5 hash for change detection (stored in `_index_metadata.json` sidecar)
 
-2. **`search_engine.py`** - SQLite FTS5 Search
-   - Creates FTS5 virtual table with `porter unicode61` tokenizer
-   - **BM25 ranking** with title weighted **10x** higher than content
-   - **Prefix matching** for partial words (`"term"*` syntax)
-   - **Query sanitization** - escapes FTS5 special characters
-   - Parallel text extraction using **8 threads** (ThreadPoolExecutor)
-   - Stores index in single `.ashelp_search.db` file (50-100MB)
-   - Batch inserts (1000 docs) in single transaction (~10-11 min initial build)
+2. **`embeddings.py`** - Embedding Service
+   - Lazy-loads sentence-transformer model on first use
+   - Default model: `all-MiniLM-L6-v2` (384-dim, ~22MB download)
+   - Configurable via `AS_HELP_EMBEDDING_MODEL` env var
+   - `embed_text()` for single texts, `embed_batch()` for bulk embedding
+   - 2048 char truncation for long texts
+
+3. **`search_engine.py`** - LanceDB Hybrid Search with RRF
+   - **Three search legs** fused via Reciprocal Rank Fusion (RRF, k=60):
+     - Title vector similarity (weight 2x)
+     - Content vector similarity (weight 1x)
+     - Full-text keyword search (weight 1.5x)
+   - LanceDB directory-based storage (`.ashelp_lance/`)
+   - PyArrow schema: page metadata + 2 vector columns + combined `search_text` for FTS
+   - **Query sanitization** for FTS special characters
+   - Parallel text extraction using ThreadPoolExecutor
+   - Metadata sidecar (`_index_metadata.json`) tracks XML hash + embedding model
+   - Accepts optional `embedding_service` parameter for testability
 
 3. **`server.py`** - FastMCP Server
    - Exposes 5 tools: `search_help`, `get_page_by_id`, `get_page_by_help_id`, `get_breadcrumb`, `get_help_statistics`
@@ -36,18 +46,23 @@ This is a **Model Context Protocol (MCP) server** that provides full-text search
 ### Data Flow
 
 ```
-brhelpcontent.xml → Indexer → SQLite FTS5 → BM25 Ranked Results → MCP Tools
+brhelpcontent.xml → Indexer → Page Tree (in-memory)
                         ↓
-                  HTML Files → lxml → Plain Text → Index Content
+                  HTML Files → lxml → Plain Text
+                        ↓
+             sentence-transformers → Embeddings (title + content vectors)
+                        ↓
+                  LanceDB → Table + FTS Index → RRF Hybrid Search → MCP Tools
 ```
 
-### Search Ranking (BM25)
+### Search Ranking (RRF)
 
-Results are ranked using BM25 (Best Match 25):
-- **Title matches**: Weighted **10x** higher than content
-- **Term frequency**: More occurrences = higher rank
-- **Document length**: Short documents with matches rank higher
-- **Prefix matching**: `"motor"*` matches "motor", "motors", "motoring"
+Results are ranked using Reciprocal Rank Fusion with three search legs:
+- **Title vector** (weight 2x): Semantic similarity between query and title embeddings
+- **Content vector** (weight 1x): Semantic similarity between query and content embeddings
+- **FTS keyword** (weight 1.5x): Tantivy-powered full-text search on combined title+content
+- **RRF formula**: `score = Σ weight / (k + rank + 1)` where `k=60`
+- Higher score = better match
 
 ## Development Workflows
 
@@ -97,7 +112,7 @@ uv run python test_search.py   # Runs sample queries
   - WSL: `/mnt/c/BRAutomation/AS412/Help-en/Data`
   - Windows: `C:\BRAutomation\AS412\Help-en\Data`
 - `AS_HELP_FORCE_REBUILD` - Set `true` for first run, then `false` (auto-rebuild on XML changes)
-- `AS_HELP_DB_PATH` - Optional custom DB location (defaults to `{AS_HELP_ROOT}/.ashelp_search.db`)
+- `AS_HELP_DB_PATH` - Optional custom DB location (defaults to `{AS_HELP_ROOT}/.ashelp_lance`)
 
 ### Abbreviated XML Tags (Critical!)
 
@@ -110,12 +125,19 @@ See `_process_section()` and `_process_page()` in `indexer.py` for implementatio
 
 ### Index Rebuild Logic
 
-**Do NOT rebuild unnecessarily** - costs 1-2 minutes:
-1. Check metadata file exists (`.ashelp_metadata/index_metadata.json`)
-2. Compare MD5 hash of current XML vs. stored hash
-3. Rebuild only if: `force_rebuild=True` OR hash mismatch OR no metadata
+**Three-tier strategy** — avoids unnecessary full rebuilds:
 
-See `needs_reindex()` in `indexer.py` and `_needs_reindex()` in `search_engine.py`.
+1. **No change** (most starts): XML hash matches + model unchanged → load index (<3s)
+2. **Incremental update** (AS service packs): XML hash changed, page fingerprints exist in metadata
+   - Diffs per-page fingerprints (`hash(title|file_path|parent_id|help_id|is_section)`)
+   - Deletes removed/changed rows from LanceDB, embeds & adds new/changed rows
+   - Falls back to full rebuild if >50% of pages changed
+   - Rebuilds FTS index after mutations
+3. **Full rebuild** (first run, model change, legacy metadata): Re-extracts, re-embeds, overwrites LanceDB table
+
+Per-page fingerprints are stored in `_index_metadata.json` alongside the XML hash and embedding model.
+
+See `_detect_build_strategy()` and `_incremental_update()` in `search_engine.py`.
 
 ### Content Extraction Strategy
 
@@ -156,9 +178,9 @@ Add to client config (e.g., `claude_desktop_config.json` or VS Code settings):
 | Operation | Time | Notes |
 |-----------|------|-------|
 | XML parse | ~2s | pages in-memory |
-| First index build | 10-11 min | Parallel HTML extraction + FTS5 indexing |
+| First index build | 10-11 min | Parallel HTML extraction + embedding + FTS indexing |
 | Subsequent startup | <3s | Load existing DB |
-| Search query | 10-50ms | FTS5 with BM25 ranking |
+| Search query | 10-50ms | RRF hybrid search |
 | Memory usage | 10-30MB | Runtime after index load |
 
 **Log progress every 5000 docs** during indexing to show it's working.
@@ -169,7 +191,7 @@ Add to client config (e.g., `claude_desktop_config.json` or VS Code settings):
 2. **Always handle both XML tag formats** - Some XMLs use `Section`, others use `S`.
 3. **Check metadata hash before rebuilding** - Rebuilding pages is unnecessary waste of time.
 4. **Path handling** - B&R uses Windows paths (backslashes), ensure cross-platform Path usage.
-5. **Database locking** - Close SQLite connections properly (see `__del__` in `search_engine.py`).
+5. **LanceDB storage** - Directory-based, no explicit close needed (see `close()` in `search_engine.py`).
 
 ## File Structure Patterns
 
@@ -179,7 +201,8 @@ src/
   __main__.py           # Module entry point
   server.py             # FastMCP server + tools (main logic)
   indexer.py            # XML parsing + HTML extraction
-  search_engine.py      # SQLite FTS5 search
+  search_engine.py      # LanceDB hybrid search with RRF
+  embeddings.py         # Sentence-transformer embedding service
   
 Root level:
   test_*.py             # Standalone test scripts (no MCP server)
@@ -207,14 +230,16 @@ See README.md for complete setup instructions.
 
 ## Key Dependencies
 
-- `mcp[cli]` - FastMCP SDK and MCP protocol
+- `lancedb` - Vector + FTS database (LanceDB)
+- `sentence-transformers` - Local embedding models
+- `pyarrow` - Columnar data for LanceDB tables
 - `lxml` - Fast HTML parsing (2-3x faster than BeautifulSoup)
 - `python-dotenv` - .env file loading (optional, env vars work directly)
-- **Zero search dependencies** - Uses Python's built-in `sqlite3` module
 
 ## When Modifying Code
 
 - **Adding tools**: Add `@mcp.tool()` decorated function in `server.py` with Pydantic models
 - **Changing XML parsing**: Update both tag formats in `indexer.py` (`Section`/`S`, etc.)
-- **Search improvements**: Modify FTS5 query syntax in `search_engine.py` (see SQLite FTS5 docs)
+- **Search improvements**: Adjust RRF weights or add search legs in `search_engine.py`
+- **Embedding model**: Change `AS_HELP_EMBEDDING_MODEL` env var or update default in `embeddings.py`
 - **New metadata**: Update `_save_metadata()` and `_load_metadata()` in `indexer.py`

@@ -50,6 +50,7 @@ DISTRIBUTION.md
 *.db-shm
 *.db-wal
 .ashelp_search.db
+.ashelp_lance/
 .ashelp_metadata
 
 # Scripts

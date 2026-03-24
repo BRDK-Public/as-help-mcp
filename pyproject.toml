@@ -10,11 +10,12 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "defusedxml>=0.0.1",
+    "lancedb>=0.20.0",
     "lxml>=5.3.0",
-    "lxml-stubs>=0.5.1",
     "mcp[cli]>=1.21.2",
+    "pyarrow>=17.0.0",
     "python-dotenv>=1.2.1",
-    "types-defusedxml>=0.7.0.20250822",
+    "sentence-transformers>=3.0.0",
 ]
 
 [project.optional-dependencies]
@@ -24,13 +25,17 @@ test = [
     "pytest-cov>=4.1.0",
     "ruff>=0.8.0",
     "mypy>=1.13.0",
+    "lxml-stubs>=0.5.1",
+    "types-defusedxml>=0.7.0.20250822",
 ]
 dev = [
+    "lxml-stubs>=0.5.1",
     "mypy>=1.13.0",
     "bandit>=1.8.0",
     "pip-audit>=2.8.0",
     "radon>=6.0.0",
     "pre-commit>=4.0.0",
+    "types-defusedxml>=0.7.0.20250822",
     "pyinstaller>=6.0.0",
 ]
 
@@ -96,6 +101,30 @@ warn_redundant_casts = true
 warn_unused_ignores = true
 warn_no_return = true
 strict_equality = true
+
+[[tool.mypy.overrides]]
+module = [
+    "lancedb",
+    "lancedb.*",
+    "pyarrow",
+    "pyarrow.*",
+    "sentence_transformers",
+    "sentence_transformers.*",
+    "torch",
+    "torch.*",
+]
+ignore_missing_imports = true
+
+[tool.uv]
+# CPU-only PyTorch by default (~200 MB instead of ~2.4 GiB).
+# For CUDA GPU acceleration, see README.md.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
 
 [build-system]
 requires = ["hatchling"]
