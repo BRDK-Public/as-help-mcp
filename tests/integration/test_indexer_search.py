@@ -86,7 +86,9 @@ class TestIndexerSearchEngineIntegration:
         indexer1.parse_xml_structure()
 
         db_path = tmp_path / "test_reindex_lance"
-        search_engine1 = HelpSearchEngine(db_path, indexer1, force_rebuild=True, embedding_service=mock_embedding_service)
+        search_engine1 = HelpSearchEngine(
+            db_path, indexer1, force_rebuild=True, embedding_service=mock_embedding_service
+        )
         search_engine1.initialize()
         search_engine1.close()
 
@@ -107,7 +109,9 @@ class TestIndexerSearchEngineIntegration:
         indexer3.parse_xml_structure()
 
         # Search engine should also detect change
-        search_engine3 = HelpSearchEngine(db_path, indexer3, force_rebuild=False, embedding_service=mock_embedding_service)
+        search_engine3 = HelpSearchEngine(
+            db_path, indexer3, force_rebuild=False, embedding_service=mock_embedding_service
+        )
         search_engine3.initialize()
         # Would rebuild if hash mismatch detected
         search_engine3.close()

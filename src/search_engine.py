@@ -75,14 +75,14 @@ class HelpSearchEngine:
         # Build status tracking (thread-safe via GIL for simple dict updates)
         self._build_status: dict = {
             "state": "initializing",  # initializing | building | fts_ready | ready | error
-            "build_type": None,       # full | incremental | none
-            "phase": "",              # current phase description
+            "build_type": None,  # full | incremental | none
+            "phase": "",  # current phase description
             "pages_total": 0,
             "pages_processed": 0,
             "started_at": None,
             "completed_at": None,
             "error": None,
-            "incremental_stats": None, # {added, removed, changed, unchanged} for incremental builds
+            "incremental_stats": None,  # {added, removed, changed, unchanged} for incremental builds
         }
 
         # Ensure directory exists
@@ -429,6 +429,7 @@ class HelpSearchEngine:
         if sys.platform == "win32":
             import ctypes
             from ctypes import wintypes
+
             kernel32 = ctypes.windll.kernel32
             PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
             STILL_ACTIVE = 259
@@ -543,19 +544,21 @@ class HelpSearchEngine:
     def _get_table_schema(self) -> pa.Schema:
         """Get the PyArrow schema for the LanceDB help_pages table."""
         dim = self.embedder.dimension
-        return pa.schema([
-            pa.field("page_id", pa.utf8()),
-            pa.field("title", pa.utf8()),
-            pa.field("content", pa.utf8()),
-            pa.field("search_text", pa.utf8()),
-            pa.field("file_path", pa.utf8()),
-            pa.field("help_id", pa.utf8()),
-            pa.field("is_section", pa.int32()),
-            pa.field("breadcrumb_path", pa.utf8()),
-            pa.field("category", pa.utf8()),
-            pa.field("title_vector", pa.list_(pa.float32(), dim)),
-            pa.field("content_vector", pa.list_(pa.float32(), dim)),
-        ])
+        return pa.schema(
+            [
+                pa.field("page_id", pa.utf8()),
+                pa.field("title", pa.utf8()),
+                pa.field("content", pa.utf8()),
+                pa.field("search_text", pa.utf8()),
+                pa.field("file_path", pa.utf8()),
+                pa.field("help_id", pa.utf8()),
+                pa.field("is_section", pa.int32()),
+                pa.field("breadcrumb_path", pa.utf8()),
+                pa.field("category", pa.utf8()),
+                pa.field("title_vector", pa.list_(pa.float32(), dim)),
+                pa.field("content_vector", pa.list_(pa.float32(), dim)),
+            ]
+        )
 
     def _records_to_arrow(self, records, title_vectors, content_vectors) -> pa.Table:
         """Convert extracted records + embeddings to a PyArrow table."""
@@ -655,7 +658,7 @@ class HelpSearchEngine:
         all_records: list[tuple] = []
 
         for chunk_start in range(0, remaining, BUILD_CHUNK_SIZE):
-            chunk = pages_to_process[chunk_start:chunk_start + BUILD_CHUNK_SIZE]
+            chunk = pages_to_process[chunk_start : chunk_start + BUILD_CHUNK_SIZE]
             chunk_num = chunk_start // BUILD_CHUNK_SIZE + 1
 
             self._build_status["phase"] = f"extracting text (chunk {chunk_num}/{total_chunks})"
@@ -713,7 +716,7 @@ class HelpSearchEngine:
         all_content_vectors: list[list[float]] = []
 
         for chunk_start in range(0, len(all_records), BUILD_CHUNK_SIZE):
-            chunk_records = all_records[chunk_start:chunk_start + BUILD_CHUNK_SIZE]
+            chunk_records = all_records[chunk_start : chunk_start + BUILD_CHUNK_SIZE]
             chunk_num = chunk_start // BUILD_CHUNK_SIZE + 1
 
             titles = [r[1] for r in chunk_records]
@@ -798,7 +801,7 @@ class HelpSearchEngine:
         sys.stderr.flush()
 
         for chunk_start in range(0, remaining, BUILD_CHUNK_SIZE):
-            chunk = pages_to_process[chunk_start:chunk_start + BUILD_CHUNK_SIZE]
+            chunk = pages_to_process[chunk_start : chunk_start + BUILD_CHUNK_SIZE]
             chunk_num = chunk_start // BUILD_CHUNK_SIZE + 1
             chunk_time = time.time()
 
@@ -836,9 +839,7 @@ class HelpSearchEngine:
             processed = already_done + chunk_start + len(chunk)
             self._build_status["pages_processed"] = processed
             chunk_elapsed = time.time() - chunk_time
-            logger.info(
-                f"Chunk {chunk_num}/{total_chunks}: {processed}/{total_pages} pages ({chunk_elapsed:.1f}s)"
-            )
+            logger.info(f"Chunk {chunk_num}/{total_chunks}: {processed}/{total_pages} pages ({chunk_elapsed:.1f}s)")
             sys.stderr.flush()
 
         self._finalize_build(start_time, total_pages)
@@ -908,9 +909,7 @@ class HelpSearchEngine:
 
         # Fall back to full rebuild if >50% of pages changed (not worth incremental overhead)
         if len(to_upsert) > len(new_ids) * 0.5:
-            logger.info(
-                f"Too many changes ({len(to_upsert)}/{len(new_ids)}) - falling back to full rebuild"
-            )
+            logger.info(f"Too many changes ({len(to_upsert)}/{len(new_ids)}) - falling back to full rebuild")
             self._build_index()
             return
 
@@ -970,8 +969,7 @@ class HelpSearchEngine:
 
         elapsed = time.time() - start_time
         logger.info(
-            f"Incremental update complete in {elapsed:.1f}s "
-            f"(+{len(added)} -{len(removed)} ~{len(changed)} pages)"
+            f"Incremental update complete in {elapsed:.1f}s (+{len(added)} -{len(removed)} ~{len(changed)} pages)"
         )
 
     def _load_index(self):
@@ -992,7 +990,9 @@ class HelpSearchEngine:
         safe = re.sub(r"[^\w\s.-]", "", category)
         return f"lower(category) = '{safe.lower()}'"
 
-    def _vector_search(self, table, query_vector: list[float], column_name: str, limit: int, where_clause: str | None) -> list[dict]:
+    def _vector_search(
+        self, table, query_vector: list[float], column_name: str, limit: int, where_clause: str | None
+    ) -> list[dict]:
         """Run vector similarity search on a specific column."""
         try:
             builder = table.search(query_vector, vector_column_name=column_name)
@@ -1007,7 +1007,7 @@ class HelpSearchEngine:
         """Run full-text keyword search with query sanitization."""
         # Sanitize query: remove FTS special characters
         sanitized = query
-        for char in '"\'*:(){}^+[]-':
+        for char in "\"'*:(){}^+[]-":
             sanitized = sanitized.replace(char, " ")
 
         fts_keywords = {"and", "or", "not", "near"}
@@ -1034,7 +1034,7 @@ class HelpSearchEngine:
 
         # Parse search terms from query
         sanitized = query
-        for char in '"\'*:(){}^+[]-':
+        for char in "\"'*:(){}^+[]-":
             sanitized = sanitized.replace(char, " ")
         terms = [t for t in sanitized.split() if len(t) >= 2]
 
@@ -1133,18 +1133,20 @@ class HelpSearchEngine:
         for pid in sorted_ids:
             row = page_data[pid]
             snippet = self._generate_snippet(row.get("content", ""), query)
-            results.append({
-                "page_id": pid,
-                "title": row.get("title", ""),
-                "file_path": row.get("file_path", ""),
-                "help_id": row.get("help_id") or None,
-                "is_section": bool(row.get("is_section", 0)),
-                "breadcrumb_path": row.get("breadcrumb_path") or None,
-                "category": row.get("category") or None,
-                "score": rrf_scores[pid],
-                "snippet": snippet,
-                "search_mode": search_mode,
-            })
+            results.append(
+                {
+                    "page_id": pid,
+                    "title": row.get("title", ""),
+                    "file_path": row.get("file_path", ""),
+                    "help_id": row.get("help_id") or None,
+                    "is_section": bool(row.get("is_section", 0)),
+                    "breadcrumb_path": row.get("breadcrumb_path") or None,
+                    "category": row.get("category") or None,
+                    "score": rrf_scores[pid],
+                    "snippet": snippet,
+                    "search_mode": search_mode,
+                }
+            )
 
         logger.info(f"Search for '{query}' (cat={category}, mode={search_mode}) returned {len(results)} results")
         return results

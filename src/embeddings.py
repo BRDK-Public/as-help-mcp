@@ -52,9 +52,7 @@ class EmbeddingService:
             def _heartbeat():
                 while not heartbeat_stop.wait(10):
                     elapsed = time.time() - start
-                    logger.info(
-                        f"Still loading embedding model ({phase['name']})... {elapsed:.0f}s elapsed"
-                    )
+                    logger.info(f"Still loading embedding model ({phase['name']})... {elapsed:.0f}s elapsed")
                     if (
                         not import_warned["value"]
                         and phase["name"] == "importing sentence_transformers"
@@ -108,8 +106,7 @@ class EmbeddingService:
                         device = "cpu"
 
                 logger.info(
-                    f"Loading embedding model '{self.model_name}' on {device} "
-                    "(first use may download ~22MB)..."
+                    f"Loading embedding model '{self.model_name}' on {device} (first use may download ~22MB)..."
                 )
                 _flush_logs()
 
@@ -120,10 +117,7 @@ class EmbeddingService:
                 self._dimension = self._model.get_sentence_embedding_dimension()
                 self._device = device
                 elapsed = time.time() - start
-                logger.info(
-                    f"Embedding model loaded in {elapsed:.1f}s "
-                    f"(device={device}, dimension={self._dimension})"
-                )
+                logger.info(f"Embedding model loaded in {elapsed:.1f}s (device={device}, dimension={self._dimension})")
                 _flush_logs()
             finally:
                 heartbeat_stop.set()
@@ -179,10 +173,7 @@ class EmbeddingService:
                     else:
                         raise ValueError("batch size must be > 0")
                 except ValueError:
-                    logger.warning(
-                        f"Invalid AS_HELP_EMBED_BATCH_SIZE='{configured}', "
-                        "falling back to default"
-                    )
+                    logger.warning(f"Invalid AS_HELP_EMBED_BATCH_SIZE='{configured}', falling back to default")
                     batch_size = 256 if self._device in ("cuda", "mps") else 64
             else:
                 batch_size = 256 if self._device in ("cuda", "mps") else 64

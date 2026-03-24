@@ -48,6 +48,7 @@ def _build_online_help_url(base_url: str, file_path: str | None) -> str | None:
     if not file_path:
         return None
     from urllib.parse import quote
+
     normalized_path = file_path.replace("\\", "/")
     # Encode each path segment individually to preserve '/' separators
     encoded_path = "/".join(quote(segment, safe="") for segment in normalized_path.split("/"))
@@ -251,7 +252,9 @@ async def app_lifespan(server: FastMCP):
     elif build_type == "incremental":
         logger.info("=== Server ready (incremental index update running in background) ===")
     else:
-        logger.info(f"=== Server ready ({build_type} index build running in background - this may take several minutes) ===")
+        logger.info(
+            f"=== Server ready ({build_type} index build running in background - this may take several minutes) ==="
+        )
 
     # Yield context to the application
     context = AppContext(
@@ -412,13 +415,15 @@ def search_help(
     status_msg = None
     if search_mode == "keyword":
         status_msg = (
-            "Semantic search is still loading — results are keyword-only. "
-            "Retry later for better relevance ranking."
+            "Semantic search is still loading — results are keyword-only. Retry later for better relevance ranking."
         )
 
     return SearchResults(
-        query=query, results=search_results, total=len(search_results),
-        search_mode=search_mode, status_message=status_msg,
+        query=query,
+        results=search_results,
+        total=len(search_results),
+        search_mode=search_mode,
+        status_message=status_msg,
     )
 
 
@@ -642,8 +647,7 @@ async def get_help_statistics(ctx: Context) -> dict:
     await ctx.info(f"Statistics: {total_pages} total, {total_sections} sections, {total_help_ids} HelpIDs")
     await ctx.info(f"Hierarchy: {pages_with_parents} with parents, {root_pages} root items")
     await ctx.info(
-        f"Index: state={build_status['state']}, type={build_status['build_type']}, "
-        f"phase={build_status['phase']}"
+        f"Index: state={build_status['state']}, type={build_status['build_type']}, phase={build_status['phase']}"
     )
 
     result: dict = {
@@ -1071,10 +1075,12 @@ def main():
     # Doing it here (before stdio captures stdin/stdout) takes ~6s and the modules
     # are then cached in sys.modules for the background thread.
     import time as _t
+
     _t0 = _t.monotonic()
     logger.info("Pre-loading ML libraries (before stdio transport)...")
     import sentence_transformers  # noqa: F401
     import torch  # noqa: F401
+
     logger.info("ML libraries loaded in %.1fs", _t.monotonic() - _t0)
 
     # Run with stdio transport by default (for local MCP clients like Claude Desktop)

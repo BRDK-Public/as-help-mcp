@@ -15,7 +15,9 @@ class TestQuerySanitization:
     def search_engine_with_data(self, initialized_indexer, tmp_path, mock_embedding_service):
         """Create search engine with sample data."""
         db_path = tmp_path / "test_lance"
-        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service
+        )
         engine.initialize()
         yield engine
         engine.close()
@@ -67,7 +69,9 @@ class TestEnhancedQueryBuilding:
     def search_engine_with_data(self, initialized_indexer, tmp_path, mock_embedding_service):
         """Create search engine with sample data."""
         db_path = tmp_path / "test_lance"
-        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service
+        )
         engine.initialize()
         yield engine
         engine.close()
@@ -93,7 +97,9 @@ class TestCategoryFiltering:
     def search_engine_with_data(self, initialized_indexer, tmp_path, mock_embedding_service):
         """Create search engine with sample data."""
         db_path = tmp_path / "test_lance"
-        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service
+        )
         engine.initialize()
         yield engine
         engine.close()
@@ -134,7 +140,9 @@ class TestResultMapping:
     def search_engine_with_data(self, initialized_indexer, tmp_path, mock_embedding_service):
         """Create search engine with sample data."""
         db_path = tmp_path / "test_lance"
-        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service
+        )
         engine.initialize()
         yield engine
         engine.close()
@@ -182,7 +190,9 @@ class TestErrorHandling:
     def search_engine_with_data(self, initialized_indexer, tmp_path, mock_embedding_service):
         """Create search engine with sample data."""
         db_path = tmp_path / "test_lance"
-        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service
+        )
         engine.initialize()
         yield engine
         engine.close()
@@ -200,7 +210,9 @@ class TestExtractTextForPage:
     def search_engine_with_data(self, initialized_indexer, tmp_path, mock_embedding_service):
         """Create search engine with sample data."""
         db_path = tmp_path / "test_lance"
-        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service
+        )
         engine.initialize()
         yield engine
         engine.close()
@@ -259,7 +271,9 @@ class TestIndexBuildAndLoad:
     def test_index_exists_returns_true_after_build(self, initialized_indexer, tmp_path, mock_embedding_service):
         """Verify _index_exists returns True after index is built."""
         db_path = tmp_path / "test_lance"
-        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service
+        )
         engine.initialize()
 
         assert engine._index_exists() is True
@@ -270,12 +284,16 @@ class TestIndexBuildAndLoad:
         """Verify _needs_reindex detects XML changes."""
         db_path = tmp_path / "test_lance"
 
-        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service
+        )
         engine.initialize()
         engine.close()
 
         with patch.object(initialized_indexer, "_get_xml_hash", return_value="different_hash"):
-            engine2 = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=False, embedding_service=mock_embedding_service)
+            engine2 = HelpSearchEngine(
+                db_path, initialized_indexer, force_rebuild=False, embedding_service=mock_embedding_service
+            )
             engine2.initialize()
             engine2.close()
 
@@ -283,7 +301,9 @@ class TestIndexBuildAndLoad:
         """Verify _needs_reindex detects embedding model changes."""
         db_path = tmp_path / "test_lance"
 
-        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service
+        )
         engine.initialize()
         engine.close()
 
@@ -295,7 +315,9 @@ class TestIndexBuildAndLoad:
         with open(metadata_path, "w") as f:
             json.dump(metadata, f)
 
-        engine2 = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=False, embedding_service=mock_embedding_service)
+        engine2 = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=False, embedding_service=mock_embedding_service
+        )
         engine2.initialize()
         # Should have rebuilt (detected model mismatch)
         assert engine2._index_exists() is True
@@ -305,11 +327,15 @@ class TestIndexBuildAndLoad:
         """Verify index can be loaded without rebuilding."""
         db_path = tmp_path / "test_lance"
 
-        engine1 = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine1 = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service
+        )
         engine1.initialize()
         engine1.close()
 
-        engine2 = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=False, embedding_service=mock_embedding_service)
+        engine2 = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=False, embedding_service=mock_embedding_service
+        )
         engine2.initialize()
 
         results = engine2.search("motion")
@@ -363,7 +389,9 @@ class TestParallelProcessing:
             mock_executor_instance.map.return_value = []
 
             try:
-                engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+                engine = HelpSearchEngine(
+                    db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service
+                )
                 engine.initialize()
                 engine.close()
             except Exception:
@@ -381,7 +409,9 @@ class TestDatabaseConnection:
         """Verify context manager closes connection."""
         db_path = tmp_path / "test_lance"
 
-        with HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service) as engine:
+        with HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service
+        ) as engine:
             engine.initialize()
             # Should be able to search
             results = engine.search("motion")
@@ -390,7 +420,9 @@ class TestDatabaseConnection:
     def test_close_method_works(self, initialized_indexer, tmp_path, mock_embedding_service):
         """Verify close method closes connection."""
         db_path = tmp_path / "test_lance"
-        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service
+        )
         engine.initialize()
 
         engine.close()
@@ -401,7 +433,9 @@ class TestDatabaseConnection:
     def test_del_cleanup(self, initialized_indexer, tmp_path, mock_embedding_service):
         """Verify __del__ cleans up connection."""
         db_path = tmp_path / "test_lance"
-        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service
+        )
         engine.initialize()
 
         engine.__del__()
@@ -414,7 +448,9 @@ class TestSearchLimits:
     def search_engine_with_data(self, initialized_indexer, tmp_path, mock_embedding_service):
         """Create search engine with sample data."""
         db_path = tmp_path / "test_lance"
-        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service
+        )
         engine.initialize()
         yield engine
         engine.close()
@@ -462,34 +498,48 @@ class TestBuildStrategyDetection:
     def test_full_rebuild_on_first_run(self, initialized_indexer, tmp_path, mock_embedding_service):
         """Verify first run uses full build strategy."""
         db_path = tmp_path / "new_lance"
-        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=False, embedding_service=mock_embedding_service)
+        engine = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=False, embedding_service=mock_embedding_service
+        )
         assert engine._build_strategy == "full"
 
     def test_none_when_unchanged(self, initialized_indexer, tmp_path, mock_embedding_service):
         """Verify no rebuild when nothing changed."""
         db_path = tmp_path / "test_lance"
-        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service
+        )
         engine.initialize()
         engine.close()
 
-        engine2 = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=False, embedding_service=mock_embedding_service)
+        engine2 = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=False, embedding_service=mock_embedding_service
+        )
         assert engine2._build_strategy == "none"
 
-    def test_incremental_when_xml_changed_with_fingerprints(self, initialized_indexer, tmp_path, mock_embedding_service):
+    def test_incremental_when_xml_changed_with_fingerprints(
+        self, initialized_indexer, tmp_path, mock_embedding_service
+    ):
         """Verify incremental strategy when XML changed but fingerprints exist."""
         db_path = tmp_path / "test_lance"
-        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service
+        )
         engine.initialize()
         engine.close()
 
         with patch.object(initialized_indexer, "_get_xml_hash", return_value="different_hash"):
-            engine2 = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=False, embedding_service=mock_embedding_service)
+            engine2 = HelpSearchEngine(
+                db_path, initialized_indexer, force_rebuild=False, embedding_service=mock_embedding_service
+            )
             assert engine2._build_strategy == "incremental"
 
     def test_full_when_model_changed(self, initialized_indexer, tmp_path, mock_embedding_service):
         """Verify full rebuild when embedding model changes."""
         db_path = tmp_path / "test_lance"
-        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service
+        )
         engine.initialize()
         engine.close()
 
@@ -501,13 +551,17 @@ class TestBuildStrategyDetection:
         with open(metadata_path, "w") as f:
             json.dump(metadata, f)
 
-        engine2 = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=False, embedding_service=mock_embedding_service)
+        engine2 = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=False, embedding_service=mock_embedding_service
+        )
         assert engine2._build_strategy == "full"
 
     def test_full_when_no_fingerprints_stored(self, initialized_indexer, tmp_path, mock_embedding_service):
         """Verify full rebuild when metadata has no fingerprints (legacy index)."""
         db_path = tmp_path / "test_lance"
-        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service
+        )
         engine.initialize()
         engine.close()
 
@@ -520,7 +574,9 @@ class TestBuildStrategyDetection:
             json.dump(metadata, f)
 
         with patch.object(initialized_indexer, "_get_xml_hash", return_value="different_hash"):
-            engine2 = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=False, embedding_service=mock_embedding_service)
+            engine2 = HelpSearchEngine(
+                db_path, initialized_indexer, force_rebuild=False, embedding_service=mock_embedding_service
+            )
             assert engine2._build_strategy == "full"
 
 
@@ -745,7 +801,9 @@ class TestBuildResume:
     def test_resume_detected_after_interrupted_build(self, initialized_indexer, tmp_path, mock_embedding_service):
         """Verify resume strategy is detected when build was interrupted."""
         db_path = tmp_path / "resume_lance"
-        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service
+        )
 
         # Simulate an interrupted build: write progress marker + partial table
         engine._save_build_progress()
@@ -760,14 +818,18 @@ class TestBuildResume:
         engine.close()
 
         # New engine should detect the resumable partial build
-        engine2 = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=False, embedding_service=mock_embedding_service)
+        engine2 = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=False, embedding_service=mock_embedding_service
+        )
         assert engine2._build_strategy == "resume"
         engine2.close()
 
     def test_resume_completes_build(self, initialized_indexer, tmp_path, mock_embedding_service):
         """Verify resume finishes indexing remaining pages."""
         db_path = tmp_path / "resume_lance"
-        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service
+        )
 
         # Simulate interrupted build with 1 page done
         engine._save_build_progress()
@@ -781,7 +843,9 @@ class TestBuildResume:
         engine.close()
 
         # Resume should complete the build
-        engine2 = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=False, embedding_service=mock_embedding_service)
+        engine2 = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=False, embedding_service=mock_embedding_service
+        )
         assert engine2._build_strategy == "resume"
         engine2.initialize()
 
@@ -798,7 +862,9 @@ class TestBuildResume:
     def test_no_resume_when_xml_changed(self, initialized_indexer, tmp_path, mock_embedding_service):
         """Verify resume is skipped when XML hash doesn't match (data changed)."""
         db_path = tmp_path / "resume_lance"
-        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service
+        )
 
         # Simulate interrupted build
         engine._save_build_progress()
@@ -811,7 +877,9 @@ class TestBuildResume:
 
         # Change XML hash — resume should not be possible
         with patch.object(initialized_indexer, "_get_xml_hash", return_value="different_hash"):
-            engine2 = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=False, embedding_service=mock_embedding_service)
+            engine2 = HelpSearchEngine(
+                db_path, initialized_indexer, force_rebuild=False, embedding_service=mock_embedding_service
+            )
             # Should NOT be resume (XML changed since the partial build)
             assert engine2._build_strategy != "resume"
             engine2.close()
@@ -819,7 +887,9 @@ class TestBuildResume:
     def test_force_rebuild_ignores_resume(self, initialized_indexer, tmp_path, mock_embedding_service):
         """Verify force_rebuild=True ignores resumable partial build."""
         db_path = tmp_path / "resume_lance"
-        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service
+        )
 
         # Simulate interrupted build
         engine._save_build_progress()
@@ -830,14 +900,18 @@ class TestBuildResume:
         engine.db.create_table(engine.TABLE_NAME, chunk_data)
         engine.close()
 
-        engine2 = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine2 = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service
+        )
         assert engine2._build_strategy == "full"
         engine2.close()
 
     def test_build_status_tracks_chunks(self, initialized_indexer, tmp_path, mock_embedding_service):
         """Verify build status updates during chunked build."""
         db_path = tmp_path / "status_lance"
-        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service
+        )
         engine.initialize()
 
         status = engine.build_status
@@ -854,7 +928,9 @@ class TestReadyStateSemantics:
     def test_ready_is_false_when_initialize_fails(self, initialized_indexer, tmp_path, mock_embedding_service):
         """Verify waiters are unblocked but ready remains False on initialization failure."""
         db_path = tmp_path / "error_lance"
-        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service
+        )
 
         with patch.object(engine, "_build_index_two_phase", side_effect=RuntimeError("boom")):
             with pytest.raises(RuntimeError, match="boom"):
@@ -873,7 +949,9 @@ class TestInstanceLock:
     def test_second_instance_same_db_path_raises(self, initialized_indexer, tmp_path, mock_embedding_service):
         """A second engine on the same db_path should fail while the first is alive."""
         db_path = tmp_path / "lock_lance"
-        engine1 = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine1 = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service
+        )
 
         with pytest.raises(RuntimeError, match="already using"):
             HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
@@ -883,19 +961,27 @@ class TestInstanceLock:
     def test_instance_lock_released_on_close(self, initialized_indexer, tmp_path, mock_embedding_service):
         """After close(), a new engine should acquire the lock successfully."""
         db_path = tmp_path / "lock_lance"
-        engine1 = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine1 = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service
+        )
         engine1.close()
 
         # Should succeed now
-        engine2 = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine2 = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service
+        )
         engine2.close()
 
     def test_different_db_paths_allowed(self, initialized_indexer, tmp_path, mock_embedding_service):
         """Different db paths should be able to run concurrently."""
         db1 = tmp_path / "lance_as4"
         db2 = tmp_path / "lance_as6"
-        engine1 = HelpSearchEngine(db1, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
-        engine2 = HelpSearchEngine(db2, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine1 = HelpSearchEngine(
+            db1, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service
+        )
+        engine2 = HelpSearchEngine(
+            db2, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service
+        )
 
         # Both acquired locks successfully
         assert engine1._instance_lock_owned
@@ -912,18 +998,23 @@ class TestInstanceLock:
         # Write a lock with a PID that definitely doesn't exist
         lock_path = db_path / "_instance.lock"
         import json
+
         with open(lock_path, "w") as f:
             json.dump({"pid": 99999999, "started_at": 0}, f)
 
         # Should succeed — stale lock is overwritten
-        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service
+        )
         assert engine._instance_lock_owned
         engine.close()
 
     def test_context_manager_releases_instance_lock(self, initialized_indexer, tmp_path, mock_embedding_service):
         """Instance lock should be released when using context manager."""
         db_path = tmp_path / "ctx_lance"
-        with HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service) as engine:
+        with HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service
+        ) as engine:
             assert engine._instance_lock_owned
 
         # Lock should be released, file gone
