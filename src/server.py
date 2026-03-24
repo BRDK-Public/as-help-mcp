@@ -40,11 +40,18 @@ def get_as_version_config() -> tuple[str, str]:
 
 
 def _build_online_help_url(base_url: str, file_path: str | None) -> str | None:
-    """Build normalized online help URL from a relative file path."""
+    """Build normalized online help URL from a relative file path.
+
+    Percent-encodes special characters (parentheses, spaces, etc.) in each
+    path segment while preserving the '/' separators.
+    """
     if not file_path:
         return None
+    from urllib.parse import quote
     normalized_path = file_path.replace("\\", "/")
-    return f"{base_url}{normalized_path}"
+    # Encode each path segment individually to preserve '/' separators
+    encoded_path = "/".join(quote(segment, safe="") for segment in normalized_path.split("/"))
+    return f"{base_url}{encoded_path}"
 
 
 def _parse_bool_arg(value: str) -> bool:
