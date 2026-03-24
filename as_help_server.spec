@@ -15,36 +15,30 @@ from PyInstaller.utils.hooks import collect_submodules, collect_data_files, coll
 
 block_cipher = None
 
-# Use collect_submodules for complex ML packages that have many dynamic imports.
-# This is far more reliable than listing individual submodules by hand.
+# Only use collect_submodules for smaller packages that PyInstaller doesn't have
+# built-in hooks for. Let PyInstaller's own hooks handle torch, numpy, scipy, sklearn.
 collected_submodules = []
 for pkg in [
     "sentence_transformers",
     "transformers",
-    "sklearn",
-    "scipy",
-    "torch",
-    "numpy",
     "huggingface_hub",
-    "tokenizers",
     "safetensors",
-    "pyarrow",
     "lancedb",
+    "tokenizers",
     "tqdm",
 ]:
     collected_submodules += collect_submodules(pkg)
 
 # Collect data files needed at runtime (e.g. model configs, version files)
 extra_datas = []
-for pkg in ["transformers", "huggingface_hub", "sentence_transformers", "pyarrow", "lancedb"]:
+for pkg in ["transformers", "huggingface_hub", "sentence_transformers", "lancedb"]:
     extra_datas += collect_data_files(pkg)
 
 # Collect native shared libraries (.dll/.so/.dylib)
 extra_binaries = []
-for pkg in ["torch", "tokenizers", "scipy", "sklearn", "lancedb", "pyarrow", "numpy"]:
+for pkg in ["tokenizers", "lancedb"]:
     extra_binaries += collect_dynamic_libs(pkg)
 
-# Explicit hidden imports for packages that don't need full collect_submodules
 hidden_imports = collected_submodules + [
     # MCP SDK internals
     "mcp",
@@ -106,8 +100,6 @@ hidden_imports = collected_submodules + [
     # Async support
     "asyncio",
     "concurrent.futures",
-    # Numeric (required by lancedb)
-    "numpy",
 ]
 
 a = Analysis(
@@ -120,13 +112,11 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        # Exclude unnecessary modules to reduce binary size
+        # Exclude UI/visualization modules not needed by a CLI server
         "tkinter",
         "matplotlib",
         "pandas",
         "PIL",
-        "pip",
-        "wheel",
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
