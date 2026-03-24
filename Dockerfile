@@ -37,8 +37,12 @@ ENV PATH="/app/.venv/bin:$PATH" \
 
 # Default environment variables (can be overridden)
 # Note: AS_HELP_DB_PATH is NOT set here - server.py auto-detects based on help root hash
+# Default stdio transport is used for local development; for HTTP, set MCP_TRANSPORT=streamable-http and configure host/port with MCP_HOST/MCP_PORT
 ENV AS_HELP_ROOT=/data/help \
-    AS_HELP_FORCE_REBUILD=false
+    AS_HELP_FORCE_REBUILD=false\
+    MCP_TRANSPORT=stdio \
+    MCP_HOST=0.0.0.0 \
+    MCP_PORT=8000
 
 # Create data directories
 RUN mkdir -p /data/help /data/db
