@@ -6,8 +6,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.server import (
-    _parse_bool_arg,
     AppContext,
+    _parse_bool_arg,
     browse_section,
     get_as_version_config,
     get_breadcrumb,

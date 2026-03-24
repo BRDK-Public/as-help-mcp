@@ -529,7 +529,7 @@ class TestIncrementalUpdate:
 
     def test_incremental_adds_new_page(self, temp_help_dir, tmp_path, mock_embedding_service):
         """Verify incremental update adds a new page to the index."""
-        from src.indexer import HelpContentIndexer, HelpPage
+        from src.indexer import HelpContentIndexer
 
         # Build initial index
         xml_content = """<?xml version="1.0" encoding="UTF-8"?>

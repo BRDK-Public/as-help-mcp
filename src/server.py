@@ -1073,8 +1073,8 @@ def main():
     import time as _t
     _t0 = _t.monotonic()
     logger.info("Pre-loading ML libraries (before stdio transport)...")
-    import torch  # noqa: F401
     import sentence_transformers  # noqa: F401
+    import torch  # noqa: F401
     logger.info("ML libraries loaded in %.1fs", _t.monotonic() - _t0)
 
     # Run with stdio transport by default (for local MCP clients like Claude Desktop)

@@ -504,7 +504,7 @@ class HelpSearchEngine:
                     warned = True
 
                 if time.time() - start > timeout_seconds:
-                    raise TimeoutError("Timed out waiting for build lock")
+                    raise TimeoutError("Timed out waiting for build lock") from None
 
                 time.sleep(2)
 
@@ -596,7 +596,7 @@ class HelpSearchEngine:
 
         if content_texts:
             embedded_contents = self.embedder.embed_batch(content_texts)
-            for idx, vec in zip(content_indices, embedded_contents):
+            for idx, vec in zip(content_indices, embedded_contents, strict=True):
                 content_vectors[idx] = vec
 
         return content_vectors
