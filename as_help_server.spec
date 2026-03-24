@@ -11,10 +11,41 @@ Or use the convenience script:
 import sys
 from pathlib import Path
 
+from PyInstaller.utils.hooks import collect_submodules, collect_data_files, collect_dynamic_libs
+
 block_cipher = None
 
-# Collect all hidden imports needed by MCP SDK and dependencies
-hidden_imports = [
+# Use collect_submodules for complex ML packages that have many dynamic imports.
+# This is far more reliable than listing individual submodules by hand.
+collected_submodules = []
+for pkg in [
+    "sentence_transformers",
+    "transformers",
+    "sklearn",
+    "scipy",
+    "torch",
+    "numpy",
+    "huggingface_hub",
+    "tokenizers",
+    "safetensors",
+    "pyarrow",
+    "lancedb",
+    "tqdm",
+]:
+    collected_submodules += collect_submodules(pkg)
+
+# Collect data files needed at runtime (e.g. model configs, version files)
+extra_datas = []
+for pkg in ["transformers", "huggingface_hub", "sentence_transformers", "pyarrow", "lancedb"]:
+    extra_datas += collect_data_files(pkg)
+
+# Collect native shared libraries (.dll/.so/.dylib)
+extra_binaries = []
+for pkg in ["torch", "tokenizers", "scipy", "sklearn", "lancedb", "pyarrow", "numpy"]:
+    extra_binaries += collect_dynamic_libs(pkg)
+
+# Explicit hidden imports for packages that don't need full collect_submodules
+hidden_imports = collected_submodules + [
     # MCP SDK internals
     "mcp",
     "mcp.server",
@@ -82,8 +113,8 @@ hidden_imports = [
 a = Analysis(
     ["src/server.py"],
     pathex=["."],
-    binaries=[],
-    datas=[],
+    binaries=extra_binaries,
+    datas=extra_datas,
     hiddenimports=hidden_imports,
     hookspath=[],
     hooksconfig={},
@@ -94,8 +125,6 @@ a = Analysis(
         "matplotlib",
         "pandas",
         "PIL",
-        "scipy",
-        "setuptools",
         "pip",
         "wheel",
     ],
