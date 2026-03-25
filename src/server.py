@@ -7,6 +7,7 @@ Optimized for thousands of help files with persistent indexing and fast startup.
 import asyncio
 import logging
 import os
+import sys
 from argparse import ArgumentTypeError
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -238,7 +239,11 @@ async def app_lifespan(server: FastMCP):
 
     # Initialize search engine (constructor is fast — just connects to LanceDB)
     logger.info("Initializing search engine...")
-    search_engine = HelpSearchEngine(db_path=db_path, indexer=indexer, force_rebuild=force_rebuild)
+    try:
+        search_engine = HelpSearchEngine(db_path=db_path, indexer=indexer, force_rebuild=force_rebuild)
+    except RuntimeError as exc:
+        logger.error("Cannot start help server: %s", exc)
+        sys.exit(1)
 
     # Build/load the index in a background thread so the MCP server can respond
     # to initialize immediately. The search tool will wait for readiness.

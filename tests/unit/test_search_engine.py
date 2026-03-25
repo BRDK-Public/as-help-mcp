@@ -1,6 +1,7 @@
 """Unit tests for search_engine.py - LanceDB hybrid search with RRF."""
 
 import json
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -1019,3 +1020,56 @@ class TestInstanceLock:
 
         # Lock should be released, file gone
         assert not (db_path / "_instance.lock").exists()
+
+    def test_concurrent_lock_times_out_with_clear_message(
+        self, initialized_indexer, tmp_path, mock_embedding_service
+    ):
+        """RuntimeError with a descriptive message after timeout waiting for a live cross-process lock."""
+        db_path = tmp_path / "timeout_lance"
+        db_path.mkdir(parents=True, exist_ok=True)
+
+        # Write a lock file from a "different" (fake) PID
+        fake_pid = os.getpid() + 1000
+        lock_path = db_path / "_instance.lock"
+        with open(lock_path, "w") as f:
+            json.dump({"pid": fake_pid, "started_at": 0}, f)
+
+        # Pretend that fake process is always alive
+        with patch.object(HelpSearchEngine, "_is_process_alive", return_value=True):
+            with patch("src.search_engine.time.sleep"):  # speed up the busy-wait
+                with pytest.raises(RuntimeError, match="Database is locked"):
+                    HelpSearchEngine(
+                        db_path,
+                        initialized_indexer,
+                        force_rebuild=False,
+                        embedding_service=mock_embedding_service,
+                        _lock_timeout=0,  # time out immediately
+                    )
+
+    def test_concurrent_lock_succeeds_once_released(
+        self, initialized_indexer, tmp_path, mock_embedding_service
+    ):
+        """Engine acquires the lock after the blocking process releases it."""
+        db_path = tmp_path / "released_lance"
+        db_path.mkdir(parents=True, exist_ok=True)
+
+        fake_pid = os.getpid() + 1000
+        lock_path = db_path / "_instance.lock"
+        with open(lock_path, "w") as f:
+            json.dump({"pid": fake_pid, "started_at": 0}, f)
+
+        # _is_process_alive returns True once (process still running), then False
+        # (process exited / released the lock).
+        alive_responses = iter([True, False])
+
+        with patch.object(HelpSearchEngine, "_is_process_alive", side_effect=lambda _: next(alive_responses)):
+            with patch("src.search_engine.time.sleep"):  # speed up the busy-wait
+                engine = HelpSearchEngine(
+                    db_path,
+                    initialized_indexer,
+                    force_rebuild=True,
+                    embedding_service=mock_embedding_service,
+                    _lock_timeout=60,
+                )
+                assert engine._instance_lock_owned
+                engine.close()
