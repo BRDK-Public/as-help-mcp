@@ -14,6 +14,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import BaseModel, Field
 
 from src.indexer import HelpContentIndexer
@@ -1084,8 +1085,13 @@ def main():
     logger.info("ML libraries loaded in %.1fs", _t.monotonic() - _t0)
 
     # Run with stdio transport by default (for local MCP clients like Claude Desktop)
-    # To run as HTTP server, use: mcp.run(transport="streamable-http")
-    mcp.run()
+    # To expose over HTTP, set MCP_TRANSPORT=streamable-http and configure host/port with MCP_HOST/MCP_PORT
+    transport = os.environ.get("MCP_TRANSPORT", "stdio")
+    if transport == "streamable-http":
+        mcp.settings.host = os.environ.get("MCP_HOST", "0.0.0.0")
+        mcp.settings.port = int(os.environ.get("MCP_PORT", "8000"))
+        mcp.settings.transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+    mcp.run(transport=transport)
 
 
 if __name__ == "__main__":

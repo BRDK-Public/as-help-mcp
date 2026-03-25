@@ -11,10 +11,35 @@ Or use the convenience script:
 import sys
 from pathlib import Path
 
+from PyInstaller.utils.hooks import collect_submodules, collect_data_files, collect_dynamic_libs
+
 block_cipher = None
 
-# Collect all hidden imports needed by MCP SDK and dependencies
-hidden_imports = [
+# Only use collect_submodules for smaller packages that PyInstaller doesn't have
+# built-in hooks for. Let PyInstaller's own hooks handle torch, numpy, scipy, sklearn.
+collected_submodules = []
+for pkg in [
+    "sentence_transformers",
+    "transformers",
+    "huggingface_hub",
+    "safetensors",
+    "lancedb",
+    "tokenizers",
+    "tqdm",
+]:
+    collected_submodules += collect_submodules(pkg)
+
+# Collect data files needed at runtime (e.g. model configs, version files)
+extra_datas = []
+for pkg in ["transformers", "huggingface_hub", "sentence_transformers", "lancedb"]:
+    extra_datas += collect_data_files(pkg)
+
+# Collect native shared libraries (.dll/.so/.dylib)
+extra_binaries = []
+for pkg in ["tokenizers", "lancedb"]:
+    extra_binaries += collect_dynamic_libs(pkg)
+
+hidden_imports = collected_submodules + [
     # MCP SDK internals
     "mcp",
     "mcp.server",
@@ -80,23 +105,18 @@ hidden_imports = [
 a = Analysis(
     ["src/server.py"],
     pathex=["."],
-    binaries=[],
-    datas=[],
+    binaries=extra_binaries,
+    datas=extra_datas,
     hiddenimports=hidden_imports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[
-        # Exclude unnecessary modules to reduce binary size
+        # Exclude UI/visualization modules not needed by a CLI server
         "tkinter",
         "matplotlib",
-        "numpy",
         "pandas",
         "PIL",
-        "scipy",
-        "setuptools",
-        "pip",
-        "wheel",
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
