@@ -36,6 +36,9 @@ WEIGHT_FTS_KEYWORD = 1.5
 # Number of pages per chunk during index build (saves progress after each chunk)
 BUILD_CHUNK_SIZE = 5000
 
+# Retry interval (seconds) when waiting for the instance lock to be released
+LOCK_RETRY_INTERVAL_SECONDS = 2
+
 
 class HelpSearchEngine:
     """Hybrid search engine using LanceDB with RRF fusion.
@@ -56,6 +59,7 @@ class HelpSearchEngine:
         indexer: HelpContentIndexer,
         force_rebuild: bool = False,
         embedding_service: EmbeddingService | None = None,
+        _lock_timeout: int | None = None,
     ):
         """Initialize search engine.
 
@@ -64,6 +68,9 @@ class HelpSearchEngine:
             indexer: HelpContentIndexer for accessing help data
             force_rebuild: Force rebuild even if valid index exists
             embedding_service: Optional EmbeddingService instance (created internally if not provided)
+            _lock_timeout: Seconds to wait for the instance lock before giving up.
+                Defaults to the ``AS_HELP_LOCK_TIMEOUT`` env var (default 60).
+                The leading underscore signals this is intended for tests only.
         """
         self.db_path = Path(db_path)
         self.indexer = indexer
@@ -104,7 +111,8 @@ class HelpSearchEngine:
         # Different db paths (e.g. AS4 vs AS6) can run concurrently.
         self._instance_lock_path = self.db_path / "_instance.lock"
         self._instance_lock_owned = False
-        self._acquire_instance_lock()
+        lock_timeout = _lock_timeout if _lock_timeout is not None else int(os.getenv("AS_HELP_LOCK_TIMEOUT", "60"))
+        self._acquire_instance_lock(timeout_seconds=lock_timeout)
 
         # Determine build strategy: full, resume, incremental, or none
         if force_rebuild:
@@ -360,8 +368,19 @@ class HelpSearchEngine:
     # Instance lock: one server per db_path
     # ------------------------------------------------------------------
 
-    def _acquire_instance_lock(self):
-        """Acquire a per-db-path instance lock. Raises if another live server holds it."""
+    def _acquire_instance_lock(self, timeout_seconds: int = 60):
+        """Acquire a per-db-path instance lock.
+
+        When another live process already holds the lock (e.g. a concurrent startup
+        or a health-check probe), this method waits up to *timeout_seconds* for the
+        lock to be released before giving up.  Raises RuntimeError on timeout or if
+        the same Python process tries to open the same path twice.
+
+        Args:
+            timeout_seconds: How long to wait for another process to release the
+                lock before raising.  Defaults to 60 seconds (analogous to SQLite's
+                ``PRAGMA busy_timeout``).
+        """
         resolved = str(self.db_path.resolve())
 
         # Same-process check (e.g. two engines in the same Python process)
@@ -373,25 +392,44 @@ class HelpSearchEngine:
                     f"or use a different --db-path for each help root."
                 )
 
-        # Cross-process check via lock file
-        lock_info = self._read_instance_lock()
-        if lock_info is not None:
-            other_pid = lock_info.get("pid")
-            if other_pid and self._is_process_alive(other_pid) and other_pid != os.getpid():
-                raise RuntimeError(
-                    f"Another as-help-server (PID {other_pid}) is already using "
-                    f"database at {self.db_path}. Stop the other instance first, "
-                    f"or use a different --db-path for each help root."
-                )
-            # Stale lock from a dead process -- safe to overwrite
-            if other_pid and other_pid != os.getpid():
-                logger.debug("Overwriting stale instance lock (PID %s no longer running)", other_pid)
+        start = time.time()
+        warned = False
 
-        self._write_instance_lock()
-        with self._active_db_paths_lock:
-            self._active_db_paths.add(resolved)
-        self._instance_lock_owned = True
-        logger.info("Acquired instance lock for %s (PID %s)", self.db_path, os.getpid())
+        while True:
+            # Cross-process check via lock file
+            lock_info = self._read_instance_lock()
+            if lock_info is not None:
+                other_pid = lock_info.get("pid")
+                if other_pid and self._is_process_alive(other_pid) and other_pid != os.getpid():
+                    elapsed = time.time() - start
+                    if elapsed >= timeout_seconds:
+                        raise RuntimeError(
+                            f"Database is locked by another as-help-server process "
+                            f"(PID {other_pid}) at {self.db_path}. "
+                            f"Stop the other instance first, or use a different "
+                            f"--db-path for each help root."
+                        )
+                    if not warned:
+                        logger.warning(
+                            "Database at %s is held by another as-help-server (PID %s). "
+                            "Waiting up to %ds for it to be released...",
+                            self.db_path,
+                            other_pid,
+                            timeout_seconds,
+                        )
+                        warned = True
+                    time.sleep(LOCK_RETRY_INTERVAL_SECONDS)
+                    continue
+                # Stale lock from a dead process -- safe to overwrite
+                if other_pid and other_pid != os.getpid():
+                    logger.debug("Overwriting stale instance lock (PID %s no longer running)", other_pid)
+
+            self._write_instance_lock()
+            with self._active_db_paths_lock:
+                self._active_db_paths.add(resolved)
+            self._instance_lock_owned = True
+            logger.info("Acquired instance lock for %s (PID %s)", self.db_path, os.getpid())
+            return
 
     def _release_instance_lock(self):
         """Release instance lock if owned by this process."""
