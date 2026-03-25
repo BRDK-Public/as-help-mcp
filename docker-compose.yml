@@ -7,8 +7,7 @@ services:
     container_name: as-help-mcp-server-local
     restart: unless-stopped
     
-    # Environment configuration
-    environment:
+
 
     # Volume mounts
     volumes:

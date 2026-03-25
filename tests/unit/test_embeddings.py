@@ -158,7 +158,7 @@ class TestLazyLoading:
 
         dim = service.dimension
         assert dim == 384
-        mock_st_class.assert_called_once_with(DEFAULT_MODEL_NAME, device="cpu")
+        mock_st_class.assert_called_once_with(service._resolved_model_path, device="cpu")
 
     @patch("torch.cuda.is_available", return_value=False)
     @patch("sentence_transformers.SentenceTransformer")

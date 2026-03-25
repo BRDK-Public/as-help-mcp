@@ -30,14 +30,40 @@ class EmbeddingService:
         """Initialize embedding service and load model.
 
         Args:
-            model_name: HuggingFace model name. Defaults to AS_HELP_EMBEDDING_MODEL
-                        env var or 'all-MiniLM-L6-v2'.
+            model_name: HuggingFace model name or local path. Defaults to
+                        AS_HELP_EMBEDDING_MODEL env var or 'all-MiniLM-L6-v2'.
         """
         self.model_name = model_name or os.getenv("AS_HELP_EMBEDDING_MODEL", DEFAULT_MODEL_NAME)
         self._model: SentenceTransformer | None = None
         self._dimension: int | None = None
         self._device: str | None = None
         self._load_lock = threading.Lock()
+
+        # Resolve local model cache: if .model_cache/<model_name>/ exists
+        # (populated by prepare_model.py for Docker builds), use the local
+        # directory path instead of downloading from HuggingFace Hub.
+        self._resolved_model_path = self._resolve_model_path()
+
+    def _resolve_model_path(self) -> str:
+        """Return local model directory if available, otherwise the model name for HF download."""
+        # Check environment variable for explicit model path
+        explicit_path = os.getenv("AS_HELP_MODEL_PATH", "").strip()
+        if explicit_path and os.path.isdir(explicit_path):
+            logger.info(f"Using model from AS_HELP_MODEL_PATH: {explicit_path}")
+            return explicit_path
+
+        # Check common locations for pre-exported model
+        candidates = [
+            os.path.join("/app/.model_cache", self.model_name),  # Docker
+            os.path.join(".model_cache", self.model_name),       # Local dev
+        ]
+        for path in candidates:
+            if os.path.isdir(path) and os.path.isfile(os.path.join(path, "config.json")):
+                logger.info(f"Using pre-exported model from: {path}")
+                return path
+
+        # Fall back to HuggingFace Hub download
+        return self.model_name
 
     def _load_model(self):
         """Lazy-load the sentence-transformer model on first use."""
@@ -117,7 +143,25 @@ class EmbeddingService:
                 _flush_logs()
 
                 phase["name"] = f"initializing model ({device})"
-                self._model = SentenceTransformer(self.model_name, device=device)
+                # Redirect stdout→stderr at BOTH the Python and OS file-descriptor
+                # levels during model construction.  SentenceTransformer, safetensors
+                # and tokenizers contain Rust/C extensions that write directly to
+                # C-level fd 1 (stdout).  A Python-level sys.stdout reassignment does
+                # NOT intercept those writes.  In Docker (or any pipe-based MCP
+                # transport) the fd 1 pipe buffer fills up because the MCP client
+                # only reads JSON-RPC, causing the native write() call to block
+                # forever.  os.dup2(2, 1) makes fd 1 point to stderr at the OS
+                # level so every write – Python or C – lands on stderr.
+                _saved_stdout_fd = os.dup(1)       # keep a copy of real stdout
+                os.dup2(2, 1)                       # fd 1 → stderr
+                _saved_py_stdout = sys.stdout
+                sys.stdout = sys.stderr              # Python-level redirect too
+                try:
+                    self._model = SentenceTransformer(self._resolved_model_path, device=device)
+                finally:
+                    sys.stdout = _saved_py_stdout    # restore Python stdout
+                    os.dup2(_saved_stdout_fd, 1)     # restore fd 1
+                    os.close(_saved_stdout_fd)
 
                 phase["name"] = "reading model metadata"
                 self._dimension = self._model.get_sentence_embedding_dimension()

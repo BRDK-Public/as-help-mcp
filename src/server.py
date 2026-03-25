@@ -19,9 +19,14 @@ from pydantic import BaseModel, Field
 
 from src.indexer import HelpContentIndexer
 from src.search_engine import HelpSearchEngine
+from src.embeddings import EmbeddingService
 
 # Load environment variables from .env file
 load_dotenv()
+
+# Module-level holder for pre-loaded embedding service.
+# Populated in main() before mcp.run() captures stdio, then consumed in app_lifespan.
+_preloaded_embedding_service: EmbeddingService | None = None
 
 
 def get_as_version_config() -> tuple[str, str]:
@@ -238,7 +243,10 @@ async def app_lifespan(server: FastMCP):
 
     # Initialize search engine (constructor is fast — just connects to LanceDB)
     logger.info("Initializing search engine...")
-    search_engine = HelpSearchEngine(db_path=db_path, indexer=indexer, force_rebuild=force_rebuild)
+    search_engine = HelpSearchEngine(
+        db_path=db_path, indexer=indexer, force_rebuild=force_rebuild,
+        embedding_service=_preloaded_embedding_service,
+    )
 
     # Build/load the index in a background thread so the MCP server can respond
     # to initialize immediately. The search tool will wait for readiness.
@@ -1069,20 +1077,33 @@ def main():
             raise ValueError("--embed-batch-size must be > 0")
         os.environ["AS_HELP_EMBED_BATCH_SIZE"] = str(args.embed_batch_size)
 
-    # Pre-import heavy ML libraries BEFORE mcp.run() starts the stdio transport.
-    # These imports probe terminal state (tqdm) and load large native libraries (torch).
-    # When done inside a background thread after stdio is captured, they stall for
-    # minutes due to contention with the MCP transport's stdin/stdout handling.
-    # Doing it here (before stdio captures stdin/stdout) takes ~6s and the modules
-    # are then cached in sys.modules for the background thread.
+    # Pre-load the embedding model BEFORE mcp.run() starts the stdio transport.
+    # In Docker, stdout is a pipe from the very start. Any library that writes to
+    # stdout (tqdm, safetensors progress, HF Hub) will block when the pipe buffer
+    # fills because the MCP client only reads valid JSON-RPC, not progress output.
+    # Redirecting stdout→stderr during model loading prevents this entirely.
+    global _preloaded_embedding_service
+    import sys
     import time as _t
-
     _t0 = _t.monotonic()
-    logger.info("Pre-loading ML libraries (before stdio transport)...")
-    import sentence_transformers  # noqa: F401
-    import torch  # noqa: F401
-
-    logger.info("ML libraries loaded in %.1fs", _t.monotonic() - _t0)
+    logger.info("Pre-loading embedding model (before stdio transport)...")
+    # Redirect stdout→stderr at the OS file-descriptor level.  Native C/Rust
+    # extensions (safetensors, tokenizers) write to fd 1 directly, bypassing
+    # Python's sys.stdout.  In Docker the fd-1 pipe fills and blocks forever
+    # because the MCP client only reads JSON-RPC.  os.dup2(2,1) makes fd 1
+    # point to stderr so all writes land safely on the log stream.
+    _saved_stdout_fd = os.dup(1)
+    os.dup2(2, 1)
+    _saved_py_stdout = sys.stdout
+    sys.stdout = sys.stderr
+    try:
+        _preloaded_embedding_service = EmbeddingService()
+        _preloaded_embedding_service._load_model()
+    finally:
+        sys.stdout = _saved_py_stdout
+        os.dup2(_saved_stdout_fd, 1)
+        os.close(_saved_stdout_fd)
+    logger.info("Embedding model ready in %.1fs", _t.monotonic() - _t0)
 
     # Run with stdio transport by default (for local MCP clients like Claude Desktop)
     # To expose over HTTP, set MCP_TRANSPORT=streamable-http and configure host/port with MCP_HOST/MCP_PORT

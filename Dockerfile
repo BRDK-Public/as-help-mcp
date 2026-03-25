@@ -8,8 +8,17 @@ COPY pyproject.toml uv.lock ./
 COPY src ./src
 
 # Install dependencies using uv
+# Use CPU-only PyTorch to avoid downloading ~2.5GB of CUDA packages
 RUN uv venv && \
+    uv pip install --no-cache torch --index-url https://download.pytorch.org/whl/cpu && \
     uv pip install --no-cache -r pyproject.toml
+
+# Copy pre-exported model from host.
+# Corporate proxies with TLS inspection prevent downloading from HuggingFace
+# inside Docker (SSL cert verify fails).  Instead, the model is exported on
+# the host via: uv run python prepare_model.py
+# and then copied into the image.  This is fast (~22MB) and repeatable.
+COPY .model_cache /app/.model_cache
 
 # Runtime stage
 FROM python:3.12-slim-bookworm
@@ -28,13 +37,28 @@ RUN apt-get update && \
 # Copy virtual environment from builder
 COPY --from=builder /app/.venv /app/.venv
 
+# Copy pre-exported model (from host's .model_cache/ via prepare_model.py)
+COPY --from=builder /app/.model_cache /app/.model_cache
+
 # Copy source code
 COPY --from=builder /app/src /app/src
 
 # Set Python path to use venv
+# Disable tqdm/HF progress bars — they write to stdout which conflicts with
+# the MCP stdio transport piped by Docker.
+# Skip optional transformer backends to speed up import.
+# HF_HUB_OFFLINE=1 ensures no network calls to HuggingFace at runtime.
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONPATH="/app/src:$PYTHONPATH" \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    TQDM_DISABLE=1 \
+    HF_HUB_DISABLE_PROGRESS_BARS=1 \
+    HF_HUB_OFFLINE=1 \
+    HF_HUB_DISABLE_XET=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    TRANSFORMERS_NO_TF=1 \
+    TRANSFORMERS_NO_FLAX=1 \
+    TOKENIZERS_PARALLELISM=false
 
 # Default environment variables (can be overridden)
 # Note: AS_HELP_DB_PATH is NOT set here - server.py auto-detects based on help root hash
