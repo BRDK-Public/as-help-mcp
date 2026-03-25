@@ -58,3 +58,6 @@ Thumbs.db
 
 # Testing
 .coverage
+
+# Pre-exported model cache for Docker builds (see prepare_model.py)
+.model_cache/

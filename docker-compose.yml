@@ -7,15 +7,12 @@ services:
     container_name: as-help-mcp-server-local
     restart: unless-stopped
     
-    # Environment configuration
-    environment:
+
 
     # Volume mounts
     volumes:
       # Single volume stores DBs for all AS versions
       - ashelp-data:/data/db
-      # Cache embedding model downloads across container rebuilds
-      - huggingface-cache:/root/.cache/huggingface
     
     stdin_open: true
     tty: true
@@ -23,7 +20,4 @@ services:
 volumes:
   # Single volume holds all AS version databases
   ashelp-data:
-    driver: local
-  # Persistent cache for sentence-transformer model downloads
-  huggingface-cache:
     driver: local
