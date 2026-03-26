@@ -71,6 +71,8 @@ class HelpSearchEngine:
         self._ready = threading.Event()
         self._fts_ready = threading.Event()
         self._build_error: Exception | None = None
+        self._instance_lock_owned = False
+        self._build_lock_owned = False
 
         # Build status tracking (thread-safe via GIL for simple dict updates)
         self._build_status: dict = {
@@ -85,7 +87,10 @@ class HelpSearchEngine:
             "incremental_stats": None,  # {added, removed, changed, unchanged} for incremental builds
         }
 
-        # Ensure directory exists
+        # Ensure directory exists (handle legacy file at same path)
+        if self.db_path.exists() and not self.db_path.is_dir():
+            logger.warning("Removing legacy file at %s (LanceDB requires a directory)", self.db_path)
+            self.db_path.unlink()
         self.db_path.mkdir(parents=True, exist_ok=True)
 
         # Connect to LanceDB (directory-based, lightweight)
@@ -98,12 +103,10 @@ class HelpSearchEngine:
         self._build_progress_path = self.db_path / "_build_progress.json"
         # Build lock to avoid concurrent heavy rebuild/model-load in multiple processes
         self._build_lock_path = self.db_path / "_build.lock"
-        self._build_lock_owned = False
 
         # Per-db-path instance lock: prevents multiple servers using the same database.
         # Different db paths (e.g. AS4 vs AS6) can run concurrently.
         self._instance_lock_path = self.db_path / "_instance.lock"
-        self._instance_lock_owned = False
         self._acquire_instance_lock()
 
         # Determine build strategy: full, resume, incremental, or none
@@ -377,12 +380,23 @@ class HelpSearchEngine:
         lock_info = self._read_instance_lock()
         if lock_info is not None:
             other_pid = lock_info.get("pid")
-            if other_pid and self._is_process_alive(other_pid) and other_pid != os.getpid():
-                raise RuntimeError(
-                    f"Another as-help-server (PID {other_pid}) is already using "
-                    f"database at {self.db_path}. Stop the other instance first, "
-                    f"or use a different --db-path for each help root."
-                )
+            if other_pid and other_pid != os.getpid() and self._is_process_alive(other_pid):
+                # Guard against Windows PID reuse: compare process creation time
+                # with the timestamp stored in the lock file.
+                lock_time = lock_info.get("started_at")
+                create_time = self._get_process_create_time(other_pid)
+                if create_time is not None and lock_time is not None and create_time > lock_time + 5:
+                    # Process was created well after the lock was written → PID was recycled
+                    logger.debug(
+                        "Stale instance lock: PID %s was recycled (lock written %.0f, process created %.0f)",
+                        other_pid, lock_time, create_time,
+                    )
+                else:
+                    raise RuntimeError(
+                        f"Another as-help-server (PID {other_pid}) is already using "
+                        f"database at {self.db_path}. Stop the other instance first, "
+                        f"or use a different --db-path for each help root."
+                    )
             # Stale lock from a dead process -- safe to overwrite
             if other_pid and other_pid != os.getpid():
                 logger.debug("Overwriting stale instance lock (PID %s no longer running)", other_pid)
@@ -448,6 +462,38 @@ class HelpSearchEngine:
             return True
         except (OSError, ProcessLookupError):
             return False
+
+    @staticmethod
+    def _get_process_create_time(pid: int) -> float | None:
+        """Get process creation time as a Unix timestamp, or None if unavailable."""
+        if sys.platform == "win32":
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.windll.kernel32
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                return None
+            try:
+                creation = wintypes.FILETIME()
+                exit_ft = wintypes.FILETIME()
+                kernel_ft = wintypes.FILETIME()
+                user_ft = wintypes.FILETIME()
+                if not kernel32.GetProcessTimes(
+                    handle,
+                    ctypes.byref(creation),
+                    ctypes.byref(exit_ft),
+                    ctypes.byref(kernel_ft),
+                    ctypes.byref(user_ft),
+                ):
+                    return None
+                # FILETIME is 100ns intervals since 1601-01-01; convert to Unix epoch
+                ft = (creation.dwHighDateTime << 32) | creation.dwLowDateTime
+                return (ft - 116444736000000000) / 10000000.0
+            finally:
+                kernel32.CloseHandle(handle)
+        return None  # creation-time check only implemented for Windows
 
     # ------------------------------------------------------------------
     # Build lock: serialises heavy rebuild/model-load across processes
