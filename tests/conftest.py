@@ -10,24 +10,24 @@ from src.embeddings import EmbeddingService
 from src.indexer import HelpContentIndexer, HelpPage
 
 
-class MockEmbeddingService(EmbeddingService):
-    """Mock embedding service that returns deterministic vectors without loading a real model.
+class MockEmbeddingService:
+    """Mock embedding service that returns deterministic vectors without API calls.
 
     Uses MD5 hash of input text to generate reproducible vectors. Identical texts
     produce identical vectors, while different texts produce different vectors.
     Uses dimension=8 for fast tests.
+
+    Matches the EmbeddingService interface (api_endpoint, api_key, model_name, etc.)
+    but never makes HTTP requests.
     """
 
     def __init__(self, dimension: int = 8):
-        # Skip parent __init__ entirely — no model loading
+        self.api_endpoint = "https://mock.test/v1"
+        self.api_key = "mock-key"
         self.model_name = "mock-model"
-        self._model = None
         self._dimension = dimension
-        self._device = "cpu"
-
-    def _load_model(self):
-        """No-op for mock — model is never loaded."""
-        pass
+        self.batch_size = 100
+        self.max_chars = 8000
 
     @property
     def dimension(self) -> int:
@@ -44,6 +44,9 @@ class MockEmbeddingService(EmbeddingService):
 
     def embed_batch(self, texts: list[str], batch_size: int | None = None) -> list[list[float]]:
         return [self.embed_text(t) for t in texts]
+
+    def close(self):
+        pass
 
 
 @pytest.fixture

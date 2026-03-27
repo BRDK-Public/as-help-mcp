@@ -2,9 +2,9 @@
 
 ## Project Overview
 
-This is a **Model Context Protocol (MCP) server** that provides hybrid semantic + keyword search and retrieval for B&R Automation Studio help documentation. Built with Python 3.12+, FastMCP SDK, LanceDB for vector + FTS storage, and sentence-transformers for local embeddings.
+This is a **Model Context Protocol (MCP) server** that provides keyword and optional semantic search + retrieval for B&R Automation Studio help documentation. Built with Python 3.12+, FastMCP SDK, LanceDB for FTS + optional vector storage, and httpx for optional API-based embeddings.
 
-**Key Architecture Decision:** LanceDB was chosen for hybrid search (vector + full-text) with Reciprocal Rank Fusion (RRF). Sentence-transformers (`all-MiniLM-L6-v2`) provides local embeddings — no API keys needed.
+**Key Architecture Decision:** LanceDB provides full-text search (FTS) by default with no external dependencies. When `CREATE_EMBEDDINGS=true`, the server calls an OpenAI-compatible embedding API to create vectors and enables hybrid search (RRF = Reciprocal Rank Fusion). No local ML models — embeddings are always API-based and optional.
 
 ## Core Architecture
 
@@ -17,47 +17,63 @@ This is a **Model Context Protocol (MCP) server** that provides hybrid semantic 
    - Uses **lxml** for fast HTML text extraction (2-3x faster than BeautifulSoup)
    - Uses MD5 hash for change detection (stored in `_index_metadata.json` sidecar)
 
-2. **`embeddings.py`** - Embedding Service
-   - Lazy-loads sentence-transformer model on first use
-   - Default model: `all-MiniLM-L6-v2` (384-dim, ~22MB download)
-   - Configurable via `AS_HELP_EMBEDDING_MODEL` env var
-   - `embed_text()` for single texts, `embed_batch()` for bulk embedding
-   - 2048 char truncation for long texts
+2. **`embeddings.py`** - Optional API-Based Embedding Service
+   - Only used when `CREATE_EMBEDDINGS=true`
+   - Calls any **OpenAI-compatible** embedding API (OpenAI, Azure OpenAI, GitHub Models, Ollama, LiteLLM)
+   - Configured via env vars: `EMBEDDING_API_ENDPOINT`, `EMBEDDING_API_KEY`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS`
+   - `embed_text()` for single texts, `embed_batch()` for bulk (with configurable batch size)
+   - Automatic retry on 429/5xx with exponential backoff
+   - Uses **httpx** (async-capable HTTP client) — no torch, no sentence-transformers
 
-3. **`search_engine.py`** - LanceDB Hybrid Search with RRF
-   - **Three search legs** fused via Reciprocal Rank Fusion (RRF, k=60):
-     - Title vector similarity (weight 2x)
-     - Content vector similarity (weight 1x)
-     - Full-text keyword search (weight 1.5x)
+3. **`search_engine.py`** - LanceDB Dual-Mode Search Engine
+   - **FTS-only mode** (default, `CREATE_EMBEDDINGS=false`):
+     - Tantivy-powered full-text keyword search
+     - PyArrow schema: 9 columns (page metadata + `search_text` for FTS)
+     - No vector columns — minimal storage overhead
+   - **Hybrid mode** (`CREATE_EMBEDDINGS=true`):
+     - Three search legs fused via RRF (k=60):
+       - Title vector similarity (weight 2x)
+       - Content vector similarity (weight 1x)
+       - FTS keyword search (weight 1.5x)
+     - PyArrow schema: 11 columns (adds `title_vector` + `content_vector`)
    - LanceDB directory-based storage (`.ashelp_lance/`)
-   - PyArrow schema: page metadata + 2 vector columns + combined `search_text` for FTS
    - **Query sanitization** for FTS special characters
    - Parallel text extraction using ThreadPoolExecutor
-   - Metadata sidecar (`_index_metadata.json`) tracks XML hash + embedding model
-   - Accepts optional `embedding_service` parameter for testability
+   - Metadata sidecar (`_index_metadata.json`) tracks XML hash, `embeddings_enabled`, and optional model info
 
-3. **`server.py`** - FastMCP Server
-   - Exposes 5 tools: `search_help`, `get_page_by_id`, `get_page_by_help_id`, `get_breadcrumb`, `get_help_statistics`
+4. **`server.py`** - FastMCP Server
+   - Exposes tools: `search_help`, `get_page_by_id`, `get_page_by_help_id`, `get_breadcrumb`, `get_categories`, `browse_section`, `get_help_statistics`
    - **Intentionally truncated previews** (~100 chars) to force LLM to call `get_page_by_id`
    - Server instructions guide LLM to make **multiple searches and page retrievals**
    - Uses Pydantic models for structured responses
-   - Resource endpoint: `help://page/{page_id}` for direct HTML access
+   - Resource endpoint: `help://page/{page_id}` for direct text/HTML access
+   - Reads `CREATE_EMBEDDINGS` env var to conditionally create `EmbeddingService`
 
 ### Data Flow
 
 ```
-brhelpcontent.xml → Indexer → Page Tree (in-memory)
-                        ↓
-                  HTML Files → lxml → Plain Text
-                        ↓
-             sentence-transformers → Embeddings (title + content vectors)
-                        ↓
-                  LanceDB → Table + FTS Index → RRF Hybrid Search → MCP Tools
+FTS-only mode (default):
+  brhelpcontent.xml → Indexer → Page Tree (in-memory)
+                          ↓
+                    HTML Files → lxml → Plain Text
+                          ↓
+                    LanceDB → Table + FTS Index → Keyword Search → MCP Tools
+
+Hybrid mode (CREATE_EMBEDDINGS=true):
+  brhelpcontent.xml → Indexer → Page Tree (in-memory)
+                          ↓
+                    HTML Files → lxml → Plain Text
+                          ↓
+               Embedding API → Vectors (title + content)
+                          ↓
+                    LanceDB → Table + FTS Index + Vectors → RRF Hybrid Search → MCP Tools
 ```
 
-### Search Ranking (RRF)
+### Search Ranking
 
-Results are ranked using Reciprocal Rank Fusion with three search legs:
+**FTS-only mode:** Tantivy BM25 keyword ranking on combined title+content text.
+
+**Hybrid mode (RRF):**
 - **Title vector** (weight 2x): Semantic similarity between query and title embeddings
 - **Content vector** (weight 1x): Semantic similarity between query and content embeddings
 - **FTS keyword** (weight 1.5x): Tantivy-powered full-text search on combined title+content
@@ -114,6 +130,16 @@ uv run python test_search.py   # Runs sample queries
 - `AS_HELP_FORCE_REBUILD` - Set `true` for first run, then `false` (auto-rebuild on XML changes)
 - `AS_HELP_DB_PATH` - Optional custom DB location (defaults to `{AS_HELP_ROOT}/.ashelp_lance`)
 
+### Embedding Variables (Optional — only when `CREATE_EMBEDDINGS=true`)
+
+- `CREATE_EMBEDDINGS` - Master switch: `true` enables API-based embeddings + hybrid search
+- `EMBEDDING_API_ENDPOINT` - Base URL of OpenAI-compatible embedding API
+- `EMBEDDING_API_KEY` - API key (required)
+- `EMBEDDING_MODEL` - Model name (e.g., `text-embedding-3-small`, `text-embedding-ada-002`)
+- `EMBEDDING_DIMENSIONS` - Vector dimensions (e.g., `1536`, `384`)
+- `EMBEDDING_BATCH_SIZE` - Texts per API call (default: 100)
+- `EMBEDDING_MAX_CHARS` - Text truncation limit (default: 8000)
+
 ### Abbreviated XML Tags (Critical!)
 
 The B&R XML uses shortened tags - **both formats must be handled**:
@@ -136,6 +162,8 @@ See `_process_section()` and `_process_page()` in `indexer.py` for implementatio
 3. **Full rebuild** (first run, model change, legacy metadata): Re-extracts, re-embeds, overwrites LanceDB table
 
 Per-page fingerprints are stored in `_index_metadata.json` alongside the XML hash and embedding model.
+
+**Mode switching:** Changing between FTS-only and hybrid mode (or changing the embedding model) triggers a full rebuild because the PyArrow schema differs (9 vs 11 columns).
 
 See `_detect_build_strategy()` and `_incremental_update()` in `search_engine.py`.
 
@@ -178,7 +206,8 @@ Add to client config (e.g., `claude_desktop_config.json` or VS Code settings):
 | Operation | Time | Notes |
 |-----------|------|-------|
 | XML parse | ~2s | pages in-memory |
-| First index build | 10-11 min | Parallel HTML extraction + embedding + FTS indexing |
+| First index build (FTS-only) | ~2-3 min | Parallel HTML extraction + FTS indexing |
+| First index build (hybrid) | 10-11 min | Parallel HTML extraction + embedding + FTS indexing |
 | Subsequent startup | <3s | Load existing DB |
 | Search query | 10-50ms | RRF hybrid search |
 | Memory usage | 10-30MB | Runtime after index load |
@@ -202,7 +231,7 @@ src/
   server.py             # FastMCP server + tools (main logic)
   indexer.py            # XML parsing + HTML extraction
   search_engine.py      # LanceDB hybrid search with RRF
-  embeddings.py         # Sentence-transformer embedding service
+  embeddings.py         # Optional API-based embedding service
   
 Root level:
   test_*.py             # Standalone test scripts (no MCP server)
@@ -231,7 +260,7 @@ See README.md for complete setup instructions.
 ## Key Dependencies
 
 - `lancedb` - Vector + FTS database (LanceDB)
-- `sentence-transformers` - Local embedding models
+- `httpx` - HTTP client for optional embedding API calls
 - `pyarrow` - Columnar data for LanceDB tables
 - `lxml` - Fast HTML parsing (2-3x faster than BeautifulSoup)
 - `python-dotenv` - .env file loading (optional, env vars work directly)
@@ -241,5 +270,5 @@ See README.md for complete setup instructions.
 - **Adding tools**: Add `@mcp.tool()` decorated function in `server.py` with Pydantic models
 - **Changing XML parsing**: Update both tag formats in `indexer.py` (`Section`/`S`, etc.)
 - **Search improvements**: Adjust RRF weights or add search legs in `search_engine.py`
-- **Embedding model**: Change `AS_HELP_EMBEDDING_MODEL` env var or update default in `embeddings.py`
+- **Embedding model**: Change `EMBEDDING_MODEL` env var — any OpenAI-compatible model works
 - **New metadata**: Update `_save_metadata()` and `_load_metadata()` in `indexer.py`

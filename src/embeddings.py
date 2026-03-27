@@ -1,269 +1,217 @@
-"""Embedding service for semantic search using sentence-transformers."""
+"""Embedding service using an OpenAI-compatible embedding API.
+
+Supports any OpenAI-compatible endpoint: OpenAI, Azure OpenAI, GitHub Models,
+Ollama, LiteLLM, etc.  Only used when CREATE_EMBEDDINGS=true.
+"""
 
 from __future__ import annotations
 
 import logging
 import os
-import sys
-import threading
 import time
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from sentence_transformers import SentenceTransformer
+import httpx
 
 logger = logging.getLogger(__name__)
 
-# Default model: fast, small (22MB), 384-dim, good quality for English technical docs
-DEFAULT_MODEL_NAME = "all-MiniLM-L6-v2"
-
-
-def _flush_logs():
-    """Flush stderr so log output is visible immediately through MCP stdio pipe."""
-    sys.stderr.flush()
+# Defaults
+DEFAULT_BATCH_SIZE = 100
+DEFAULT_MAX_CHARS = 8000
+DEFAULT_TIMEOUT = 60  # seconds per API call
 
 
 class EmbeddingService:
-    """Manages sentence-transformer model for generating text embeddings."""
+    """Calls an OpenAI-compatible ``/embeddings`` endpoint.
 
-    def __init__(self, model_name: str | None = None):
-        """Initialize embedding service and load model.
+    All configuration is read from environment variables (or constructor args):
 
-        Args:
-            model_name: HuggingFace model name or local path. Defaults to
-                        AS_HELP_EMBEDDING_MODEL env var or 'all-MiniLM-L6-v2'.
-        """
-        self.model_name = model_name or os.getenv("AS_HELP_EMBEDDING_MODEL", DEFAULT_MODEL_NAME)
-        self._model: SentenceTransformer | None = None
-        self._dimension: int | None = None
-        self._device: str | None = None
-        self._load_lock = threading.Lock()
+    * ``EMBEDDING_API_ENDPOINT`` - base URL, e.g. ``https://models.inference.ai.azure.com``
+    * ``EMBEDDING_API_KEY``      - bearer token / API key
+    * ``EMBEDDING_MODEL``        - model name sent in the request body
+    * ``EMBEDDING_DIMENSIONS``   - expected vector dimensionality (required)
+    * ``EMBEDDING_BATCH_SIZE``   - texts per API call (default 100)
+    * ``EMBEDDING_MAX_CHARS``    - truncate input texts to this length (default 8000)
+    """
 
-        # Resolve local model cache: if .model_cache/<model_name>/ exists
-        # (populated by prepare_model.py for Docker builds), use the local
-        # directory path instead of downloading from HuggingFace Hub.
-        self._resolved_model_path = self._resolve_model_path()
+    def __init__(
+        self,
+        *,
+        api_endpoint: str | None = None,
+        api_key: str | None = None,
+        model_name: str | None = None,
+        dimensions: int | None = None,
+        batch_size: int | None = None,
+        max_chars: int | None = None,
+    ):
+        self.api_endpoint = (api_endpoint or os.getenv("EMBEDDING_API_ENDPOINT", "")).rstrip("/")
+        self.api_key = api_key or os.getenv("EMBEDDING_API_KEY", "")
+        self.model_name = model_name or os.getenv("EMBEDDING_MODEL", "")
 
-    def _resolve_model_path(self) -> str:
-        """Return local model directory if available, otherwise the model name for HF download."""
-        # Check environment variable for explicit model path
-        explicit_path = os.getenv("AS_HELP_MODEL_PATH", "").strip()
-        if explicit_path and os.path.isdir(explicit_path):
-            logger.info(f"Using model from AS_HELP_MODEL_PATH: {explicit_path}")
-            return explicit_path
+        dim_str = os.getenv("EMBEDDING_DIMENSIONS", "")
+        self._dimension = dimensions or (int(dim_str) if dim_str.strip() else 0)
 
-        # Check common locations for pre-exported model
-        candidates = [
-            os.path.join("/app/.model_cache", self.model_name),  # Docker
-            os.path.join(".model_cache", self.model_name),       # Local dev
-        ]
-        for path in candidates:
-            if os.path.isdir(path) and os.path.isfile(os.path.join(path, "config.json")):
-                logger.info(f"Using pre-exported model from: {path}")
-                return path
+        bs_str = os.getenv("EMBEDDING_BATCH_SIZE", "")
+        self.batch_size = batch_size or (int(bs_str) if bs_str.strip() else DEFAULT_BATCH_SIZE)
 
-        # Fall back to HuggingFace Hub download
-        return self.model_name
+        mc_str = os.getenv("EMBEDDING_MAX_CHARS", "")
+        self.max_chars = max_chars or (int(mc_str) if mc_str.strip() else DEFAULT_MAX_CHARS)
 
-    def _load_model(self):
-        """Lazy-load the sentence-transformer model on first use."""
-        if self._model is not None:
-            return
+        # Validate required fields
+        if not self.api_endpoint:
+            raise ValueError("EMBEDDING_API_ENDPOINT is required when embeddings are enabled")
+        if not self.api_key:
+            raise ValueError("EMBEDDING_API_KEY is required when embeddings are enabled")
+        if not self.model_name:
+            raise ValueError("EMBEDDING_MODEL is required when embeddings are enabled")
+        if self._dimension <= 0:
+            raise ValueError("EMBEDDING_DIMENSIONS must be a positive integer")
 
-        with self._load_lock:
-            if self._model is not None:
-                return
+        # Construct the embeddings URL
+        # If the endpoint already ends with /embeddings, use as-is
+        if self.api_endpoint.endswith("/embeddings"):
+            self._url = self.api_endpoint
+        else:
+            # Strip trailing /v1 if present, then add /v1/embeddings
+            base = self.api_endpoint.rstrip("/")
+            if base.endswith("/v1"):
+                self._url = f"{base}/embeddings"
+            else:
+                self._url = f"{base}/v1/embeddings"
 
-            start = time.time()
-            heartbeat_stop = threading.Event()
-            phase = {"name": "starting"}
-            import_warned = {"value": False}
+        self._client = httpx.Client(
+            timeout=DEFAULT_TIMEOUT,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+        )
 
-            # Emit periodic heartbeat logs so users can see activity even if
-            # imports or model initialization are slow.
-            def _heartbeat():
-                while not heartbeat_stop.wait(10):
-                    elapsed = time.time() - start
-                    logger.info(f"Still loading embedding model ({phase['name']})... {elapsed:.0f}s elapsed")
-                    if (
-                        not import_warned["value"]
-                        and phase["name"] == "importing sentence_transformers"
-                        and elapsed >= 120
-                    ):
-                        logger.warning(
-                            "sentence_transformers import is unusually slow. "
-                            "Ensure only one as-help-server instance is running. "
-                            "See README troubleshooting section for acceleration options."
-                        )
-                        import_warned["value"] = True
-                    _flush_logs()
-
-            heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
-            heartbeat_thread.start()
-
-            try:
-                phase["name"] = "importing torch"
-                logger.info("Embedding load phase: importing torch")
-                _flush_logs()
-                import torch
-
-                phase["name"] = "importing sentence_transformers"
-                logger.info("Embedding load phase: importing sentence_transformers")
-                _flush_logs()
-
-                # Skip optional transformer backends we do not use.
-                # This reduces import overhead and avoids unnecessary framework initialization.
-                os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
-                os.environ.setdefault("TRANSFORMERS_NO_FLAX", "1")
-                os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-
-                from sentence_transformers import SentenceTransformer
-
-                # Allow explicit device override for troubleshooting.
-                forced_device = os.getenv("AS_HELP_EMBEDDING_DEVICE", "").strip().lower()
-                if forced_device in ("cpu", "cuda", "mps"):
-                    device = forced_device
-                    logger.info(f"Embedding device forced via AS_HELP_EMBEDDING_DEVICE={device}")
-                    _flush_logs()
-                else:
-                    phase["name"] = "detecting device"
-                    logger.info("Embedding load phase: detecting device")
-                    _flush_logs()
-                    # Auto-detect best available device
-                    if torch.cuda.is_available():
-                        device = "cuda"
-                    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                        device = "mps"
-                    else:
-                        device = "cpu"
-
-                logger.info(
-                    f"Loading embedding model '{self.model_name}' on {device} (first use may download ~22MB)..."
-                )
-                _flush_logs()
-
-                phase["name"] = f"initializing model ({device})"
-                # Redirect stdout→stderr at BOTH the Python and OS file-descriptor
-                # levels during model construction.  SentenceTransformer, safetensors
-                # and tokenizers contain Rust/C extensions that write directly to
-                # C-level fd 1 (stdout).  A Python-level sys.stdout reassignment does
-                # NOT intercept those writes.  In Docker (or any pipe-based MCP
-                # transport) the fd 1 pipe buffer fills up because the MCP client
-                # only reads JSON-RPC, causing the native write() call to block
-                # forever.  os.dup2(2, 1) makes fd 1 point to stderr at the OS
-                # level so every write – Python or C – lands on stderr.
-                _saved_stdout_fd = os.dup(1)       # keep a copy of real stdout
-                os.dup2(2, 1)                       # fd 1 → stderr
-                _saved_py_stdout = sys.stdout
-                sys.stdout = sys.stderr              # Python-level redirect too
-                try:
-                    self._model = SentenceTransformer(self._resolved_model_path, device=device)
-                finally:
-                    sys.stdout = _saved_py_stdout    # restore Python stdout
-                    os.dup2(_saved_stdout_fd, 1)     # restore fd 1
-                    os.close(_saved_stdout_fd)
-
-                phase["name"] = "reading model metadata"
-                self._dimension = self._model.get_sentence_embedding_dimension()
-                self._device = device
-                elapsed = time.time() - start
-                logger.info(f"Embedding model loaded in {elapsed:.1f}s (device={device}, dimension={self._dimension})")
-                _flush_logs()
-            finally:
-                heartbeat_stop.set()
+        logger.info(
+            "EmbeddingService configured: endpoint=%s model=%s dim=%d batch=%d",
+            self.api_endpoint,
+            self.model_name,
+            self._dimension,
+            self.batch_size,
+        )
 
     @property
     def dimension(self) -> int:
-        """Return the embedding dimension for the loaded model."""
-        self._load_model()
-        return self._dimension  # type: ignore[return-value]
+        """Return the configured embedding dimension."""
+        return self._dimension
 
     def embed_text(self, text: str) -> list[float]:
-        """Embed a single text string.
-
-        Args:
-            text: Text to embed. Empty string produces a zero-ish vector.
+        """Embed a single text string via the API.
 
         Returns:
             List of floats (embedding vector).
         """
-        self._load_model()
-        # Truncate to model's max sequence length (handled internally by sentence-transformers,
-        # but we trim obviously huge texts to save tokenizer overhead)
-        max_chars = 2048
-        if len(text) > max_chars:
-            text = text[:max_chars]
-        embedding = self._model.encode(text, show_progress_bar=False)  # type: ignore[union-attr]
-        return embedding.tolist()
+        if not text.strip():
+            return [0.0] * self._dimension
+
+        truncated = text[: self.max_chars] if len(text) > self.max_chars else text
+        result = self._call_api([truncated])
+        return result[0]
 
     def embed_batch(self, texts: list[str], batch_size: int | None = None) -> list[list[float]]:
-        """Embed a batch of texts efficiently.
+        """Embed a batch of texts via chunked API calls.
 
         Args:
             texts: List of texts to embed.
-            batch_size: Batch size for encoding. Auto-selected based on device
-                        if not specified (256 for GPU, 64 for CPU).
+            batch_size: Override instance batch_size for this call.
 
         Returns:
-            List of embedding vectors, same order as input.
+            List of embedding vectors in the same order as input.
         """
         if not texts:
             return []
 
-        self._load_model()
-
-        # Auto-select batch size based on device if not specified
-        if batch_size is None:
-            configured = os.getenv("AS_HELP_EMBED_BATCH_SIZE", "").strip()
-            if configured:
-                try:
-                    configured_size = int(configured)
-                    if configured_size > 0:
-                        batch_size = configured_size
-                    else:
-                        raise ValueError("batch size must be > 0")
-                except ValueError:
-                    logger.warning(f"Invalid AS_HELP_EMBED_BATCH_SIZE='{configured}', falling back to default")
-                    batch_size = 256 if self._device in ("cuda", "mps") else 64
-            else:
-                batch_size = 256 if self._device in ("cuda", "mps") else 64
-
-        # Truncate long texts
-        max_chars = 2048
-        truncated = [t[:max_chars] if len(t) > max_chars else t for t in texts]
-
-        total = len(truncated)
-        # Process in chunks to provide visible progress.
-        # tqdm progress bars use \r carriage returns that don't render through
-        # MCP stdio stderr pipe, so we log periodic updates with stderr flush.
-        chunk_size = batch_size * 20
+        bs = batch_size or self.batch_size
+        total = len(texts)
         all_embeddings: list[list[float]] = []
 
-        logger.info(f"Embedding {total} texts (batch_size={batch_size}, device={self._device})...")
-        _flush_logs()
+        # Truncate
+        truncated = [t[: self.max_chars] if len(t) > self.max_chars else t for t in texts]
+
+        logger.info("Embedding %d texts (batch_size=%d, model=%s)...", total, bs, self.model_name)
         start = time.time()
 
-        for offset in range(0, total, chunk_size):
-            chunk = truncated[offset : offset + chunk_size]
-            chunk_embeddings = self._model.encode(  # type: ignore[union-attr]
-                chunk, batch_size=batch_size, show_progress_bar=False
-            )
-            all_embeddings.extend(e.tolist() for e in chunk_embeddings)
+        for offset in range(0, total, bs):
+            chunk = truncated[offset : offset + bs]
+            # Replace empty strings with a single space (API rejects empty input)
+            chunk = [t if t.strip() else " " for t in chunk]
 
-            done = min(offset + chunk_size, total)
+            chunk_vectors = self._call_api(chunk)
+            all_embeddings.extend(chunk_vectors)
+
+            done = min(offset + bs, total)
             elapsed = time.time() - start
             rate = done / elapsed if elapsed > 0 else 0
-            pct = done * 100 // total
             if done < total:
                 eta = (total - done) / rate if rate > 0 else 0
-                logger.info(f"  Progress: {done}/{total} ({pct}%, {rate:.0f} texts/s, ETA {eta:.0f}s)")
+                logger.info(
+                    "  Progress: %d/%d (%d%%, %.0f texts/s, ETA %.0fs)",
+                    done, total, done * 100 // total, rate, eta,
+                )
             else:
-                logger.info(f"  Done: {done}/{total} ({rate:.0f} texts/s)")
-            _flush_logs()
+                logger.info("  Done: %d/%d (%.0f texts/s)", done, total, rate)
 
         elapsed = time.time() - start
-        rate = total / elapsed if elapsed > 0 else 0
-        logger.info(f"Embedded {total} texts in {elapsed:.1f}s ({rate:.0f} texts/s)")
-        _flush_logs()
-
+        logger.info("Embedded %d texts in %.1fs", total, elapsed)
         return all_embeddings
+
+    def _call_api(self, texts: list[str]) -> list[list[float]]:
+        """Make a single API call with retry on transient errors.
+
+        Retries up to 3 times on 429 (rate limit) and 5xx (server error)
+        with exponential backoff.
+        """
+        payload: dict = {
+            "input": texts,
+            "model": self.model_name,
+        }
+        # Include dimensions if the API supports it (OpenAI, GitHub Models)
+        if self._dimension:
+            payload["dimensions"] = self._dimension
+
+        max_retries = 3
+        for attempt in range(max_retries + 1):
+            try:
+                response = self._client.post(self._url, json=payload)
+                if response.status_code == 200:
+                    data = response.json()
+                    # Sort by index to guarantee order
+                    embeddings_data = sorted(data["data"], key=lambda x: x["index"])
+                    return [item["embedding"] for item in embeddings_data]
+
+                if response.status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
+                    wait = 2 ** attempt
+                    logger.warning(
+                        "Embedding API returned %d (attempt %d/%d), retrying in %ds...",
+                        response.status_code,
+                        attempt + 1,
+                        max_retries,
+                        wait,
+                    )
+                    time.sleep(wait)
+                    continue
+
+                # Non-retryable error
+                response.raise_for_status()
+
+            except httpx.TimeoutException:
+                if attempt < max_retries:
+                    wait = 2 ** attempt
+                    logger.warning(
+                        "Embedding API timeout (attempt %d/%d), retrying in %ds...",
+                        attempt + 1, max_retries, wait,
+                    )
+                    time.sleep(wait)
+                    continue
+                raise
+
+        # Should not reach here, but just in case
+        raise RuntimeError(f"Embedding API failed after {max_retries} retries")
+
+    def close(self):
+        """Close the HTTP client."""
+        self._client.close()

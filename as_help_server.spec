@@ -16,27 +16,21 @@ from PyInstaller.utils.hooks import collect_submodules, collect_data_files, coll
 block_cipher = None
 
 # Only use collect_submodules for smaller packages that PyInstaller doesn't have
-# built-in hooks for. Let PyInstaller's own hooks handle torch, numpy, scipy, sklearn.
+# built-in hooks for.
 collected_submodules = []
 for pkg in [
-    "sentence_transformers",
-    "transformers",
-    "huggingface_hub",
-    "safetensors",
     "lancedb",
-    "tokenizers",
-    "tqdm",
 ]:
     collected_submodules += collect_submodules(pkg)
 
-# Collect data files needed at runtime (e.g. model configs, version files)
+# Collect data files needed at runtime
 extra_datas = []
-for pkg in ["transformers", "huggingface_hub", "sentence_transformers", "lancedb"]:
+for pkg in ["lancedb"]:
     extra_datas += collect_data_files(pkg)
 
 # Collect native shared libraries (.dll/.so/.dylib)
 extra_binaries = []
-for pkg in ["tokenizers", "lancedb"]:
+for pkg in ["lancedb"]:
     extra_binaries += collect_dynamic_libs(pkg)
 
 hidden_imports = collected_submodules + [
@@ -97,6 +91,7 @@ hidden_imports = collected_submodules + [
     "src.server",
     "src.indexer",
     "src.search_engine",
+    "src.embeddings",
     # Async support
     "asyncio",
     "concurrent.futures",

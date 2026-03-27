@@ -1,176 +1,360 @@
-"""Unit tests for embeddings.py - EmbeddingService."""
+"""Unit tests for embeddings.py - API-based EmbeddingService."""
 
+import json
 from unittest.mock import MagicMock, patch
 
-import numpy as np
+import httpx
 import pytest
 
-from src.embeddings import DEFAULT_MODEL_NAME, EmbeddingService
+from src.embeddings import EmbeddingService
+
+
+def _make_embedding_response(vectors: list[list[float]]) -> dict:
+    """Build a mock OpenAI embedding API response."""
+    return {
+        "data": [{"index": i, "embedding": vec} for i, vec in enumerate(vectors)],
+        "model": "test-model",
+        "usage": {"prompt_tokens": 10, "total_tokens": 10},
+    }
 
 
 class TestEmbeddingServiceInit:
-    """Test EmbeddingService initialization."""
+    """Test EmbeddingService initialization and validation."""
 
-    def test_default_model_name(self):
-        """Verify default model name is set correctly."""
+    def test_constructor_with_all_args(self):
+        """Verify constructor accepts all explicit arguments."""
+        service = EmbeddingService(
+            api_endpoint="https://api.example.com",
+            api_key="sk-test",
+            model_name="text-embedding-3-small",
+            dimensions=1536,
+            batch_size=50,
+            max_chars=4000,
+        )
+        assert service.api_endpoint == "https://api.example.com"
+        assert service.model_name == "text-embedding-3-small"
+        assert service.dimension == 1536
+        assert service.batch_size == 50
+        assert service.max_chars == 4000
+        service.close()
+
+    def test_constructor_from_env_vars(self, monkeypatch):
+        """Verify constructor reads from environment variables."""
+        monkeypatch.setenv("EMBEDDING_API_ENDPOINT", "https://env.example.com")
+        monkeypatch.setenv("EMBEDDING_API_KEY", "env-key")
+        monkeypatch.setenv("EMBEDDING_MODEL", "env-model")
+        monkeypatch.setenv("EMBEDDING_DIMENSIONS", "768")
+        monkeypatch.setenv("EMBEDDING_BATCH_SIZE", "200")
+        monkeypatch.setenv("EMBEDDING_MAX_CHARS", "5000")
+
         service = EmbeddingService()
-        assert service.model_name == DEFAULT_MODEL_NAME
-
-    def test_custom_model_name(self):
-        """Verify custom model name is accepted."""
-        service = EmbeddingService(model_name="custom-model")
-        assert service.model_name == "custom-model"
-
-    def test_env_var_model_name(self, monkeypatch):
-        """Verify model name from environment variable."""
-        monkeypatch.setenv("AS_HELP_EMBEDDING_MODEL", "env-model")
-        service = EmbeddingService()
+        assert service.api_endpoint == "https://env.example.com"
+        assert service.api_key == "env-key"
         assert service.model_name == "env-model"
+        assert service.dimension == 768
+        assert service.batch_size == 200
+        assert service.max_chars == 5000
+        service.close()
 
-    def test_explicit_overrides_env_var(self, monkeypatch):
-        """Verify explicit model name overrides env var."""
-        monkeypatch.setenv("AS_HELP_EMBEDDING_MODEL", "env-model")
-        service = EmbeddingService(model_name="explicit-model")
+    def test_explicit_args_override_env_vars(self, monkeypatch):
+        """Verify explicit args take precedence over env vars."""
+        monkeypatch.setenv("EMBEDDING_API_ENDPOINT", "https://env.example.com")
+        monkeypatch.setenv("EMBEDDING_API_KEY", "env-key")
+        monkeypatch.setenv("EMBEDDING_MODEL", "env-model")
+        monkeypatch.setenv("EMBEDDING_DIMENSIONS", "768")
+
+        service = EmbeddingService(
+            api_endpoint="https://explicit.example.com",
+            api_key="explicit-key",
+            model_name="explicit-model",
+            dimensions=1536,
+        )
+        assert service.api_endpoint == "https://explicit.example.com"
+        assert service.api_key == "explicit-key"
         assert service.model_name == "explicit-model"
+        assert service.dimension == 1536
+        service.close()
 
-    def test_model_not_loaded_on_init(self):
-        """Verify model is lazily loaded, not on __init__."""
-        service = EmbeddingService()
-        assert service._model is None
+    def test_missing_endpoint_raises(self, monkeypatch):
+        """Verify missing endpoint raises ValueError."""
+        monkeypatch.delenv("EMBEDDING_API_ENDPOINT", raising=False)
+        with pytest.raises(ValueError, match="EMBEDDING_API_ENDPOINT"):
+            EmbeddingService(api_key="key", model_name="model", dimensions=384)
+
+    def test_missing_api_key_raises(self, monkeypatch):
+        """Verify missing API key raises ValueError."""
+        monkeypatch.delenv("EMBEDDING_API_KEY", raising=False)
+        with pytest.raises(ValueError, match="EMBEDDING_API_KEY"):
+            EmbeddingService(api_endpoint="https://api.test", model_name="model", dimensions=384)
+
+    def test_missing_model_raises(self, monkeypatch):
+        """Verify missing model name raises ValueError."""
+        monkeypatch.delenv("EMBEDDING_MODEL", raising=False)
+        with pytest.raises(ValueError, match="EMBEDDING_MODEL"):
+            EmbeddingService(api_endpoint="https://api.test", api_key="key", dimensions=384)
+
+    def test_missing_dimensions_raises(self, monkeypatch):
+        """Verify missing dimensions raises ValueError."""
+        monkeypatch.delenv("EMBEDDING_DIMENSIONS", raising=False)
+        with pytest.raises(ValueError, match="EMBEDDING_DIMENSIONS"):
+            EmbeddingService(api_endpoint="https://api.test", api_key="key", model_name="model")
+
+    def test_zero_dimensions_raises(self):
+        """Verify zero dimensions raises ValueError."""
+        with pytest.raises(ValueError, match="EMBEDDING_DIMENSIONS"):
+            EmbeddingService(
+                api_endpoint="https://api.test", api_key="key", model_name="model", dimensions=0
+            )
+
+
+class TestURLConstruction:
+    """Test embedding API URL construction."""
+
+    def _make(self, endpoint: str) -> EmbeddingService:
+        return EmbeddingService(
+            api_endpoint=endpoint, api_key="key", model_name="m", dimensions=8
+        )
+
+    def test_plain_base_url(self):
+        """Verify /v1/embeddings is appended to plain base URL."""
+        s = self._make("https://api.openai.com")
+        assert s._url == "https://api.openai.com/v1/embeddings"
+        s.close()
+
+    def test_base_url_with_v1(self):
+        """Verify /embeddings appended when /v1 already present."""
+        s = self._make("https://api.openai.com/v1")
+        assert s._url == "https://api.openai.com/v1/embeddings"
+        s.close()
+
+    def test_base_url_with_full_path(self):
+        """Verify URL used as-is when it ends with /embeddings."""
+        s = self._make("https://api.openai.com/v1/embeddings")
+        assert s._url == "https://api.openai.com/v1/embeddings"
+        s.close()
+
+    def test_trailing_slash_stripped(self):
+        """Verify trailing slash is handled."""
+        s = self._make("https://api.openai.com/")
+        assert s._url == "https://api.openai.com/v1/embeddings"
+        s.close()
 
 
 class TestEmbedText:
-    """Test single text embedding."""
+    """Test single text embedding via API."""
 
     @pytest.fixture
-    def mock_service(self):
-        """Create service with mocked SentenceTransformer."""
-        service = EmbeddingService()
-        mock_model = MagicMock()
-        mock_model.get_sentence_embedding_dimension.return_value = 384
-        mock_model.encode.return_value = np.zeros(384)
-        service._model = mock_model
-        service._dimension = 384
-        return service
+    def service(self):
+        s = EmbeddingService(
+            api_endpoint="https://api.test", api_key="key", model_name="model", dimensions=4
+        )
+        yield s
+        s.close()
 
-    def test_embed_text_returns_list(self, mock_service):
-        """Verify embed_text returns a list of floats."""
-        result = mock_service.embed_text("hello world")
-        assert isinstance(result, list)
-        assert len(result) == 384
+    def test_embed_text_returns_vector(self, service):
+        """Verify embed_text returns a list of floats with correct dimension."""
+        mock_response = httpx.Response(
+            200,
+            json=_make_embedding_response([[0.1, 0.2, 0.3, 0.4]]),
+        )
+        service._client = MagicMock()
+        service._client.post.return_value = mock_response
 
-    def test_embed_text_calls_encode(self, mock_service):
-        """Verify encode is called with correct args."""
-        mock_service.embed_text("test input")
-        mock_service._model.encode.assert_called_once_with("test input", show_progress_bar=False)
+        result = service.embed_text("hello")
+        assert result == [0.1, 0.2, 0.3, 0.4]
 
-    def test_embed_text_truncates_long_input(self, mock_service):
-        """Verify very long text is truncated."""
-        long_text = "x" * 5000
-        mock_service.embed_text(long_text)
-        call_args = mock_service._model.encode.call_args[0][0]
-        assert len(call_args) == 2048
+    def test_embed_empty_text_returns_zeros(self, service):
+        """Verify empty text returns zero vector without API call."""
+        service._client = MagicMock()
+        result = service.embed_text("")
+        assert result == [0.0, 0.0, 0.0, 0.0]
+        service._client.post.assert_not_called()
 
-    def test_embed_text_short_input_not_truncated(self, mock_service):
-        """Verify short text is passed as-is."""
-        short_text = "hello"
-        mock_service.embed_text(short_text)
-        call_args = mock_service._model.encode.call_args[0][0]
-        assert call_args == "hello"
+    def test_embed_text_truncates_long_input(self, service):
+        """Verify long text is truncated to max_chars."""
+        service.max_chars = 100
+        mock_response = httpx.Response(
+            200,
+            json=_make_embedding_response([[1.0, 2.0, 3.0, 4.0]]),
+        )
+        service._client = MagicMock()
+        service._client.post.return_value = mock_response
+
+        long_text = "x" * 500
+        service.embed_text(long_text)
+
+        call_payload = service._client.post.call_args[1]["json"]
+        assert len(call_payload["input"][0]) == 100
 
 
 class TestEmbedBatch:
-    """Test batch text embedding."""
+    """Test batch embedding via API."""
 
     @pytest.fixture
-    def mock_service(self):
-        """Create service with mocked SentenceTransformer."""
-        service = EmbeddingService()
-        mock_model = MagicMock()
-        mock_model.get_sentence_embedding_dimension.return_value = 384
-        mock_model.encode.return_value = np.zeros((3, 384))
-        service._model = mock_model
-        service._dimension = 384
-        service._device = "cpu"
-        return service
+    def service(self):
+        s = EmbeddingService(
+            api_endpoint="https://api.test", api_key="key", model_name="model",
+            dimensions=4, batch_size=2,
+        )
+        yield s
+        s.close()
 
-    def test_embed_batch_empty_list(self, mock_service):
+    def test_embed_batch_empty(self, service):
         """Verify empty list returns empty list."""
-        result = mock_service.embed_batch([])
-        assert result == []
+        assert service.embed_batch([]) == []
 
-    def test_embed_batch_returns_list_of_lists(self, mock_service):
-        """Verify batch returns correct structure."""
-        result = mock_service.embed_batch(["a", "b", "c"])
-        assert isinstance(result, list)
-        assert len(result) == 3
-        assert all(isinstance(v, list) for v in result)
+    def test_embed_batch_single_chunk(self, service):
+        """Verify batch within batch_size makes one API call."""
+        mock_response = httpx.Response(
+            200,
+            json=_make_embedding_response([[1, 2, 3, 4], [5, 6, 7, 8]]),
+        )
+        service._client = MagicMock()
+        service._client.post.return_value = mock_response
 
-    def test_embed_batch_truncates_long_texts(self, mock_service):
-        """Verify long texts are truncated in batch."""
-        texts = ["short", "x" * 5000, "also short"]
-        mock_service.embed_batch(texts)
-        call_args = mock_service._model.encode.call_args[0][0]
-        assert len(call_args[1]) == 2048
-        assert call_args[0] == "short"
-        assert call_args[2] == "also short"
+        result = service.embed_batch(["a", "b"])
+        assert len(result) == 2
+        assert service._client.post.call_count == 1
 
-    def test_embed_batch_custom_batch_size(self, mock_service):
-        """Verify custom batch_size is passed to encode."""
-        mock_service.embed_batch(["a", "b", "c"], batch_size=32)
-        mock_service._model.encode.assert_called_once()
-        _, kwargs = mock_service._model.encode.call_args
-        assert kwargs["batch_size"] == 32
-        assert kwargs["show_progress_bar"] is False
+    def test_embed_batch_multiple_chunks(self, service):
+        """Verify batch exceeding batch_size makes multiple API calls."""
+        mock_response = httpx.Response(
+            200,
+            json=_make_embedding_response([[1, 2, 3, 4], [5, 6, 7, 8]]),
+        )
+        service._client = MagicMock()
+        service._client.post.return_value = mock_response
 
-    def test_embed_batch_uses_env_batch_size(self, mock_service, monkeypatch):
-        """Verify AS_HELP_EMBED_BATCH_SIZE overrides default auto batch size."""
-        monkeypatch.setenv("AS_HELP_EMBED_BATCH_SIZE", "128")
+        result = service.embed_batch(["a", "b", "c", "d"])
+        assert len(result) == 4
+        assert service._client.post.call_count == 2
 
-        mock_service.embed_batch(["a", "b", "c"])
+    def test_embed_batch_replaces_empty_strings(self, service):
+        """Verify empty strings in batch are replaced with space."""
+        mock_response = httpx.Response(
+            200,
+            json=_make_embedding_response([[1, 2, 3, 4], [5, 6, 7, 8]]),
+        )
+        service._client = MagicMock()
+        service._client.post.return_value = mock_response
 
-        _, kwargs = mock_service._model.encode.call_args
-        assert kwargs["batch_size"] == 128
+        service.embed_batch(["hello", ""])
 
-    def test_embed_batch_invalid_env_batch_size_falls_back_default(self, mock_service, monkeypatch):
-        """Verify invalid AS_HELP_EMBED_BATCH_SIZE falls back to device default."""
-        monkeypatch.setenv("AS_HELP_EMBED_BATCH_SIZE", "not-a-number")
-
-        mock_service.embed_batch(["a", "b", "c"])
-
-        _, kwargs = mock_service._model.encode.call_args
-        assert kwargs["batch_size"] == 64
+        call_payload = service._client.post.call_args[1]["json"]
+        assert call_payload["input"] == ["hello", " "]
 
 
-class TestLazyLoading:
-    """Test lazy model loading behavior."""
+class TestAPIRetry:
+    """Test retry logic for transient API errors."""
 
-    @patch("torch.cuda.is_available", return_value=False)
-    @patch("sentence_transformers.SentenceTransformer")
-    def test_dimension_triggers_load(self, mock_st_class, _mock_cuda):
-        """Verify accessing dimension triggers model load."""
-        mock_model = MagicMock()
-        mock_model.get_sentence_embedding_dimension.return_value = 384
-        mock_st_class.return_value = mock_model
+    @pytest.fixture
+    def service(self):
+        s = EmbeddingService(
+            api_endpoint="https://api.test", api_key="key", model_name="model", dimensions=4
+        )
+        yield s
+        s.close()
 
-        service = EmbeddingService()
-        assert service._model is None
+    def test_retry_on_429(self, service):
+        """Verify retry on rate limit (429)."""
+        rate_limit_response = httpx.Response(429, json={"error": "rate limited"})
+        success_response = httpx.Response(
+            200, json=_make_embedding_response([[1, 2, 3, 4]])
+        )
 
-        dim = service.dimension
-        assert dim == 384
-        mock_st_class.assert_called_once_with(service._resolved_model_path, device="cpu")
+        service._client = MagicMock()
+        service._client.post.side_effect = [rate_limit_response, success_response]
 
-    @patch("torch.cuda.is_available", return_value=False)
-    @patch("sentence_transformers.SentenceTransformer")
-    def test_model_loaded_once(self, mock_st_class, _mock_cuda):
-        """Verify model is only loaded once across multiple calls."""
-        mock_model = MagicMock()
-        mock_model.get_sentence_embedding_dimension.return_value = 384
-        mock_model.encode.return_value = np.zeros(384)
-        mock_st_class.return_value = mock_model
+        with patch("src.embeddings.time.sleep"):
+            result = service._call_api(["test"])
 
-        service = EmbeddingService()
-        service.embed_text("first")
-        service.embed_text("second")
+        assert result == [[1, 2, 3, 4]]
+        assert service._client.post.call_count == 2
 
-        mock_st_class.assert_called_once()
+    def test_retry_on_500(self, service):
+        """Verify retry on server error (500)."""
+        error_response = httpx.Response(500, json={"error": "internal"})
+        success_response = httpx.Response(
+            200, json=_make_embedding_response([[1, 2, 3, 4]])
+        )
+
+        service._client = MagicMock()
+        service._client.post.side_effect = [error_response, success_response]
+
+        with patch("src.embeddings.time.sleep"):
+            result = service._call_api(["test"])
+
+        assert result == [[1, 2, 3, 4]]
+
+    def test_retry_on_timeout(self, service):
+        """Verify retry on timeout."""
+        success_response = httpx.Response(
+            200, json=_make_embedding_response([[1, 2, 3, 4]])
+        )
+
+        service._client = MagicMock()
+        service._client.post.side_effect = [
+            httpx.TimeoutException("timeout"),
+            success_response,
+        ]
+
+        with patch("src.embeddings.time.sleep"):
+            result = service._call_api(["test"])
+
+        assert result == [[1, 2, 3, 4]]
+
+    def test_no_retry_on_400(self, service):
+        """Verify no retry on client error (400)."""
+        error_response = httpx.Response(400, json={"error": "bad request"})
+        error_response.request = httpx.Request("POST", "https://api.test/v1/embeddings")
+
+        service._client = MagicMock()
+        service._client.post.return_value = error_response
+
+        with pytest.raises(httpx.HTTPStatusError):
+            service._call_api(["test"])
+
+        assert service._client.post.call_count == 1
+
+    def test_exhausted_retries_raises(self, service):
+        """Verify error raised after all retries exhausted."""
+        error_response = httpx.Response(500, json={"error": "internal"})
+        error_response.request = httpx.Request("POST", "https://api.test/v1/embeddings")
+
+        service._client = MagicMock()
+        service._client.post.return_value = error_response
+
+        with patch("src.embeddings.time.sleep"):
+            with pytest.raises(httpx.HTTPStatusError):
+                service._call_api(["test"])
+
+        assert service._client.post.call_count == 4  # initial + 3 retries
+
+
+class TestResponseOrdering:
+    """Test that embeddings are returned in correct order."""
+
+    @pytest.fixture
+    def service(self):
+        s = EmbeddingService(
+            api_endpoint="https://api.test", api_key="key", model_name="model", dimensions=4
+        )
+        yield s
+        s.close()
+
+    def test_out_of_order_response_is_sorted(self, service):
+        """Verify embeddings are sorted by index even if API returns them out of order."""
+        out_of_order_response = {
+            "data": [
+                {"index": 1, "embedding": [5, 6, 7, 8]},
+                {"index": 0, "embedding": [1, 2, 3, 4]},
+            ],
+            "model": "test",
+            "usage": {"prompt_tokens": 10, "total_tokens": 10},
+        }
+        mock_response = httpx.Response(200, json=out_of_order_response)
+        service._client = MagicMock()
+        service._client.post.return_value = mock_response
+
+        result = service._call_api(["first", "second"])
+        assert result == [[1, 2, 3, 4], [5, 6, 7, 8]]

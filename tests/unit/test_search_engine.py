@@ -813,7 +813,7 @@ class TestBuildResume:
         records = [engine._extract_text_for_page(pid, page) for pid, page in partial]
         title_vecs = engine.embedder.embed_batch([r[1] for r in records])
         content_vecs = engine.embedder.embed_batch([r[2] if r[2] else r[1] for r in records])
-        chunk_data = engine._records_to_arrow(records, title_vecs, content_vecs)
+        chunk_data = engine._records_to_hybrid_arrow(records, title_vecs, content_vecs)
         engine.db.create_table(engine.TABLE_NAME, chunk_data)
         engine.close()
 
@@ -838,7 +838,7 @@ class TestBuildResume:
         records = [engine._extract_text_for_page(pid, page) for pid, page in partial]
         title_vecs = engine.embedder.embed_batch([r[1] for r in records])
         content_vecs = engine.embedder.embed_batch([r[2] if r[2] else r[1] for r in records])
-        chunk_data = engine._records_to_arrow(records, title_vecs, content_vecs)
+        chunk_data = engine._records_to_hybrid_arrow(records, title_vecs, content_vecs)
         engine.db.create_table(engine.TABLE_NAME, chunk_data)
         engine.close()
 
@@ -871,7 +871,7 @@ class TestBuildResume:
         records = [engine._extract_text_for_page(pid, page) for pid, page in list(engine.indexer.pages.items())[:1]]
         title_vecs = engine.embedder.embed_batch([r[1] for r in records])
         content_vecs = engine.embedder.embed_batch([r[2] if r[2] else r[1] for r in records])
-        chunk_data = engine._records_to_arrow(records, title_vecs, content_vecs)
+        chunk_data = engine._records_to_hybrid_arrow(records, title_vecs, content_vecs)
         engine.db.create_table(engine.TABLE_NAME, chunk_data)
         engine.close()
 
@@ -896,7 +896,7 @@ class TestBuildResume:
         records = [engine._extract_text_for_page(pid, page) for pid, page in list(engine.indexer.pages.items())[:1]]
         title_vecs = engine.embedder.embed_batch([r[1] for r in records])
         content_vecs = engine.embedder.embed_batch([r[2] if r[2] else r[1] for r in records])
-        chunk_data = engine._records_to_arrow(records, title_vecs, content_vecs)
+        chunk_data = engine._records_to_hybrid_arrow(records, title_vecs, content_vecs)
         engine.db.create_table(engine.TABLE_NAME, chunk_data)
         engine.close()
 
@@ -1019,3 +1019,157 @@ class TestInstanceLock:
 
         # Lock should be released, file gone
         assert not (db_path / "_instance.lock").exists()
+
+
+class TestFTSOnlyMode:
+    """Test FTS-only mode (no embedding service)."""
+
+    @pytest.fixture
+    def fts_engine(self, initialized_indexer, tmp_path):
+        """Create search engine in FTS-only mode (no embedding service)."""
+        db_path = tmp_path / "fts_lance"
+        engine = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=True, embedding_service=None
+        )
+        engine.initialize()
+        yield engine
+        engine.close()
+
+    def test_fts_mode_embeddings_disabled(self, fts_engine):
+        """Verify embeddings are disabled when no embedding service provided."""
+        assert fts_engine._embeddings_enabled is False
+        assert fts_engine.embedder is None
+
+    def test_fts_mode_search_works(self, fts_engine):
+        """Verify FTS search returns results in keyword mode."""
+        results = fts_engine.search("motion")
+        assert isinstance(results, list)
+        assert len(results) > 0
+        assert results[0]["search_mode"] == "keyword"
+
+    def test_fts_mode_no_vector_columns(self, fts_engine):
+        """Verify FTS-only table has no vector columns."""
+        table = fts_engine.db.open_table(fts_engine.TABLE_NAME)
+        schema = table.schema
+        column_names = [field.name for field in schema]
+        assert "title_vector" not in column_names
+        assert "content_vector" not in column_names
+        # But FTS columns exist
+        assert "search_text" in column_names
+        assert "page_id" in column_names
+
+    def test_fts_mode_ready_immediately(self, fts_engine):
+        """Verify FTS-only mode is ready without two-phase build."""
+        assert fts_engine.ready is True
+        assert fts_engine.fts_ready is True
+
+    def test_fts_mode_build_status(self, fts_engine):
+        """Verify build status reflects FTS-only mode."""
+        status = fts_engine.build_status
+        assert status["state"] == "ready"
+        assert status["embeddings_enabled"] is False
+
+    def test_fts_mode_metadata_no_embedding_model(self, fts_engine):
+        """Verify metadata does not contain embedding model info."""
+        import json
+        with open(fts_engine._metadata_path) as f:
+            metadata = json.load(f)
+        assert metadata["embeddings_enabled"] is False
+        assert "embedding_model" not in metadata
+        assert "embedding_dimension" not in metadata
+
+    def test_fts_mode_reload_without_rebuild(self, initialized_indexer, tmp_path):
+        """Verify FTS-only index can be reloaded without rebuilding."""
+        db_path = tmp_path / "fts_reload"
+        engine1 = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=True, embedding_service=None
+        )
+        engine1.initialize()
+        engine1.close()
+
+        engine2 = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=False, embedding_service=None
+        )
+        assert engine2._build_strategy == "none"
+        engine2.initialize()
+
+        results = engine2.search("motion")
+        assert isinstance(results, list)
+        engine2.close()
+
+    def test_fts_to_hybrid_mode_switch_triggers_rebuild(self, initialized_indexer, tmp_path, mock_embedding_service):
+        """Verify switching from FTS to hybrid triggers full rebuild."""
+        db_path = tmp_path / "fts_to_hybrid"
+
+        # Build FTS-only
+        engine1 = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=True, embedding_service=None
+        )
+        engine1.initialize()
+        engine1.close()
+
+        # Switch to hybrid mode
+        engine2 = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=False, embedding_service=mock_embedding_service
+        )
+        assert engine2._build_strategy == "full"
+        engine2.close()
+
+    def test_hybrid_to_fts_mode_switch_triggers_rebuild(self, initialized_indexer, tmp_path, mock_embedding_service):
+        """Verify switching from hybrid to FTS triggers full rebuild."""
+        db_path = tmp_path / "hybrid_to_fts"
+
+        # Build hybrid
+        engine1 = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service
+        )
+        engine1.initialize()
+        engine1.close()
+
+        # Switch to FTS-only
+        engine2 = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=False, embedding_service=None
+        )
+        assert engine2._build_strategy == "full"
+        engine2.close()
+
+    def test_fts_only_incremental_add(self, temp_help_dir, tmp_path):
+        """Verify incremental update works in FTS-only mode."""
+        from src.indexer import HelpContentIndexer
+
+        xml_content = """<?xml version="1.0" encoding="UTF-8"?>
+<BrHelpContent>
+    <Section Id="sec1" Text="Section" File="index.html">
+        <Page Id="page1" Text="Page One" File="hardware/x20di9371.html"/>
+    </Section>
+</BrHelpContent>"""
+        (temp_help_dir / "brhelpcontent.xml").write_text(xml_content, encoding="utf-8")
+
+        indexer = HelpContentIndexer(temp_help_dir)
+        indexer.parse_xml_structure()
+
+        db_path = tmp_path / "inc_fts"
+        engine = HelpSearchEngine(db_path, indexer, force_rebuild=True, embedding_service=None)
+        engine.initialize()
+        engine.close()
+
+        # Add a page
+        xml_content2 = """<?xml version="1.0" encoding="UTF-8"?>
+<BrHelpContent>
+    <Section Id="sec1" Text="Section" File="index.html">
+        <Page Id="page1" Text="Page One" File="hardware/x20di9371.html"/>
+        <Page Id="page2" Text="Page Two" File="motion/overview.html"/>
+    </Section>
+</BrHelpContent>"""
+        (temp_help_dir / "brhelpcontent.xml").write_text(xml_content2, encoding="utf-8")
+
+        indexer2 = HelpContentIndexer(temp_help_dir)
+        indexer2.parse_xml_structure()
+
+        engine2 = HelpSearchEngine(db_path, indexer2, force_rebuild=False, embedding_service=None)
+        assert engine2._build_strategy == "incremental"
+        engine2.initialize()
+
+        table = engine2.db.open_table(engine2.TABLE_NAME)
+        assert table.count_rows() == 3  # sec1 + page1 + page2
+        engine2.close()

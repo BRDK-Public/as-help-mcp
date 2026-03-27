@@ -19,14 +19,9 @@ from pydantic import BaseModel, Field
 
 from src.indexer import HelpContentIndexer
 from src.search_engine import HelpSearchEngine
-from src.embeddings import EmbeddingService
 
 # Load environment variables from .env file
 load_dotenv()
-
-# Module-level holder for pre-loaded embedding service.
-# Populated in main() before mcp.run() captures stdio, then consumed in app_lifespan.
-_preloaded_embedding_service: EmbeddingService | None = None
 
 
 def get_as_version_config() -> tuple[str, str]:
@@ -79,9 +74,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Suppress noisy HTTP request logging from sentence-transformers/huggingface
+# Suppress noisy HTTP request logging
 logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 
 
 # Pydantic models for structured output
@@ -110,7 +104,7 @@ class SearchResults(BaseModel):
     total: int = Field(description="Total number of results returned")
     search_mode: str | None = Field(
         default=None,
-        description="Search mode: 'hybrid' (semantic + keyword) or 'keyword' (keyword only, vectors still building)",
+        description="Search mode: 'hybrid' (semantic + keyword, requires embeddings) or 'keyword' (FTS only, default)",
     )
     status_message: str | None = Field(
         default=None,
@@ -239,13 +233,29 @@ async def app_lifespan(server: FastMCP):
     old_sqlite_db = db_path.parent / ".ashelp_search.db" if db_path.name == ".ashelp_lance" else None
     if old_sqlite_db and old_sqlite_db.exists():
         logger.info(f"Found old SQLite FTS5 index at {old_sqlite_db} - it can be safely deleted")
-        logger.info("Migrated from SQLite FTS5 to LanceDB hybrid search (RRF)")
+        logger.info("Migrated from SQLite FTS5 to LanceDB search")
+
+    # Optionally create embedding service for hybrid search
+    create_embeddings = os.getenv("CREATE_EMBEDDINGS", "false").lower() == "true"
+    embedding_service = None
+    if create_embeddings:
+        from src.embeddings import EmbeddingService
+
+        logger.info("CREATE_EMBEDDINGS=true — initializing embedding API client...")
+        try:
+            embedding_service = EmbeddingService()
+        except ValueError as e:
+            logger.error(f"Failed to initialize embedding service: {e}")
+            logger.error("Set EMBEDDING_API_ENDPOINT, EMBEDDING_API_KEY, EMBEDDING_MODEL, EMBEDDING_DIMENSIONS")
+            raise
+    else:
+        logger.info("CREATE_EMBEDDINGS is not set — using FTS keyword search only")
 
     # Initialize search engine (constructor is fast — just connects to LanceDB)
     logger.info("Initializing search engine...")
     search_engine = HelpSearchEngine(
         db_path=db_path, indexer=indexer, force_rebuild=force_rebuild,
-        embedding_service=_preloaded_embedding_service,
+        embedding_service=embedding_service,
     )
 
     # Build/load the index in a background thread so the MCP server can respond
@@ -295,7 +305,7 @@ mcp = FastMCP(  # pragma: no cover
         "- browse_section - Navigate into a category/section to see its children\n\n"  # pragma: no cover
         "*** THOROUGH RESEARCH WORKFLOW ***\n\n"  # pragma: no cover
         "For comprehensive answers, use MULTIPLE searches and retrieve MULTIPLE pages:\n\n"  # pragma: no cover
-        "1. search_help - Find pages by keyword OR meaning (hybrid search). Returns titles/page_ids only, NO content.\n"  # pragma: no cover
+        "1. search_help - Find pages by keyword OR meaning (hybrid search when embeddings enabled). Returns titles/page_ids only, NO content.\n"  # pragma: no cover
         "2. get_page_by_id - Get FULL content. Call for EACH relevant page.\n"  # pragma: no cover
         "3. REPEAT - Search with different keywords if needed. Get more pages.\n\n"  # pragma: no cover
         "BEST PRACTICES:\n"  # pragma: no cover
@@ -303,7 +313,7 @@ mcp = FastMCP(  # pragma: no cover
         "- Use browse_section() to explore a category's structure before searching\n"  # pragma: no cover
         "- Complex questions need 2-5 page retrievals from different angles\n"  # pragma: no cover
         "- Search for the main topic, then related concepts (e.g., 'MC_BR_MoveAbsolute' then 'axis error handling')\n"  # pragma: no cover
-        "- The search understands meaning, not just keywords — try natural language queries\n"  # pragma: no cover
+        "- The search understands meaning, not just keywords — try natural language queries (when embeddings enabled)\n"  # pragma: no cover
         "- If first search doesn't have what you need, try synonyms or related terms\n"  # pragma: no cover
         "- Retrieve pages that look relevant - reading 3 pages is better than guessing\n\n"  # pragma: no cover
         "WARNING: content_preview is ~100 chars - NEVER answer from previews alone.\n"  # pragma: no cover
@@ -1046,14 +1056,13 @@ def main():
         help="AS version for online help (AS_HELP_VERSION). Default: 4",
     )
     parser.add_argument(
-        "--embedding-device",
-        choices=["cpu", "cuda", "mps"],
-        help="Force embedding device (AS_HELP_EMBEDDING_DEVICE). Optional.",
-    )
-    parser.add_argument(
-        "--embed-batch-size",
-        type=int,
-        help="Embedding batch size override (AS_HELP_EMBED_BATCH_SIZE). Optional.",
+        "--create-embeddings",
+        type=_parse_bool_arg,
+        nargs="?",
+        const=True,
+        default=None,
+        metavar="BOOL",
+        help="Enable embedding via API: true/false (CREATE_EMBEDDINGS). Omit value for true.",
     )
     parser.add_argument("--usage", action="store_true", help="Print usage examples and exit")
 
@@ -1070,40 +1079,8 @@ def main():
         os.environ["AS_HELP_FORCE_REBUILD"] = "true" if args.force_rebuild else "false"
     if args.as_version:
         os.environ["AS_HELP_VERSION"] = args.as_version
-    if args.embedding_device:
-        os.environ["AS_HELP_EMBEDDING_DEVICE"] = args.embedding_device
-    if args.embed_batch_size is not None:
-        if args.embed_batch_size <= 0:
-            raise ValueError("--embed-batch-size must be > 0")
-        os.environ["AS_HELP_EMBED_BATCH_SIZE"] = str(args.embed_batch_size)
-
-    # Pre-load the embedding model BEFORE mcp.run() starts the stdio transport.
-    # In Docker, stdout is a pipe from the very start. Any library that writes to
-    # stdout (tqdm, safetensors progress, HF Hub) will block when the pipe buffer
-    # fills because the MCP client only reads valid JSON-RPC, not progress output.
-    # Redirecting stdout→stderr during model loading prevents this entirely.
-    global _preloaded_embedding_service
-    import sys
-    import time as _t
-    _t0 = _t.monotonic()
-    logger.info("Pre-loading embedding model (before stdio transport)...")
-    # Redirect stdout→stderr at the OS file-descriptor level.  Native C/Rust
-    # extensions (safetensors, tokenizers) write to fd 1 directly, bypassing
-    # Python's sys.stdout.  In Docker the fd-1 pipe fills and blocks forever
-    # because the MCP client only reads JSON-RPC.  os.dup2(2,1) makes fd 1
-    # point to stderr so all writes land safely on the log stream.
-    _saved_stdout_fd = os.dup(1)
-    os.dup2(2, 1)
-    _saved_py_stdout = sys.stdout
-    sys.stdout = sys.stderr
-    try:
-        _preloaded_embedding_service = EmbeddingService()
-        _preloaded_embedding_service._load_model()
-    finally:
-        sys.stdout = _saved_py_stdout
-        os.dup2(_saved_stdout_fd, 1)
-        os.close(_saved_stdout_fd)
-    logger.info("Embedding model ready in %.1fs", _t.monotonic() - _t0)
+    if args.create_embeddings is not None:
+        os.environ["CREATE_EMBEDDINGS"] = "true" if args.create_embeddings else "false"
 
     # Run with stdio transport by default (for local MCP clients like Claude Desktop)
     # To expose over HTTP, set MCP_TRANSPORT=streamable-http and configure host/port with MCP_HOST/MCP_PORT
