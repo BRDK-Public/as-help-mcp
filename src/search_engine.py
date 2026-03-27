@@ -134,7 +134,11 @@ class HelpSearchEngine:
                     self._build_fts_index()
             elif self._build_strategy == "resume":
                 resume_ids = self._get_indexed_page_ids()
-                logger.info(f"Resuming interrupted build ({len(resume_ids)} pages already indexed)...")
+                remaining = len(self.indexer.pages) - len(resume_ids)
+                logger.info(
+                    f"Resuming interrupted build: {len(resume_ids)} pages already indexed, "
+                    f"{remaining} remaining..."
+                )
                 sys.stderr.flush()
                 if self._embeddings_enabled:
                     self._build_index_two_phase(resume_ids=resume_ids)
@@ -431,7 +435,13 @@ class HelpSearchEngine:
         remaining = len(pages_to_process)
         total_chunks = (remaining + BUILD_CHUNK_SIZE - 1) // BUILD_CHUNK_SIZE
 
-        logger.info(f"Extracting text for {remaining} pages ({total_chunks} chunks, {max_workers} workers)...")
+        if already_done > 0:
+            logger.info(
+                f"Skipped {already_done} already-indexed pages. "
+                f"Extracting text for {remaining} remaining pages ({total_chunks} chunks, {max_workers} workers)..."
+            )
+        else:
+            logger.info(f"Extracting text for {remaining} pages ({total_chunks} chunks, {max_workers} workers)...")
         sys.stderr.flush()
 
         for chunk_start in range(0, remaining, BUILD_CHUNK_SIZE):
@@ -461,7 +471,7 @@ class HelpSearchEngine:
 
             processed = already_done + chunk_start + len(chunk)
             self._build_status["pages_processed"] = processed
-            logger.info(f"Chunk {chunk_num}/{total_chunks}: {processed}/{total_pages} pages")
+            logger.info(f"Chunk {chunk_num}/{total_chunks}: {processed}/{total_pages} pages indexed")
             sys.stderr.flush()
 
         self._finalize_fts_build(start_time, total_pages)
@@ -495,7 +505,6 @@ class HelpSearchEngine:
             pages_to_process = [(pid, page) for pid, page in all_pages if pid not in resume_ids]
             already_done = total_pages - len(pages_to_process)
             table_created = True
-            logger.info(f"Resuming: {already_done} already indexed, {len(pages_to_process)} remaining")
         else:
             pages_to_process = all_pages
             already_done = 0
@@ -524,7 +533,13 @@ class HelpSearchEngine:
         dim = self.embedder.dimension  # type: ignore[union-attr]
 
         # -- Phase 1: Extract text, write with zero vectors, build FTS --
-        logger.info(f"Phase 1: Extracting text for {remaining} pages ({total_chunks} chunks)...")
+        if already_done > 0:
+            logger.info(
+                f"Phase 1: Skipped {already_done} already-indexed pages. "
+                f"Extracting text for {remaining} remaining pages ({total_chunks} chunks)..."
+            )
+        else:
+            logger.info(f"Phase 1: Extracting text for {remaining} pages ({total_chunks} chunks)...")
         sys.stderr.flush()
 
         all_records: list[tuple] = []
@@ -560,7 +575,7 @@ class HelpSearchEngine:
 
             processed = already_done + chunk_start + len(chunk)
             self._build_status["pages_processed"] = processed
-            logger.info(f"Phase 1 chunk {chunk_num}/{total_chunks}: {processed}/{total_pages} pages")
+            logger.info(f"Phase 1 chunk {chunk_num}/{total_chunks}: {processed}/{total_pages} pages indexed")
             sys.stderr.flush()
 
         # Build FTS index -> keyword search available
@@ -576,32 +591,42 @@ class HelpSearchEngine:
         sys.stderr.flush()
 
         # -- Phase 2: Embed via API, overwrite table with real vectors --
+        # When resuming, we also need to embed the previously-indexed pages
+        if resume_ids:
+            resumed_pages = [(pid, page) for pid, page in all_pages if pid in resume_ids]
+            resumed_records = [self._extract_text_for_page(pid, page) for pid, page in resumed_pages]
+            all_records_for_embed = resumed_records + all_records
+        else:
+            all_records_for_embed = all_records
+
+        embed_total = len(all_records_for_embed)
+        embed_chunks = (embed_total + BUILD_CHUNK_SIZE - 1) // BUILD_CHUNK_SIZE
         self._build_status["phase"] = "embedding via API"
-        logger.info(f"Phase 2: Embedding {len(all_records)} pages via API...")
+        logger.info(f"Phase 2: Embedding {embed_total} pages via API...")
         sys.stderr.flush()
 
         all_title_vectors: list[list[float]] = []
         all_content_vectors: list[list[float]] = []
 
-        for chunk_start in range(0, len(all_records), BUILD_CHUNK_SIZE):
-            chunk_records = all_records[chunk_start : chunk_start + BUILD_CHUNK_SIZE]
+        for chunk_start in range(0, embed_total, BUILD_CHUNK_SIZE):
+            chunk_records = all_records_for_embed[chunk_start : chunk_start + BUILD_CHUNK_SIZE]
             chunk_num = chunk_start // BUILD_CHUNK_SIZE + 1
 
             titles = [r[1] for r in chunk_records]
-            self._build_status["phase"] = f"embedding (chunk {chunk_num}/{total_chunks})"
+            self._build_status["phase"] = f"embedding (chunk {chunk_num}/{embed_chunks})"
             title_vectors = self.embedder.embed_batch(titles)  # type: ignore[union-attr]
             content_vectors = self._build_content_vectors(chunk_records, title_vectors)
 
             all_title_vectors.extend(title_vectors)
             all_content_vectors.extend(content_vectors)
 
-            logger.info(f"Phase 2 embedding chunk {chunk_num}/{total_chunks}")
+            logger.info(f"Phase 2 embedding chunk {chunk_num}/{embed_chunks}")
             sys.stderr.flush()
 
         # Overwrite table with real vectors
         self._build_status["phase"] = "writing vectors to index"
         logger.info("Writing vectors to index...")
-        full_data = self._records_to_hybrid_arrow(all_records, all_title_vectors, all_content_vectors)
+        full_data = self._records_to_hybrid_arrow(all_records_for_embed, all_title_vectors, all_content_vectors)
         self.db.drop_table(self.TABLE_NAME)
         self.db.create_table(self.TABLE_NAME, full_data)
 
@@ -933,12 +958,8 @@ class HelpSearchEngine:
     def _get_indexed_page_ids(self) -> set[str]:
         try:
             table = self.db.open_table(self.TABLE_NAME)
-            try:
-                arrow_table = table.to_lance().to_table(columns=["page_id"])
-                return set(arrow_table["page_id"].to_pylist())
-            except (AttributeError, Exception):
-                df = table.to_pandas()
-                return set(df["page_id"].tolist())
+            arrow_table = table.to_arrow().select(["page_id"])
+            return set(arrow_table["page_id"].to_pylist())
         except Exception as e:
             logger.warning(f"Could not read existing page IDs: {e}")
             return set()

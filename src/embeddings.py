@@ -195,7 +195,15 @@ class EmbeddingService:
                     time.sleep(wait)
                     continue
 
-                # Non-retryable error
+                # Non-retryable error — log the response body for diagnosis
+                try:
+                    body = response.text[:500]
+                except Exception:
+                    body = "(could not read response body)"
+                logger.error(
+                    "Embedding API error %d for %d texts: %s",
+                    response.status_code, len(texts), body,
+                )
                 response.raise_for_status()
 
             except httpx.TimeoutException:
