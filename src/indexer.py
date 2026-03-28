@@ -41,8 +41,6 @@ class HelpPage:
     help_id: str | None = None
     parent_id: str | None = None
     is_section: bool = False
-    html_content: str | None = None
-    plain_text: str | None = None
 
 
 class HelpContentIndexer:
@@ -299,7 +297,10 @@ class HelpContentIndexer:
         self.pages[page_id] = page
 
     def extract_html_content(self, page_id: str) -> str | None:
-        """Extract and cache HTML content for a page.
+        """Read HTML content for a page from disk.
+
+        Does NOT cache the result to avoid memory bloat (58K+ pages).
+        File reads are fast enough for on-demand retrieval.
 
         Args:
             page_id: The unique ID of the page
@@ -312,10 +313,6 @@ class HelpContentIndexer:
 
         page = self.pages[page_id]
 
-        # Return cached content if available
-        if page.html_content is not None:
-            return page.html_content
-
         if not page.file_path:
             return None  # pragma: no cover
 
@@ -327,9 +324,7 @@ class HelpContentIndexer:
 
         try:
             with open(html_file, encoding="utf-8", errors="ignore") as f:
-                html_content = f.read()
-                page.html_content = html_content
-                return html_content
+                return f.read()
         except Exception as e:  # pragma: no cover
             logger.error(f"Failed to read HTML file {html_file}: {e}")  # pragma: no cover
             return None  # pragma: no cover
@@ -414,10 +409,11 @@ class HelpContentIndexer:
             return None  # pragma: no cover
 
     def extract_plain_text(self, page_id: str) -> str | None:
-        """Extract plain text from HTML content for searching.
+        """Extract plain text from HTML content.
 
-        Uses lxml parser for faster parsing.
-        Extracts text with proper spacing to preserve word boundaries.
+        Reads HTML from disk and parses with lxml on each call.
+        Does NOT cache the result to avoid memory bloat (58K+ pages).
+        lxml parsing is fast (~1ms per page).
 
         Args:
             page_id: The unique ID of the page
@@ -429,69 +425,7 @@ class HelpContentIndexer:
             return None  # pragma: no cover
 
         page = self.pages[page_id]
-
-        # Return cached text if available
-        if page.plain_text is not None:
-            return page.plain_text
-
-        html_content = self.extract_html_content(page_id)
-        if not html_content:
-            return None
-
-        try:
-            # Use lxml for faster parsing
-            from lxml import html as lxml_html
-
-            root = lxml_html.fromstring(html_content)
-
-            # Remove script and style elements using XPath (faster than Cleaner)
-            # Cast to lxml HtmlElement to access xpath method
-            from typing import cast
-
-            from lxml.html import HtmlElement
-
-            root_elem = cast(HtmlElement, root)
-            for element in root_elem.xpath(".//script | .//style"):
-                element.getparent().remove(element)
-
-            # Extract text with proper spacing between block elements
-            text_parts = []
-            for elem in root.iter():
-                if elem.text:
-                    text_parts.append(elem.text)
-                # Add space after block-level elements to preserve word boundaries
-                if elem.tag in (
-                    "p",
-                    "div",
-                    "h1",
-                    "h2",
-                    "h3",
-                    "h4",
-                    "h5",
-                    "h6",
-                    "li",
-                    "td",
-                    "th",
-                    "tr",
-                    "table",
-                    "blockquote",
-                    "pre",
-                ):
-                    text_parts.append(" ")
-                if elem.tail:
-                    text_parts.append(elem.tail)
-
-            text = "".join(text_parts) if text_parts else ""
-
-            if text:
-                text = " ".join(text.split())
-
-            page.plain_text = text
-            return text
-
-        except Exception as e:  # pragma: no cover
-            logger.debug(f"Failed to extract text from HTML: {e}")  # pragma: no cover
-            return None  # pragma: no cover
+        return self._extract_plain_text_no_cache(page)
 
     def get_page_by_help_id(self, help_id: str) -> HelpPage | None:
         """Get a page by its HelpID.

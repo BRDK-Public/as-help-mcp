@@ -96,20 +96,41 @@ When embeddings are enabled, the index is built in two phases to provide **progr
 4. Build Tantivy FTS index on the `search_text` column
 5. **Set `_fts_ready` event** → keyword search is now available
 
-### Phase 2: Embedding + Vector Overwrite
+### Phase 2: Chunked Embedding + Staging Table
 
-1. Embed title+breadcrumb for each page via the configured embedding API
-2. Embed content+breadcrumb (reuses title vectors for pages without content)
-3. **Temporarily suspend FTS** (clear `_fts_ready`)
-4. Overwrite the LanceDB table with real vectors (drop + recreate)
-5. Rebuild FTS index
-6. **Set both `_fts_ready` and `_ready`** → hybrid search is now available
+Phase 2 is designed to be **memory-efficient** — it processes pages in chunks of 5,000 and writes to a staging table, keeping peak memory at ~200–400 MB regardless of total page count.
+
+1. Clean up any leftover staging table from a previous interrupted build
+2. For each chunk of 5,000 pages:
+   a. Re-extract plain text from HTML files (parallel, fast — text was not kept from Phase 1)
+   b. Embed title+breadcrumb via the configured embedding API
+   c. Embed content+breadcrumb (reuses title vectors for pages without content)
+   d. Write chunk to a **staging table** (`help_pages_staging`)
+   e. Free memory before next chunk
+3. **Brief FTS suspension**: drop original table → rename staging directory → rebuild FTS
+4. **Set both `_fts_ready` and `_ready`** → hybrid search is now available
+
+**Why a staging table?** Keyword search stays available on the original Phase 1 table during the entire embedding process (~15–20 min for 60K pages). Only the final swap (step 3) briefly suspends FTS for a few seconds.
+
+**Why re-extract text?** Phase 1 text records are not kept in memory — this would consume 1–2 GB for 120K pages. Re-extracting from HTML (parallel lxml) takes ~30–60 seconds and keeps peak memory low.
+
+### Memory profile
+
+| Phase | Peak memory (120K pages) | What's in memory |
+|-------|--------------------------|------------------|
+| Phase 1 | ~200–400 MB | One chunk of 5K pages + zero vectors |
+| Phase 2 | ~200–400 MB | One chunk of 5K pages + real vectors |
+| Swap | ~50 MB | Filesystem rename (no data in memory) |
+| Runtime | ~100–200 MB | Page tree + LanceDB mmap |
+
+Two instances (AS4 + AS6) building simultaneously: **~400–800 MB peak**, safe for 16 GB laptops.
 
 ### Why two phases?
 
-- Embedding 100K pages via an API takes 10–15 minutes (even with batching). Making users wait that long for any search capability is unacceptable.
+- Embedding 60K pages via a local API (Ollama) takes ~15–20 minutes. Making users wait that long for any search capability is unacceptable.
 - FTS/keyword search is surprisingly effective for B&R's technical documentation, where exact identifiers (`MC_MoveAbsolute`, `X20DI9371`) are common.
 - The two-phase approach lets the server be immediately useful while vectors are being computed.
+- Chunked writes keep memory consumption under ~400 MB regardless of page count, enabling multiple instances (e.g., AS4 + AS6) to build simultaneously on laptops with limited RAM.
 
 ### Resume support
 
@@ -188,6 +209,7 @@ When hybrid mode is active, every query runs four search "legs" in parallel, eac
 | 2 | **Content vector** | Semantic similarity of query vs. `breadcrumb \| content` | `content_vector` | 1.0 | 0.5 |
 | 3 | **FTS keyword** | BM25 keyword match on `title + breadcrumb + content` | — (Tantivy) | 1.5 | 3.0 |
 | 4 | **Title match** | Exact/substring match of query in page titles | — (in-memory) | 3.0 | 4.0 |
+| 5 | **Breadcrumb match** | Query terms found in breadcrumb path | — (in-memory) | 2.0 | 3.0 |
 
 - **NL** = natural-language query (e.g., "how to configure axis homing")
 - **ID** = identifier query (e.g., `MC_MoveAbsolute`, `X20DI9371`)
@@ -216,6 +238,14 @@ Pages are sorted by descending score. Pages that appear in only one signal still
 
 The 4th signal directly rewards pages whose title contains the query as a substring. Results are sorted with exact matches first, then by title length (shorter = more specific). This captures the common case where users search for a specific function block or hardware module by name.
 
+### Breadcrumb-match signal
+
+The 5th signal rewards pages whose breadcrumb path (e.g., "Motion control > ACP10/ARNC0 > General information > Revision Information") contains query terms. Pages are ranked by how many distinct query terms appear in their breadcrumb — more matching terms yield a better rank. This helps surface pages with generic titles (like "Revision Information") that live under highly relevant sections (like "ACP10/ARNC0").
+
+### FTS over-fetching
+
+In both hybrid and FTS-only modes, the search engine fetches `limit × 3` candidates (up to 100) from the underlying search, then applies title-match and breadcrumb-match bonuses to rerank. This ensures BM25's document-length normalization (which penalizes long documents) doesn't permanently exclude relevant pages from the results.
+
 ---
 
 ## Query-Type Detection
@@ -242,8 +272,9 @@ Examples:
 | Content vector | 1.0 | 0.5 | Same reasoning — vectors help with meaning, not exact names |
 | FTS keyword | 1.5 | 3.0 | Tantivy BM25 excels at matching exact identifiers and product codes |
 | Title match | 3.0 | 4.0 | Highest signal for both — direct title match is the strongest quality signal |
+| Breadcrumb match | 2.0 | 3.0 | Helps surface pages under relevant sections even with generic titles |
 
-For identifier queries, the FTS and title-match signals dominate (combined weight 7.0 vs. 1.0 for vectors). For natural-language queries, vectors get meaningful weight (3.0) alongside FTS (1.5) and the always-strong title match (3.0).
+For identifier queries, the FTS, title-match, and breadcrumb signals dominate (combined weight 10.0 vs. 1.0 for vectors). For natural-language queries, vectors get meaningful weight (3.0) alongside FTS (1.5), title match (3.0), and breadcrumb match (2.0).
 
 ---
 

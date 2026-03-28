@@ -34,12 +34,14 @@ WEIGHT_TITLE_VECTOR = 2.0
 WEIGHT_CONTENT_VECTOR = 1.0
 WEIGHT_FTS_KEYWORD = 1.5
 WEIGHT_TITLE_MATCH = 3.0  # exact / substring title match bonus
+WEIGHT_BREADCRUMB_MATCH = 2.0  # query terms found in breadcrumb path
 
 # Alternate weights when query looks like a technical identifier
 WEIGHT_TITLE_VECTOR_ID = 0.5
 WEIGHT_CONTENT_VECTOR_ID = 0.5
 WEIGHT_FTS_KEYWORD_ID = 3.0
 WEIGHT_TITLE_MATCH_ID = 4.0
+WEIGHT_BREADCRUMB_MATCH_ID = 3.0
 
 # Number of pages per chunk during index build (saves progress after each chunk)
 BUILD_CHUNK_SIZE = 5000
@@ -533,8 +535,16 @@ class HelpSearchEngine:
     # Two-phase build (embeddings enabled)
     # ------------------------------------------------------------------
 
+    STAGING_TABLE = "help_pages_staging"
+
     def _build_index_two_phase(self, resume_ids: set[str] | None = None):
-        """Build index with embeddings: Phase 1 = FTS, Phase 2 = vectors."""
+        """Build index with embeddings: Phase 1 = FTS, Phase 2 = vectors.
+
+        Memory-efficient: each phase writes in chunks so only ~5000 pages
+        are in memory at a time.  Phase 2 writes to a staging table while
+        keyword search stays available on the original table, then does a
+        brief swap at the end.
+        """
         start_time = time.time()
         all_pages = list(self.indexer.pages.items())
         total_pages = len(all_pages)
@@ -587,8 +597,6 @@ class HelpSearchEngine:
             logger.info(f"Phase 1: Extracting text for {remaining} pages ({total_chunks} chunks)...")
         sys.stderr.flush()
 
-        all_records: list[tuple] = []
-
         for chunk_start in range(0, remaining, BUILD_CHUNK_SIZE):
             chunk = pages_to_process[chunk_start : chunk_start + BUILD_CHUNK_SIZE]
             chunk_num = chunk_start // BUILD_CHUNK_SIZE + 1
@@ -603,8 +611,6 @@ class HelpSearchEngine:
                 )
                 for result in extraction_results:
                     records.append(result)
-
-            all_records.extend(records)
 
             zero_title_vectors = [[0.0] * dim for _ in records]
             zero_content_vectors = [[0.0] * dim for _ in records]
@@ -638,54 +644,55 @@ class HelpSearchEngine:
         logger.info(f"Phase 1 complete in {phase1_elapsed:.1f}s - keyword search is now available")
         sys.stderr.flush()
 
-        # -- Phase 2: Embed via API, overwrite table with real vectors --
-        # When resuming, we also need to embed the previously-indexed pages
-        if resume_ids:
-            resumed_pages = [(pid, page) for pid, page in all_pages if pid in resume_ids]
-            self._build_status["phase"] = f"re-extracting text for {len(resumed_pages)} resumed pages"
-            logger.info(f"Phase 2 prep: Re-extracting text for {len(resumed_pages)} resumed pages...")
-            sys.stderr.flush()
-            resumed_records = []
-            p2_max_workers = min(int(os.cpu_count() or 4), 10)
-            with ThreadPoolExecutor(max_workers=p2_max_workers) as executor:
-                extraction_results = executor.map(
-                    lambda item: self._extract_text_for_page(item[0], item[1]),
-                    resumed_pages,
-                    chunksize=min(100, max(1, p2_max_workers * 2)),
-                )
-                for i, result in enumerate(extraction_results):
-                    resumed_records.append(result)
-                    if (i + 1) % 5000 == 0:
-                        logger.info(f"Phase 2 prep: {i + 1}/{len(resumed_pages)} pages re-extracted")
-                        sys.stderr.flush()
-            all_records_for_embed = resumed_records + all_records
-        else:
-            all_records_for_embed = all_records
+        # -- Phase 2: Chunked embed + write to staging table --
+        # Keyword search stays available on the original table while we embed.
+        # All pages are re-extracted from HTML (fast) so we don't need to keep
+        # Phase 1 records in memory.
+        self._cleanup_staging_table()
 
-        embed_total = len(all_records_for_embed)
+        embed_total = total_pages
         embed_chunks = (embed_total + BUILD_CHUNK_SIZE - 1) // BUILD_CHUNK_SIZE
         self._build_status["phase"] = "embedding via API"
-        logger.info(f"Phase 2: Embedding {embed_total} pages via API...")
+        logger.info(f"Phase 2: Embedding {embed_total} pages via API (chunked, low memory)...")
         sys.stderr.flush()
 
-        all_title_vectors: list[list[float]] = []
-        all_content_vectors: list[list[float]] = []
-
+        staging_created = False
         phase2_start = time.time()
+
         for chunk_start in range(0, embed_total, BUILD_CHUNK_SIZE):
-            chunk_records = all_records_for_embed[chunk_start : chunk_start + BUILD_CHUNK_SIZE]
+            chunk = all_pages[chunk_start : chunk_start + BUILD_CHUNK_SIZE]
             chunk_num = chunk_start // BUILD_CHUNK_SIZE + 1
 
-            # Embed titles with breadcrumb context for better semantic signal
-            titles = [f"{r[1]} | {r[6]}" if r[6] else r[1] for r in chunk_records]
-            self._build_status["phase"] = f"embedding (chunk {chunk_num}/{embed_chunks})"
+            # Re-extract text from HTML (parallel, fast)
+            self._build_status["phase"] = f"extracting + embedding (chunk {chunk_num}/{embed_chunks})"
+            records = []
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                extraction_results = executor.map(
+                    lambda item: self._extract_text_for_page(item[0], item[1]),
+                    chunk,
+                    chunksize=min(100, max(1, max_workers * 2)),
+                )
+                for result in extraction_results:
+                    records.append(result)
+
+            # Embed titles with breadcrumb context
+            titles = [f"{r[1]} | {r[6]}" if r[6] else r[1] for r in records]
             title_vectors = self.embedder.embed_batch(titles, show_progress=False)  # type: ignore[union-attr]
-            content_vectors = self._build_content_vectors(chunk_records, title_vectors)
+            content_vectors = self._build_content_vectors(records, title_vectors)
 
-            all_title_vectors.extend(title_vectors)
-            all_content_vectors.extend(content_vectors)
+            # Write chunk to staging table
+            chunk_data = self._records_to_hybrid_arrow(records, title_vectors, content_vectors)
+            if not staging_created:
+                self.db.create_table(self.STAGING_TABLE, chunk_data)
+                staging_created = True
+            else:
+                self.db.open_table(self.STAGING_TABLE).add(chunk_data)
 
-            embedded_so_far = min(chunk_start + len(chunk_records), embed_total)
+            # Free memory before next chunk
+            del records, title_vectors, content_vectors, chunk_data
+
+            embedded_so_far = min(chunk_start + len(chunk), embed_total)
+            self._build_status["pages_processed"] = embedded_so_far
             pct = embedded_so_far * 100 // embed_total
             elapsed_p2 = time.time() - phase2_start
             rate = embedded_so_far / elapsed_p2 if elapsed_p2 > 0 else 0
@@ -693,22 +700,8 @@ class HelpSearchEngine:
             logger.info(f"Phase 2: {pct}% ({embedded_so_far}/{embed_total} pages, {rate:.0f} pages/s, ETA {eta:.0f}s)")
             sys.stderr.flush()
 
-        # Overwrite table with real vectors — suspend FTS availability during swap
-        self._fts_ready.clear()
-        self._build_status["state"] = "building"
-        self._build_status["phase"] = "writing vectors to index"
-        logger.info("Writing vectors to index (keyword search temporarily unavailable)...")
-        full_data = self._records_to_hybrid_arrow(all_records_for_embed, all_title_vectors, all_content_vectors)
-        self.db.drop_table(self.TABLE_NAME)
-        self.db.create_table(self.TABLE_NAME, full_data)
-
-        # Rebuild FTS after table overwrite, then re-enable search
-        self._build_status["phase"] = "rebuilding FTS index"
-        logger.info("Rebuilding FTS index...")
-        table = self.db.open_table(self.TABLE_NAME)
-        table.create_fts_index("search_text", replace=True)
-        self._fts_ready.set()
-        self._build_status["state"] = "fts_ready"
+        # Swap staging → final (brief FTS suspension)
+        self._swap_staging_table()
 
         self._save_metadata()
         self._clear_build_progress()
@@ -716,6 +709,65 @@ class HelpSearchEngine:
         self._build_status["pages_processed"] = total_pages
         elapsed = time.time() - start_time
         logger.info(f"Phase 2 complete - full hybrid search ready in {elapsed:.1f}s ({total_pages} documents)")
+
+    def _cleanup_staging_table(self):
+        """Remove any leftover staging table from a previous interrupted build."""
+        try:
+            tables = self.db.list_tables().tables if hasattr(self.db.list_tables(), 'tables') else self.db.list_tables()
+            if self.STAGING_TABLE in tables:
+                self.db.drop_table(self.STAGING_TABLE)
+        except Exception:
+            pass
+
+    def _swap_staging_table(self):
+        """Replace the main table with the staging table.
+
+        Uses filesystem rename for an atomic swap, keeping FTS downtime
+        to a minimum.  Falls back to an in-memory copy if rename fails.
+        """
+        self._fts_ready.clear()
+        self._build_status["state"] = "building"
+        self._build_status["phase"] = "swapping staging table"
+        logger.info("Swapping staging table → final (keyword search briefly unavailable)...")
+
+        # Drop the original (Phase 1) table
+        try:
+            self.db.drop_table(self.TABLE_NAME)
+        except Exception:
+            pass
+
+        # Try filesystem rename (zero-copy, no memory spike)
+        swapped = False
+        for suffix in [".lance", ""]:
+            staging_dir = self.db_path / f"{self.STAGING_TABLE}{suffix}"
+            final_dir = self.db_path / f"{self.TABLE_NAME}{suffix}"
+            if staging_dir.is_dir():
+                try:
+                    staging_dir.rename(final_dir)
+                    # Reconnect so LanceDB sees the renamed directory
+                    self.db = lancedb.connect(str(self.db_path))
+                    swapped = True
+                    logger.info("Staging table swapped via filesystem rename")
+                    break
+                except OSError as e:
+                    logger.warning(f"Filesystem rename failed ({e}), falling back to copy")
+
+        # Fallback: read staging data through Arrow and recreate
+        if not swapped:
+            staging = self.db.open_table(self.STAGING_TABLE)
+            arrow_data = staging.to_arrow()
+            self.db.create_table(self.TABLE_NAME, arrow_data)
+            del arrow_data
+            self.db.drop_table(self.STAGING_TABLE)
+            logger.info("Staging table swapped via Arrow copy")
+
+        # Rebuild FTS on the final table
+        self._build_status["phase"] = "rebuilding FTS index"
+        logger.info("Rebuilding FTS index...")
+        table = self.db.open_table(self.TABLE_NAME)
+        table.create_fts_index("search_text", replace=True)
+        self._fts_ready.set()
+        self._build_status["state"] = "fts_ready"
 
     # ------------------------------------------------------------------
     # Incremental update
@@ -907,6 +959,102 @@ class HelpSearchEngine:
 
         return content[:160] + ("..." if len(content) > 160 else "")
 
+    @staticmethod
+    def _apply_breadcrumb_bonus(
+        query: str, page_data: dict[str, dict], rrf_scores: dict[str, float], weight: float
+    ) -> None:
+        """Add RRF bonus for pages whose breadcrumb path contains query terms.
+
+        Pages are ranked by how many query terms appear in their breadcrumb,
+        with more matches ranked higher.
+        """
+        sanitized = query
+        for char in "\"'*:(){}^+[]-/":
+            sanitized = sanitized.replace(char, " ")
+        terms = [t.lower() for t in sanitized.split() if len(t) >= 2]
+        if not terms:
+            return
+
+        # Score each page by number of query terms found in breadcrumb
+        breadcrumb_hits: list[tuple[str, int]] = []
+        for pid, data in page_data.items():
+            bc = (data.get("breadcrumb_path") or "").lower()
+            if not bc:
+                continue
+            hits = sum(1 for t in terms if t in bc)
+            if hits > 0:
+                breadcrumb_hits.append((pid, hits))
+
+        # Sort by hit count descending (more matching terms = better rank)
+        breadcrumb_hits.sort(key=lambda x: x[1], reverse=True)
+        for rank, (pid, _hits) in enumerate(breadcrumb_hits):
+            rrf_scores[pid] = rrf_scores.get(pid, 0.0) + weight / (RRF_K + rank + 1)
+
+    def _breadcrumb_retrieval(
+        self, table, query: str, limit: int, where_clause: str | None
+    ) -> list[dict]:
+        """Retrieve pages whose breadcrumb contains ALL distinctive query terms.
+
+        Uses a SQL scan with AND filter to find pages where the breadcrumb path
+        contains all query terms (≥3 chars). Results are sorted in Python by
+        the number of matching terms, so the most relevant pages come first.
+
+        This is an independent retrieval leg that can surface pages missed by
+        the main FTS search (which penalizes long documents via BM25 normalization).
+
+        Requires at least 2 query terms to avoid overly broad single-term matches
+        that would add noise to the RRF fusion.
+        """
+        sanitized = query
+        for char in "\"'*:(){}^+[]-/":
+            sanitized = sanitized.replace(char, " ")
+
+        fts_keywords = {"and", "or", "not", "near"}
+        terms = [t.strip().lower() for t in sanitized.split()
+                 if len(t.strip()) >= 3 and t.strip().lower() not in fts_keywords]
+
+        # Require at least 2 terms — single-term breadcrumb matches are too broad
+        # (e.g. "ACP10" alone matches 200+ pages, just adding noise)
+        if len(terms) < 2:
+            return []
+
+        # Escape SQL LIKE wildcards in query terms to prevent unexpected matches
+        def _escape_like(term: str) -> str:
+            return term.replace("%", "\\%").replace("_", "\\_")
+
+        # Build WHERE clause: breadcrumb must contain ALL query terms (AND)
+        bc_conditions = [f"lower(breadcrumb_path) LIKE '%{_escape_like(t)}%'" for t in terms]
+        bc_filter = " AND ".join(bc_conditions)
+        if where_clause:
+            combined_filter = f"({bc_filter}) AND ({where_clause})"
+        else:
+            combined_filter = bc_filter
+
+        try:
+            # Use a generous scan limit since AND filter is narrow
+            scan_limit = max(limit * 5, 200)
+            raw_results = (
+                table.search()
+                .where(combined_filter)
+                .limit(scan_limit)
+                .to_list()
+            )
+
+            if not raw_results:
+                return []
+
+            # Sort by breadcrumb match quality: count matching terms, prefer shorter breadcrumbs
+            def _bc_sort_key(row):
+                bc = (row.get("breadcrumb_path") or "").lower()
+                hits = sum(1 for t in terms if t in bc)
+                return (-hits, len(bc))  # more hits first, shorter breadcrumbs first
+
+            raw_results.sort(key=_bc_sort_key)
+            return raw_results[:limit]
+        except Exception as e:
+            logger.warning(f"Breadcrumb retrieval failed: {e}")
+            return []
+
     def search(
         self, query: str, limit: int = 20, search_in_content: bool = True, category: str | None = None
     ) -> list[dict]:
@@ -931,11 +1079,13 @@ class HelpSearchEngine:
             w_content_vec = WEIGHT_CONTENT_VECTOR_ID
             w_fts = WEIGHT_FTS_KEYWORD_ID
             w_title_match = WEIGHT_TITLE_MATCH_ID
+            w_breadcrumb = WEIGHT_BREADCRUMB_MATCH_ID
         else:
             w_title_vec = WEIGHT_TITLE_VECTOR
             w_content_vec = WEIGHT_CONTENT_VECTOR
             w_fts = WEIGHT_FTS_KEYWORD
             w_title_match = WEIGHT_TITLE_MATCH
+            w_breadcrumb = WEIGHT_BREADCRUMB_MATCH
 
         if use_vectors:
             try:
@@ -991,10 +1141,21 @@ class HelpSearchEngine:
             for rank, (pid, _data) in enumerate(title_match_candidates):
                 rrf_scores[pid] = rrf_scores.get(pid, 0.0) + w_title_match / (RRF_K + rank + 1)
 
+            # 5th leg: breadcrumb retrieval — pulls pages by breadcrumb match
+            #   (independent retrieval, can add NEW pages not found by other legs)
+            bc_results = self._breadcrumb_retrieval(table, query, fetch_limit, where_clause)
+            for rank, row in enumerate(bc_results):
+                pid = row["page_id"]
+                rrf_scores[pid] = rrf_scores.get(pid, 0.0) + w_breadcrumb / (RRF_K + rank + 1)
+                if pid not in page_data:
+                    page_data[pid] = row
+
             sorted_ids = sorted(rrf_scores.keys(), key=lambda pid: rrf_scores[pid], reverse=True)[:limit]
             search_mode = "hybrid"
         else:
-            fts_results = self._fts_search(table, query, limit, where_clause)
+            # Over-fetch to allow reranking (same approach as hybrid mode)
+            fetch_limit = min(limit * 3, 100)
+            fts_results = self._fts_search(table, query, fetch_limit, where_clause)
             rrf_scores = {}
             page_data = {}
 
@@ -1018,6 +1179,14 @@ class HelpSearchEngine:
             )
             for rank, (pid, _data) in enumerate(title_match_candidates):
                 rrf_scores[pid] = rrf_scores.get(pid, 0.0) + w_title_match / (RRF_K + rank + 1)
+
+            # Breadcrumb retrieval in keyword mode too
+            bc_results = self._breadcrumb_retrieval(table, query, fetch_limit, where_clause)
+            for rank, row in enumerate(bc_results):
+                pid = row["page_id"]
+                rrf_scores[pid] = rrf_scores.get(pid, 0.0) + w_breadcrumb / (RRF_K + rank + 1)
+                if pid not in page_data:
+                    page_data[pid] = row
 
             sorted_ids = sorted(rrf_scores.keys(), key=lambda pid: rrf_scores[pid], reverse=True)[:limit]
             search_mode = "keyword"

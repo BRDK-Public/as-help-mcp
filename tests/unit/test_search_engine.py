@@ -1291,3 +1291,106 @@ class TestTitleMatchBoost:
         results = fts_engine.search("X20DI9371")
         assert len(results) > 0
         assert "X20DI9371" in results[0]["title"]
+
+
+class TestBreadcrumbMatchBoost:
+    """Test that breadcrumb path matching boosts ranking."""
+
+    def test_apply_breadcrumb_bonus_adds_scores(self):
+        """Breadcrumb bonus adds RRF scores for pages with matching breadcrumbs."""
+        page_data = {
+            "p1": {"breadcrumb_path": "Motion control > ACP10/ARNC0 > Revision Information"},
+            "p2": {"breadcrumb_path": "Programming > Libraries > AsHttp"},
+            "p3": {"breadcrumb_path": "Motion control > mapp Motion > Overview"},
+        }
+        rrf_scores = {"p1": 0.01, "p2": 0.02, "p3": 0.015}
+        HelpSearchEngine._apply_breadcrumb_bonus("ACP10 version", page_data, rrf_scores, weight=2.0)
+        # p1 has "ACP10" and "version" is not in breadcrumb but "ACP10" is → 1 hit
+        # p3 has no matching terms → no bonus
+        # p1 should get a bonus, p2 should not
+        assert rrf_scores["p1"] > 0.01  # got a bonus
+        assert rrf_scores["p2"] == 0.02  # no match
+        # p3 has "motion" and "control" but query is "ACP10 version" → no match
+        assert rrf_scores["p3"] == 0.015
+
+    def test_apply_breadcrumb_bonus_ranks_by_hit_count(self):
+        """Pages with more matching terms in breadcrumb rank higher."""
+        page_data = {
+            "p1": {"breadcrumb_path": "Motion control > ACP10/ARNC0 > General"},
+            "p2": {"breadcrumb_path": "Motion control > ACP10/ARNC0 > Revision Information"},
+        }
+        rrf_scores = {"p1": 0.0, "p2": 0.0}
+        HelpSearchEngine._apply_breadcrumb_bonus(
+            "ACP10 revision information", page_data, rrf_scores, weight=2.0
+        )
+        # p2 has "ACP10", "revision", "information" → 3 hits
+        # p1 has "ACP10" → 1 hit
+        assert rrf_scores["p2"] > rrf_scores["p1"]
+
+    def test_apply_breadcrumb_bonus_no_terms(self):
+        """No crash when query has no usable terms."""
+        page_data = {"p1": {"breadcrumb_path": "Motion"}}
+        rrf_scores = {"p1": 0.5}
+        HelpSearchEngine._apply_breadcrumb_bonus("a b", page_data, rrf_scores, weight=2.0)
+        assert rrf_scores["p1"] == 0.5  # unchanged - terms too short
+
+    def test_apply_breadcrumb_bonus_empty_breadcrumb(self):
+        """Pages with no breadcrumb are skipped gracefully."""
+        page_data = {"p1": {"breadcrumb_path": None}, "p2": {"breadcrumb_path": ""}}
+        rrf_scores = {"p1": 0.1, "p2": 0.1}
+        HelpSearchEngine._apply_breadcrumb_bonus("motion", page_data, rrf_scores, weight=2.0)
+        assert rrf_scores["p1"] == 0.1
+        assert rrf_scores["p2"] == 0.1
+
+    @pytest.fixture
+    def fts_engine_bc(self, initialized_indexer, tmp_path):
+        """FTS-only engine for breadcrumb integration tests."""
+        db_path = tmp_path / "fts_lance_bc"
+        engine = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=True, embedding_service=None
+        )
+        engine.initialize()
+        yield engine
+        engine.close()
+
+    def test_breadcrumb_boost_in_fts_search(self, fts_engine_bc):
+        """Search for a term in breadcrumb should boost matching pages."""
+        # "mapp Motion" is in the breadcrumb of mc_moveabs_page
+        results = fts_engine_bc.search("mapp Motion")
+        assert len(results) > 0
+        # MC_BR_MoveAbsolute has breadcrumb "Motion > mapp Motion > MC_BR_MoveAbsolute"
+        titles = [r["title"] for r in results]
+        assert "MC_BR_MoveAbsolute" in titles
+
+    def test_breadcrumb_retrieval_requires_two_terms(self, fts_engine_bc):
+        """Single-term queries should NOT trigger breadcrumb retrieval (too broad)."""
+        table = fts_engine_bc.db.open_table(fts_engine_bc.TABLE_NAME)
+        # Single term — should return empty
+        results = fts_engine_bc._breadcrumb_retrieval(table, "Motion", limit=20, where_clause=None)
+        assert results == []
+        # Two terms — should return results (both "motion" and "mapp" are in breadcrumbs)
+        results = fts_engine_bc._breadcrumb_retrieval(table, "mapp Motion", limit=20, where_clause=None)
+        assert len(results) > 0
+
+    def test_breadcrumb_retrieval_short_terms_filtered(self, fts_engine_bc):
+        """Terms shorter than 3 chars are ignored; effective term count may drop below 2."""
+        table = fts_engine_bc.db.open_table(fts_engine_bc.TABLE_NAME)
+        # "IO" (2 chars) and "a" (1 char) are filtered, leaves only "motion" → single term → empty
+        results = fts_engine_bc._breadcrumb_retrieval(table, "IO a motion", limit=20, where_clause=None)
+        assert results == []
+
+    def test_breadcrumb_retrieval_escapes_like_wildcards(self, fts_engine_bc):
+        """SQL LIKE wildcards in query (%,_) should be escaped, not interpreted."""
+        table = fts_engine_bc.db.open_table(fts_engine_bc.TABLE_NAME)
+        # Query with LIKE wildcards should not cause errors or match everything
+        results = fts_engine_bc._breadcrumb_retrieval(
+            table, "100% mapp Motion", limit=20, where_clause=None
+        )
+        # Should not crash. "100%" → "100\%" in LIKE, won't match breadcrumbs
+        assert isinstance(results, list)
+
+    def test_breadcrumb_retrieval_empty_query(self, fts_engine_bc):
+        """Empty or whitespace-only query returns empty list."""
+        table = fts_engine_bc.db.open_table(fts_engine_bc.TABLE_NAME)
+        assert fts_engine_bc._breadcrumb_retrieval(table, "", limit=20, where_clause=None) == []
+        assert fts_engine_bc._breadcrumb_retrieval(table, "   ", limit=20, where_clause=None) == []

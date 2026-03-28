@@ -446,20 +446,15 @@ class TestContentExtraction:
         assert "X20DI9371" in html
         assert "Digital input module" in html
 
-    def test_extract_html_content_cached(self, temp_help_dir, sample_xml):
-        """Verify HTML content is cached."""
+    def test_extract_html_content_consistent(self, temp_help_dir, sample_xml):
+        """Verify HTML content is returned consistently (read from disk each time)."""
         indexer = HelpContentIndexer(temp_help_dir)
         indexer.parse_xml_structure()
 
-        # First extraction
+        # Two extractions should return equal content
         html1 = indexer.extract_html_content("x20di9371_page")
-
-        # Second extraction should return cached
-        page = indexer.pages["x20di9371_page"]
-        assert page.html_content is not None
-
         html2 = indexer.extract_html_content("x20di9371_page")
-        assert html1 is html2  # Same object reference
+        assert html1 == html2
 
     def test_extract_html_content_unknown_page_id(self, temp_help_dir, sample_xml):
         """Verify extract_html_content returns None for unknown page_id."""
@@ -519,7 +514,7 @@ class TestContentExtraction:
         assert "Content" in text
 
     def test_extract_text_for_page_no_cache(self, temp_help_dir, sample_xml):
-        """Verify _extract_plain_text_no_cache doesn't cache."""
+        """Verify _extract_plain_text_no_cache doesn't store state on the page."""
         indexer = HelpContentIndexer(temp_help_dir)
         indexer.parse_xml_structure()
 
@@ -530,8 +525,9 @@ class TestContentExtraction:
         assert text is not None
         assert "X20DI9371" in text
 
-        # Verify it was NOT cached
-        assert page.plain_text is None
+        # Verify no caching attributes exist on HelpPage
+        assert not hasattr(page, "plain_text")
+        assert not hasattr(page, "html_content")
 
     def test_extract_content_file_not_found(self, temp_help_dir):
         """Verify graceful handling of missing HTML files."""

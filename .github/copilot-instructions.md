@@ -70,14 +70,15 @@ Hybrid mode (CREATE_EMBEDDINGS=true):
 
 ### Search Ranking
 
-**FTS-only mode:** Tantivy BM25 keyword ranking on combined title+content text.
+**FTS-only mode:** Tantivy BM25 keyword ranking on combined title+content text, with over-fetching (limit×3) and title-match + breadcrumb-match reranking.
 
 **Hybrid mode (RRF):**
 - **Title vector** (weight 2x NL / 0.5x identifier): Semantic similarity between query and title+breadcrumb embeddings
 - **Content vector** (weight 1x NL / 0.5x identifier): Semantic similarity between query and breadcrumb+content embeddings
 - **FTS keyword** (weight 1.5x NL / 3x identifier): Tantivy-powered full-text search on title+breadcrumb+content
 - **Title match** (weight 3x NL / 4x identifier): Exact/substring match of query in page titles
-- **Query-type detection**: Identifier queries (e.g., `MC_MoveAbsolute`, `X20DI9371`) shift weights toward FTS+title match; natural language queries favor vector similarity
+- **Breadcrumb match** (weight 2x NL / 3x identifier): Query terms found in breadcrumb path (helps pages with generic titles under relevant sections)
+- **Query-type detection**: Identifier queries (e.g., `MC_MoveAbsolute`, `X20DI9371`) shift weights toward FTS+title+breadcrumb match; natural language queries favor vector similarity
 - **RRF formula**: `score = Σ weight / (k + rank + 1)` where `k=60`
 - Higher score = better match
 
