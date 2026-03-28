@@ -642,7 +642,22 @@ class HelpSearchEngine:
         # When resuming, we also need to embed the previously-indexed pages
         if resume_ids:
             resumed_pages = [(pid, page) for pid, page in all_pages if pid in resume_ids]
-            resumed_records = [self._extract_text_for_page(pid, page) for pid, page in resumed_pages]
+            self._build_status["phase"] = f"re-extracting text for {len(resumed_pages)} resumed pages"
+            logger.info(f"Phase 2 prep: Re-extracting text for {len(resumed_pages)} resumed pages...")
+            sys.stderr.flush()
+            resumed_records = []
+            p2_max_workers = min(int(os.cpu_count() or 4), 10)
+            with ThreadPoolExecutor(max_workers=p2_max_workers) as executor:
+                extraction_results = executor.map(
+                    lambda item: self._extract_text_for_page(item[0], item[1]),
+                    resumed_pages,
+                    chunksize=min(100, max(1, p2_max_workers * 2)),
+                )
+                for i, result in enumerate(extraction_results):
+                    resumed_records.append(result)
+                    if (i + 1) % 5000 == 0:
+                        logger.info(f"Phase 2 prep: {i + 1}/{len(resumed_pages)} pages re-extracted")
+                        sys.stderr.flush()
             all_records_for_embed = resumed_records + all_records
         else:
             all_records_for_embed = all_records
