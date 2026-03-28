@@ -300,24 +300,22 @@ mcp = FastMCP(  # pragma: no cover
     "B&R Automation Studio Help Server",  # pragma: no cover
     instructions=(  # pragma: no cover
         "B&R Automation Studio Help Server - 100k+ pages of technical documentation.\n\n"  # pragma: no cover
+        "CRITICAL: content_preview is ~100 chars. NEVER answer from previews alone. "  # pragma: no cover
+        "You MUST call get_page_by_id to read actual documentation.\n\n"  # pragma: no cover
+        "*** RESEARCH WORKFLOW ***\n\n"  # pragma: no cover
+        "1. search_help — Find pages by keyword or meaning. Returns titles/page_ids only, NO content.\n"  # pragma: no cover
+        "2. get_page_by_id — Get FULL content. Use breadcrumb_path from results to pick relevant pages "  # pragma: no cover
+        "and skip obvious mismatches (e.g., wrong library variant).\n"  # pragma: no cover
+        "3. REPEAT — Search with different keywords or synonyms. Complex questions need 2-5 page retrievals.\n"  # pragma: no cover
+        "4. get_page_by_help_id — Use when you have a numeric HelpID (e.g., from error codes or context help).\n\n"  # pragma: no cover
         "*** DISCOVERY & BROWSING ***\n\n"  # pragma: no cover
-        "- get_categories - List all top-level categories (e.g., Hardware, Motion, Safety)\n"  # pragma: no cover
-        "- browse_section - Navigate into a category/section to see its children\n\n"  # pragma: no cover
-        "*** THOROUGH RESEARCH WORKFLOW ***\n\n"  # pragma: no cover
-        "For comprehensive answers, use MULTIPLE searches and retrieve MULTIPLE pages:\n\n"  # pragma: no cover
-        "1. search_help - Find pages by keyword OR meaning (hybrid search when embeddings enabled). Returns titles/page_ids only, NO content.\n"  # pragma: no cover
-        "2. get_page_by_id - Get FULL content. Call for EACH relevant page.\n"  # pragma: no cover
-        "3. REPEAT - Search with different keywords if needed. Get more pages.\n\n"  # pragma: no cover
-        "BEST PRACTICES:\n"  # pragma: no cover
-        "- Use get_categories() to discover valid category names for filtering search_help\n"  # pragma: no cover
-        "- Use browse_section() to explore a category's structure before searching\n"  # pragma: no cover
-        "- Complex questions need 2-5 page retrievals from different angles\n"  # pragma: no cover
-        "- Search for the main topic, then related concepts (e.g., 'MC_BR_MoveAbsolute' then 'axis error handling')\n"  # pragma: no cover
-        "- The search understands meaning, not just keywords — try natural language queries (when embeddings enabled)\n"  # pragma: no cover
-        "- If first search doesn't have what you need, try synonyms or related terms\n"  # pragma: no cover
-        "- Retrieve pages that look relevant - reading 3 pages is better than guessing\n\n"  # pragma: no cover
-        "WARNING: content_preview is ~100 chars - NEVER answer from previews alone.\n"  # pragma: no cover
-        "You MUST call get_page_by_id to read actual documentation."  # pragma: no cover
+        "- get_categories — List top-level categories. Call BEFORE using the category filter in search_help.\n"  # pragma: no cover
+        "- browse_section — Navigate into a category/section to see its children. "  # pragma: no cover
+        "Prefer search_help for direct lookups; use browse_section only to explore structure or find siblings.\n\n"  # pragma: no cover
+        "TIPS:\n"  # pragma: no cover
+        "- Use specific identifiers when known (e.g., 'MC_BR_MoveAbsolute', 'X20DI9371')\n"  # pragma: no cover
+        "- Try keyword variations: 'axis move' vs 'motion control' vs 'positioning'\n"  # pragma: no cover
+        "- get_help_statistics — Check index build progress if search returns empty results"  # pragma: no cover
     ),  # pragma: no cover
     lifespan=app_lifespan,  # pragma: no cover
 )  # pragma: no cover
@@ -326,34 +324,25 @@ mcp = FastMCP(  # pragma: no cover
 @mcp.tool()
 def search_help(
     ctx: Context,
-    query: str = Field(description="Search query (keywords or phrases). Try different keywords for better coverage."),
+    query: str = Field(description="Search query — use specific identifiers (e.g., 'MC_BR_MoveAbsolute') or natural language (e.g., 'how to move an axis'). Try different keywords for better coverage."),
     limit: int = Field(
         default=5,
-        description="Results per search. Use smaller limits and do multiple searches with different keywords.",
+        description="Max results to return. Use smaller limits with multiple searches rather than one large search.",
     ),
-    content_search: bool = Field(default=True, description="Search in content (True) or titles only (False)"),
+    content_search: bool = Field(default=True, description="True = search titles + content (default). False = titles only (faster, use for known identifiers)."),
     category: str | None = Field(
         default=None,
-        description="Filter by category (top-level section name). Common categories: Hardware, Motion, Safety, Vision, Communication, Programming, Visualization, Services. Call get_categories() for complete list.",
+        description="Filter by top-level category. MUST call get_categories() first to get valid values — do not guess category names.",
     ),
 ) -> SearchResults:
-    """Find help pages matching your query. Returns page_ids ONLY - no actual content.
+    """Find help pages by keyword or meaning. Returns page_ids and metadata ONLY — no actual content.
 
-    WORKFLOW:
-    1. Search for main topic -> get_page_by_id for top results
-    2. Search for related terms -> get_page_by_id for those too
-    3. Combine information from multiple pages for complete answer
+    IMPORTANT: You MUST call get_page_by_id to read content. Previews (~100 chars) are NOT enough to answer questions.
 
-    Tips:
-    - Call get_categories() first to discover valid category filter values
-    - Use specific function/feature names when known (e.g., 'MC_BR_MoveAbsolute')
-    - Try variations: 'axis move' vs 'motion control' vs 'positioning'
-    - Check breadcrumb_path to understand page context before retrieving
+    Use breadcrumb_path in results to assess relevance before retrieving — skip results whose breadcrumb
+    clearly shows they are about a different library, module, or topic.
 
-    You MUST call get_page_by_id to read actual content - previews are NOT enough.
-
-    NOTE: If the search index is still building, this returns empty results with a status message.
-    Call get_help_statistics to check build progress, then retry when ready.
+    If search returns empty results, call get_help_statistics to check if the index is still building.
     """
     app_ctx: AppContext = ctx.request_context.lifespan_context
 
@@ -472,21 +461,18 @@ def get_categories(ctx: Context) -> CategoriesResult:
 def browse_section(
     ctx: Context,
     section_id: str = Field(
-        description="ID of the section to browse (from get_categories or previous browse_section call)"
+        description="Section ID from get_categories or a previous browse_section call."
     ),
 ) -> SectionChildren | None:
     """Browse the children of a section in the help tree.
 
-    Use this to navigate the documentation hierarchy:
-    1. Call get_categories() to get top-level categories
-    2. Call browse_section(category_id) to see what's inside
-    3. For child sections (is_section=True), call browse_section again to go deeper
-    4. For pages (is_section=False), call get_page_by_id to read the content
+    Use browse_section to explore structure or find sibling/related pages within a section.
+    Prefer search_help for direct topic lookups — it is faster and more precise.
 
-    This is useful for:
-    - Exploring documentation structure before searching
-    - Finding related pages within the same section
-    - Understanding the organization of a topic area
+    Workflow:
+    1. get_categories() → get top-level category IDs
+    2. browse_section(category_id) → see children
+    3. Sections (is_section=True) → browse deeper. Pages (is_section=False) → get_page_by_id.
     """
     app_ctx: AppContext = ctx.request_context.lifespan_context
 
@@ -510,19 +496,18 @@ def browse_section(
 @mcp.tool()
 def get_page_by_id(
     ctx: Context,
-    page_id: str = Field(description="Page ID from search results. Call multiple times for different pages."),
-    include_html: bool = Field(default=False, description="Include full HTML content (rarely needed)"),
-    include_text: bool = Field(default=True, description="Include full plain text content"),
-    include_breadcrumb: bool = Field(default=True, description="Include navigation breadcrumb path"),
+    page_id: str = Field(description="Page ID from search results."),
+    include_html: bool = Field(default=False, description="Include raw HTML (only needed for rendering or link extraction)."),
+    include_text: bool = Field(default=True, description="Include full plain text content."),
+    include_breadcrumb: bool = Field(default=True, description="Include navigation breadcrumb path."),
 ) -> PageContent | None:
-    """Get the COMPLETE content of a help page. Call this for EACH page you need.
+    """Get the COMPLETE content of a help page.
 
-    For thorough answers:
-    - Retrieve the main topic page
-    - Also retrieve related pages (examples, error handling, best practices)
-    - Cross-reference information from multiple pages
+    Before calling, check the breadcrumb_path from search results to confirm the page is relevant.
+    Skip pages whose breadcrumb shows they belong to a different library or unrelated topic.
 
-    Don't hesitate to call this multiple times - reading 3-5 pages gives much better answers.
+    For thorough answers, retrieve 2-5 pages: the main topic plus related pages
+    (examples, error handling, configuration). Cross-reference across pages.
     """
     app_ctx: AppContext = ctx.request_context.lifespan_context
 
@@ -562,18 +547,17 @@ def get_page_by_id(
 @mcp.tool()
 def get_page_by_help_id(
     ctx: Context,
-    help_id: str = Field(description="HelpID value (e.g., '3002099')"),
-    include_html: bool = Field(default=False, description="Include full HTML content"),
-    include_text: bool = Field(default=True, description="Include plain text content"),
+    help_id: str = Field(description="Numeric HelpID value (e.g., '3002099'). Found in error messages, context help, and AS project references."),
+    include_html: bool = Field(default=False, description="Include raw HTML."),
+    include_text: bool = Field(default=True, description="Include plain text content."),
     include_breadcrumb: bool = Field(
-        default=False, description="Include breadcrumb trail (use get_breadcrumb tool for full details)"
+        default=True, description="Include breadcrumb trail."
     ),
 ) -> PageContent | None:
-    """Retrieve a help page by its HelpID.
+    """Retrieve a help page by its numeric HelpID.
 
-    HelpIDs are numeric identifiers used in the B&R help system. This tool
-    looks up the page associated with a HelpID and returns its content.
-    Breadcrumb is optional - use the dedicated get_breadcrumb tool for navigation.
+    Use this when you have a HelpID from error codes, context-sensitive help links,
+    or AS project references. Returns the same content as get_page_by_id.
     """
     app_ctx: AppContext = ctx.request_context.lifespan_context
 
@@ -644,10 +628,11 @@ async def get_breadcrumb(
 
 @mcp.tool()
 async def get_help_statistics(ctx: Context) -> dict:
-    """Get statistics about the indexed help content and current index build status.
+    """Check index build progress and get content statistics.
 
-    Returns counts of total pages, sections, and HelpID mappings.
-    Also includes index build status (state, build type, phase, progress).
+    Primary use: check if the search index is ready (state='ready' or 'fts_ready').
+    Call this when search_help returns empty results to see if the index is still building.
+    Also returns counts of total pages, sections, and HelpID mappings.
     """
     app_ctx: AppContext = ctx.request_context.lifespan_context
 
