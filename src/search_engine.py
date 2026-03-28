@@ -765,7 +765,7 @@ class HelpSearchEngine:
             batch_size = 500
             for i in range(0, len(delete_list), batch_size):
                 batch = delete_list[i : i + batch_size]
-                id_literals = ", ".join(f"'{pid}'" for pid in batch)
+                id_literals = ", ".join(f"'{pid.replace(chr(39), chr(39)+chr(39))}'" for pid in batch)
                 table.delete(f"page_id IN ({id_literals})")
             logger.info(f"Deleted {len(to_delete)} rows from index")
 
