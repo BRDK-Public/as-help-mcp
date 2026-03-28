@@ -923,7 +923,13 @@ class HelpSearchEngine:
             w_title_match = WEIGHT_TITLE_MATCH
 
         if use_vectors:
-            query_vector = self.embedder.embed_text(query)  # type: ignore[union-attr]
+            try:
+                query_vector = self.embedder.embed_text(query)  # type: ignore[union-attr]
+            except Exception as e:
+                logger.warning(f"Embedding API error, falling back to keyword search: {e}")
+                use_vectors = False
+
+        if use_vectors:
             fetch_limit = min(limit * 3, 100)
 
             title_results = self._vector_search(table, query_vector, "title_vector", fetch_limit, where_clause)
