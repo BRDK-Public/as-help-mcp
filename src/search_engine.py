@@ -1086,21 +1086,21 @@ class HelpSearchEngine:
                     f"or use a different --db-path for each help root."
                 )
 
-        lock_info = self._read_instance_lock()
-        if lock_info is not None:
-            other_pid = lock_info.get("pid")
-            if other_pid and self._is_process_alive(other_pid) and other_pid != os.getpid():
-                raise RuntimeError(
-                    f"Another as-help-server (PID {other_pid}) is already using "
-                    f"database at {self.db_path}. Stop the other instance first, "
-                    f"or use a different --db-path for each help root."
-                )
-            if other_pid and other_pid != os.getpid():
-                logger.debug("Overwriting stale instance lock (PID %s no longer running)", other_pid)
+            lock_info = self._read_instance_lock()
+            if lock_info is not None:
+                other_pid = lock_info.get("pid")
+                if other_pid and self._is_process_alive(other_pid) and other_pid != os.getpid():
+                    raise RuntimeError(
+                        f"Another as-help-server (PID {other_pid}) is already using "
+                        f"database at {self.db_path}. Stop the other instance first, "
+                        f"or use a different --db-path for each help root."
+                    )
+                if other_pid and other_pid != os.getpid():
+                    logger.debug("Overwriting stale instance lock (PID %s no longer running)", other_pid)
 
-        self._write_instance_lock()
-        with self._active_db_paths_lock:
+            self._write_instance_lock()
             self._active_db_paths.add(resolved)
+
         self._instance_lock_owned = True
         logger.info("Acquired instance lock for %s (PID %s)", self.db_path, os.getpid())
 
