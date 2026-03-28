@@ -17,8 +17,10 @@ MCP server for B&R Automation Studio help documentation search. Provides keyword
 ## Prerequisites
 
 - B&R Automation Studio installed (with help documentation)
-- Python 3.12+ with [uv](https://docs.astral.sh/uv/) — or Docker
 - VS Code with GitHub Copilot extension
+- **For standalone binary:** Download `as-help-server.exe` from [Releases](../../releases) — no Python or Docker required
+- **For UV:** Python 3.12+ with [uv](https://docs.astral.sh/uv/)
+- **For Docker:** Docker Desktop
 - **Optional** (for hybrid search): An OpenAI-compatible embedding API (e.g., [Ollama](https://ollama.com/) with `nomic-embed-text`)
 
 ## Demo
@@ -28,7 +30,35 @@ https://github.com/user-attachments/assets/b4df6bc7-ed7c-471f-93b8-db84b0110ac3
 
 Add to `.vscode/mcp.json` in your workspace:
 
-### Option 1: Docker (Recommended)
+### Option 1: Standalone Binary (Recommended)
+
+No Python, no Docker — just download the `.exe` from [Releases](../../releases) and place it in `%APPDATA%\as-help-mcp\`.
+
+```json
+{
+  "servers": {
+    "as-help": {
+      "command": "${env:APPDATA}\\as-help-mcp\\as-help-server.exe",
+      "args": [
+        "--help-root",
+        "C:\\Program Files (x86)\\BRAutomation\\AS6\\Help-en\\Data",
+        "--db-path",
+        "${env:APPDATA}\\as-help-mcp\\data\\as6\\.ashelp_lance",
+        "--metadata-dir",
+        "${env:APPDATA}\\as-help-mcp\\data\\as6\\.ashelp_metadata",
+        "--as-version",
+        "6"
+      ]
+    }
+  }
+}
+```
+
+Update `--help-root` to match your AS installation:
+- **AS 4.x:** `C:\\BRAutomation\\AS412\\Help-en\\Data`
+- **AS 6.x:** `C:\\Program Files (x86)\\BRAutomation\\AS6\\Help-en\\Data`
+
+### Option 2: Docker
 
 ```json
 {
@@ -53,7 +83,7 @@ Update the volume path to match your AS installation:
 - **AS 6.x:** `C:\\Program Files (x86)\\BRAutomation\\AS6\\Help-en\\Data:/data/help:ro`
 - **AS 6.x in WSL:** `/mnt/c/Program Files (x86)/BRAutomation/AS6/Help-en/Data:/data/help:ro`
 
-### Option 2: UV (Local Development)
+### Option 3: UV (Local Development)
 
 ```json
 {
@@ -107,13 +137,11 @@ ollama pull nomic-embed-text
 {
   "servers": {
     "as-help": {
-      "command": "uv",
+      "command": "${env:APPDATA}\\as-help-mcp\\as-help-server.exe",
       "args": [
-        "run", "--directory", "/path/to/as-help-mcp",
-        "as-help-server",
         "--help-root", "C:\\Program Files (x86)\\BRAutomation\\AS6\\Help-en\\Data",
-        "--db-path", "..\\data\\as6\\.ashelp_lance",
-        "--metadata-dir", "..\\data\\as6\\.ashelp_metadata",
+        "--db-path", "${env:APPDATA}\\as-help-mcp\\data\\as6\\.ashelp_lance",
+        "--metadata-dir", "${env:APPDATA}\\as-help-mcp\\data\\as6\\.ashelp_metadata",
         "--as-version", "6",
         "--create-embeddings", "true"
       ],
@@ -289,25 +317,21 @@ Use the launch configurations in `.vscode/launch.json`:
 {
   "servers": {
     "as-help-4": {
-      "command": "docker",
+      "command": "${env:APPDATA}\\as-help-mcp\\as-help-server.exe",
       "args": [
-        "run", "--rm", "-i",
-        "-v", "C:\\BRAutomation\\AS412\\Help-en\\Data:/data/help:ro",
-        "-v", "ashelp-data-4:/data/db",
-        "-e", "AS_HELP_VERSION=4",
-        "-e", "AS_HELP_FORCE_REBUILD=false",
-        "ghcr.io/brdk-public/as-help-mcp:latest"
+        "--help-root", "C:\\BRAutomation\\AS412\\Help-en\\Data",
+        "--db-path", "${env:APPDATA}\\as-help-mcp\\data\\as4\\.ashelp_lance",
+        "--metadata-dir", "${env:APPDATA}\\as-help-mcp\\data\\as4\\.ashelp_metadata",
+        "--as-version", "4"
       ]
     },
     "as-help-6": {
-      "command": "docker",
+      "command": "${env:APPDATA}\\as-help-mcp\\as-help-server.exe",
       "args": [
-        "run", "--rm", "-i",
-        "-v", "C:\\Program Files (x86)\\BRAutomation\\AS6\\Help-en\\Data:/data/help:ro",
-        "-v", "ashelp-data-6:/data/db",
-        "-e", "AS_HELP_VERSION=6",
-        "-e", "AS_HELP_FORCE_REBUILD=false",
-        "ghcr.io/brdk-public/as-help-mcp:latest"
+        "--help-root", "C:\\Program Files (x86)\\BRAutomation\\AS6\\Help-en\\Data",
+        "--db-path", "${env:APPDATA}\\as-help-mcp\\data\\as6\\.ashelp_lance",
+        "--metadata-dir", "${env:APPDATA}\\as-help-mcp\\data\\as6\\.ashelp_metadata",
+        "--as-version", "6"
       ]
     }
   }
