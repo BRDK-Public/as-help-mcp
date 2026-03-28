@@ -157,8 +157,8 @@ class TestSearchHelpTool:
         assert "\\" not in result.results[0].online_help_url
 
     def test_search_help_sections_no_preview(self, mock_context, mock_indexer):
-        """Verify sections (is_section=True) have no content_preview."""
-        # Mock section result
+        """Verify sections without snippet have no content_preview."""
+        # Mock section result with no snippet
         mock_context.request_context.lifespan_context.search_engine.search.return_value = [
             {
                 "page_id": "section1",

@@ -29,13 +29,38 @@ logger = logging.getLogger(__name__)
 # Standard RRF constant (from the original RRF paper)
 RRF_K = 60
 
-# RRF weights for each search signal
+# RRF weights for each search signal (natural-language defaults)
 WEIGHT_TITLE_VECTOR = 2.0
 WEIGHT_CONTENT_VECTOR = 1.0
 WEIGHT_FTS_KEYWORD = 1.5
+WEIGHT_TITLE_MATCH = 3.0  # exact / substring title match bonus
+
+# Alternate weights when query looks like a technical identifier
+WEIGHT_TITLE_VECTOR_ID = 0.5
+WEIGHT_CONTENT_VECTOR_ID = 0.5
+WEIGHT_FTS_KEYWORD_ID = 3.0
+WEIGHT_TITLE_MATCH_ID = 4.0
 
 # Number of pages per chunk during index build (saves progress after each chunk)
 BUILD_CHUNK_SIZE = 5000
+
+# Pattern for technical identifiers: PascalCase, snake_case, UPPER_CASE, dotted names
+# e.g. MC_MoveAbsolute, AsGuard, SYS_Lib, X20DI9371, mapp.Motion
+_IDENTIFIER_RE = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_.]*$"  # single token with optional dots/underscores
+)
+
+
+def _is_identifier_query(query: str) -> bool:
+    """Detect if a query looks like a technical identifier rather than natural language.
+
+    Heuristic: the query is 1-2 words and each word matches the identifier pattern
+    (PascalCase, snake_case, dotted name, or product code like X20DI9371).
+    """
+    words = query.strip().split()
+    if not words or len(words) > 2:
+        return False
+    return all(_IDENTIFIER_RE.match(w) for w in words)
 
 
 class HelpSearchEngine:
@@ -278,10 +303,13 @@ class HelpSearchEngine:
     # ------------------------------------------------------------------
 
     def _extract_text_for_page(self, page_id: str, page) -> tuple:
-        """Extract text for a single page (used for parallel processing)."""
-        plain_text = ""
-        if not page.is_section:
-            plain_text = self.indexer._extract_plain_text_no_cache(page) or ""
+        """Extract text for a single page (used for parallel processing).
+
+        Both sections and pages get their HTML content extracted when available.
+        Many B&R sections contain substantive documentation (e.g., LED tables,
+        wiring diagrams) that is valuable for search.
+        """
+        plain_text = self.indexer._extract_plain_text_no_cache(page) or ""
 
         breadcrumb_path = self.indexer.get_breadcrumb_string(page_id)
 
@@ -847,6 +875,19 @@ class HelpSearchEngine:
         # Use vectors only when embeddings are enabled AND index is fully ready
         use_vectors = self._embeddings_enabled and self.ready
 
+        # Choose RRF weights based on query type
+        is_identifier = _is_identifier_query(query)
+        if is_identifier:
+            w_title_vec = WEIGHT_TITLE_VECTOR_ID
+            w_content_vec = WEIGHT_CONTENT_VECTOR_ID
+            w_fts = WEIGHT_FTS_KEYWORD_ID
+            w_title_match = WEIGHT_TITLE_MATCH_ID
+        else:
+            w_title_vec = WEIGHT_TITLE_VECTOR
+            w_content_vec = WEIGHT_CONTENT_VECTOR
+            w_fts = WEIGHT_FTS_KEYWORD
+            w_title_match = WEIGHT_TITLE_MATCH
+
         if use_vectors:
             query_vector = self.embedder.embed_text(query)  # type: ignore[union-attr]
             fetch_limit = min(limit * 3, 100)
@@ -863,21 +904,37 @@ class HelpSearchEngine:
 
             for rank, row in enumerate(title_results):
                 pid = row["page_id"]
-                rrf_scores[pid] = rrf_scores.get(pid, 0.0) + WEIGHT_TITLE_VECTOR / (RRF_K + rank + 1)
+                rrf_scores[pid] = rrf_scores.get(pid, 0.0) + w_title_vec / (RRF_K + rank + 1)
                 if pid not in page_data:
                     page_data[pid] = row
 
             for rank, row in enumerate(content_results):
                 pid = row["page_id"]
-                rrf_scores[pid] = rrf_scores.get(pid, 0.0) + WEIGHT_CONTENT_VECTOR / (RRF_K + rank + 1)
+                rrf_scores[pid] = rrf_scores.get(pid, 0.0) + w_content_vec / (RRF_K + rank + 1)
                 if pid not in page_data:
                     page_data[pid] = row
 
             for rank, row in enumerate(fts_results):
                 pid = row["page_id"]
-                rrf_scores[pid] = rrf_scores.get(pid, 0.0) + WEIGHT_FTS_KEYWORD / (RRF_K + rank + 1)
+                rrf_scores[pid] = rrf_scores.get(pid, 0.0) + w_fts / (RRF_K + rank + 1)
                 if pid not in page_data:
                     page_data[pid] = row
+
+            # 4th leg: title exact / substring match bonus
+            query_lower = query.strip().lower()
+            title_match_candidates = sorted(
+                [
+                    (pid, data)
+                    for pid, data in page_data.items()
+                    if query_lower in data.get("title", "").lower()
+                ],
+                key=lambda x: (
+                    x[1].get("title", "").lower() != query_lower,  # exact match first
+                    len(x[1].get("title", "")),                    # shorter titles first
+                ),
+            )
+            for rank, (pid, _data) in enumerate(title_match_candidates):
+                rrf_scores[pid] = rrf_scores.get(pid, 0.0) + w_title_match / (RRF_K + rank + 1)
 
             sorted_ids = sorted(rrf_scores.keys(), key=lambda pid: rrf_scores[pid], reverse=True)[:limit]
             search_mode = "hybrid"
@@ -888,8 +945,24 @@ class HelpSearchEngine:
 
             for rank, row in enumerate(fts_results):
                 pid = row["page_id"]
-                rrf_scores[pid] = WEIGHT_FTS_KEYWORD / (RRF_K + rank + 1)
+                rrf_scores[pid] = w_fts / (RRF_K + rank + 1)
                 page_data[pid] = row
+
+            # Title match bonus in keyword mode too
+            query_lower = query.strip().lower()
+            title_match_candidates = sorted(
+                [
+                    (pid, data)
+                    for pid, data in page_data.items()
+                    if query_lower in data.get("title", "").lower()
+                ],
+                key=lambda x: (
+                    x[1].get("title", "").lower() != query_lower,
+                    len(x[1].get("title", "")),
+                ),
+            )
+            for rank, (pid, _data) in enumerate(title_match_candidates):
+                rrf_scores[pid] = rrf_scores.get(pid, 0.0) + w_title_match / (RRF_K + rank + 1)
 
             sorted_ids = sorted(rrf_scores.keys(), key=lambda pid: rrf_scores[pid], reverse=True)[:limit]
             search_mode = "keyword"

@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.search_engine import HelpSearchEngine
+from src.search_engine import HelpSearchEngine, _is_identifier_query
 
 
 class TestQuerySanitization:
@@ -218,13 +218,16 @@ class TestExtractTextForPage:
         engine.close()
 
     def test_extract_text_for_page_section(self, search_engine_with_data):
-        """Verify sections have empty content string."""
+        """Verify sections with HTML files get their content extracted."""
         section_id = "hardware_section"
         page = search_engine_with_data.indexer.pages[section_id]
 
         result = search_engine_with_data._extract_text_for_page(section_id, page)
 
-        assert result[2] == ""  # content is 3rd element
+        # Sections now get content extracted from their HTML file
+        assert isinstance(result[2], str)  # content is 3rd element
+        # hardware_section points to index.html which has "Welcome" / "This is the index page"
+        assert len(result[2]) > 0
 
     def test_extract_text_for_page_category_extraction(self, search_engine_with_data):
         """Verify category is extracted from first breadcrumb item."""
@@ -1173,3 +1176,118 @@ class TestFTSOnlyMode:
         table = engine2.db.open_table(engine2.TABLE_NAME)
         assert table.count_rows() == 3  # sec1 + page1 + page2
         engine2.close()
+
+
+class TestIdentifierDetection:
+    """Test _is_identifier_query heuristic."""
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "MC_MoveAbsolute",
+            "AsGuard",
+            "SYS_Lib",
+            "X20DI9371",
+            "mapp.Motion",
+            "MC_BR_MoveAbsolute",
+            "x20bc124",
+            "VA_DelAlarmHistory",
+        ],
+    )
+    def test_single_word_identifiers(self, query):
+        assert _is_identifier_query(query) is True
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "MC_MoveAbsolute parameters",  # 2 words, second is identifier-ish
+            "AsGuard library",  # but "library" is also identifier-shaped
+        ],
+    )
+    def test_two_word_identifiers(self, query):
+        """Two-word queries where both words look like identifiers."""
+        assert _is_identifier_query(query) is True
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "how to move an axis",
+            "configure emergency stop safety",
+            "read and write PLC variables",
+            "error handling best practices for function blocks",
+            "transfer recipe data to PLC",
+            "network communication between two PLCs",
+        ],
+    )
+    def test_natural_language_queries(self, query):
+        assert _is_identifier_query(query) is False
+
+    def test_empty_and_whitespace(self):
+        assert _is_identifier_query("") is False
+        assert _is_identifier_query("   ") is False
+
+    def test_three_word_query_is_not_identifier(self):
+        """Queries with 3+ words are always natural language."""
+        assert _is_identifier_query("MC Move Absolute") is False
+
+
+class TestTitleMatchBoost:
+    """Test that title exact/substring match boosts ranking."""
+
+    @pytest.fixture
+    def search_engine_with_data(self, initialized_indexer, tmp_path, mock_embedding_service):
+        """Create search engine with sample data."""
+        db_path = tmp_path / "test_lance"
+        engine = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=True, embedding_service=mock_embedding_service
+        )
+        engine.initialize()
+        yield engine
+        engine.close()
+
+    def test_exact_title_match_ranks_first(self, search_engine_with_data):
+        """Searching for an exact page title should rank that page first."""
+        results = search_engine_with_data.search("MC_BR_MoveAbsolute")
+        assert len(results) > 0
+        assert results[0]["title"] == "MC_BR_MoveAbsolute"
+
+    def test_title_substring_match_boosted(self, search_engine_with_data):
+        """Results whose title contains the query should be boosted."""
+        results = search_engine_with_data.search("X20DI9371")
+        assert len(results) > 0
+        # The page with X20DI9371 in the title should be at the top
+        assert "X20DI9371" in results[0]["title"]
+
+    def test_identifier_query_uses_higher_fts_weight(self, search_engine_with_data):
+        """Identifier queries should still return results (weight shift doesn't break anything)."""
+        results = search_engine_with_data.search("MC_BR_MoveAbsolute")
+        assert len(results) > 0
+        assert results[0]["search_mode"] == "hybrid"
+
+    def test_natural_language_query_still_works(self, search_engine_with_data):
+        """Natural language queries still return relevant results."""
+        results = search_engine_with_data.search("motion control overview")
+        assert len(results) > 0
+
+    @pytest.fixture
+    def fts_engine(self, initialized_indexer, tmp_path):
+        """Create search engine in FTS-only mode."""
+        db_path = tmp_path / "fts_lance_tm"
+        engine = HelpSearchEngine(
+            db_path, initialized_indexer, force_rebuild=True, embedding_service=None
+        )
+        engine.initialize()
+        yield engine
+        engine.close()
+
+    def test_title_match_boost_in_fts_mode(self, fts_engine):
+        """Title match boost should also work in keyword-only mode."""
+        results = fts_engine.search("MC_BR_MoveAbsolute")
+        assert len(results) > 0
+        assert results[0]["title"] == "MC_BR_MoveAbsolute"
+
+    def test_title_match_boost_in_fts_mode_x20(self, fts_engine):
+        """Title match boost works for hardware product codes in FTS mode."""
+        results = fts_engine.search("X20DI9371")
+        assert len(results) > 0
+        assert "X20DI9371" in results[0]["title"]

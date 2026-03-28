@@ -169,7 +169,7 @@ See `_detect_build_strategy()` and `_incremental_update()` in `search_engine.py`
 
 ### Content Extraction Strategy
 
-- **Sections**: Index title only (no HTML content)
+- **Sections**: Index title + full plain text from HTML (when available)
 - **Pages**: Index title + full plain text from HTML
 - **Lazy loading**: HTML/text extracted on-demand and cached in `HelpPage` objects
 - **lxml**: Uses `text_content()` for fast extraction, strips `<script>` and `<style>` via XPath

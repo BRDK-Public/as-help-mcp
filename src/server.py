@@ -404,10 +404,9 @@ def search_help(
         # Use snippet precomputed by search engine to avoid extra disk I/O per result.
         # Keep previews intentionally short and incomplete to drive get_page_by_id usage.
         content_preview = None
-        if not r["is_section"]:
-            snippet = r.get("snippet")
-            if snippet:
-                content_preview = snippet.strip() + "... [TRUNCATED - call get_page_by_id for full content]"
+        snippet = r.get("snippet")
+        if snippet:
+            content_preview = snippet.strip() + "... [TRUNCATED - call get_page_by_id for full content]"
 
         # Build online help URL from file path
         online_help_url = _build_online_help_url(app_ctx.online_help_base_url, r.get("file_path"))
