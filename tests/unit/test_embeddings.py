@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 import httpx
 import pytest
 
-from src.embeddings import EmbeddingService
+from src.embeddings import EmbeddingService, EmbeddingTooLargeError
 
 
 def _make_embedding_response(vectors: list[list[float]]) -> dict:
@@ -303,8 +303,22 @@ class TestAPIRetry:
 
         assert result == [[1, 2, 3, 4]]
 
-    def test_no_retry_on_400(self, service):
-        """Verify no retry on client error (400)."""
+    def test_400_context_length_raises_too_large(self, service):
+        """Verify 400 with 'context length' raises EmbeddingTooLargeError."""
+        error_body = '{"error":{"message":"the input length exceeds the context length"}}'
+        error_response = httpx.Response(400, text=error_body)
+        error_response.request = httpx.Request("POST", "https://api.test/v1/embeddings")
+
+        service._client = MagicMock()
+        service._client.post.return_value = error_response
+
+        with pytest.raises(EmbeddingTooLargeError):
+            service._call_api(["test"])
+
+        assert service._client.post.call_count == 1
+
+    def test_400_generic_raises_http_error(self, service):
+        """Verify 400 without context-length message raises HTTPStatusError."""
         error_response = httpx.Response(400, json={"error": "bad request"})
         error_response.request = httpx.Request("POST", "https://api.test/v1/embeddings")
 
@@ -329,6 +343,69 @@ class TestAPIRetry:
                 service._call_api(["test"])
 
         assert service._client.post.call_count == 4  # initial + 3 retries
+
+
+class TestBatchFallback:
+    """Test fallback to one-by-one embedding when a batch exceeds context length."""
+
+    @pytest.fixture
+    def service(self):
+        s = EmbeddingService(
+            api_endpoint="https://api.test", api_key="key", model_name="model",
+            dimensions=4, batch_size=3,
+        )
+        yield s
+        s.close()
+
+    def test_batch_fallback_on_context_length_error(self, service):
+        """Verify batch falls back to one-by-one when API returns context-length 400."""
+        context_error = httpx.Response(
+            400, text='{"error":{"message":"the input length exceeds the context length"}}',
+        )
+        context_error.request = httpx.Request("POST", "https://api.test/v1/embeddings")
+
+        ok1 = httpx.Response(200, json=_make_embedding_response([[1, 2, 3, 4]]))
+        ok2 = httpx.Response(200, json=_make_embedding_response([[5, 6, 7, 8]]))
+        ok3 = httpx.Response(200, json=_make_embedding_response([[9, 10, 11, 12]]))
+
+        service._client = MagicMock()
+        # First call (batch of 3) fails, then 3 individual calls succeed
+        service._client.post.side_effect = [context_error, ok1, ok2, ok3]
+
+        result = service.embed_batch(["a", "b", "c"])
+        assert result == [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]]
+        assert service._client.post.call_count == 4
+
+    def test_fallback_uses_zero_vector_for_individual_failure(self, service):
+        """Verify individual texts that still fail get zero vectors."""
+        context_error = httpx.Response(
+            400, text='{"error":{"message":"the input length exceeds the context length"}}',
+        )
+        context_error.request = httpx.Request("POST", "https://api.test/v1/embeddings")
+
+        ok = httpx.Response(200, json=_make_embedding_response([[1, 2, 3, 4]]))
+
+        service._client = MagicMock()
+        # Batch fails, then text 1 ok, text 2 still too large, text 3 ok
+        service._client.post.side_effect = [context_error, ok, context_error, ok]
+
+        result = service.embed_batch(["a", "long_text", "c"])
+        assert result[0] == [1, 2, 3, 4]
+        assert result[1] == [0.0, 0.0, 0.0, 0.0]  # zero vector
+        assert result[2] == [1, 2, 3, 4]
+
+    def test_fallback_all_fail_returns_all_zeros(self, service):
+        """Verify all texts failing individually returns all zero vectors."""
+        context_error = httpx.Response(
+            400, text='{"error":{"message":"the input length exceeds the context length"}}',
+        )
+        context_error.request = httpx.Request("POST", "https://api.test/v1/embeddings")
+
+        service._client = MagicMock()
+        service._client.post.return_value = context_error
+
+        result = service.embed_batch(["a", "b"])
+        assert result == [[0.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]]
 
 
 class TestResponseOrdering:

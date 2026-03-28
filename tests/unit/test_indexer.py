@@ -129,8 +129,8 @@ class TestBreadcrumbComputation:
         assert breadcrumb[2].text == "MC_BR_MoveAbsolute"
 
     def test_breadcrumb_cycle_detection(self, temp_help_dir):
-        """Verify breadcrumb stops on cycle."""
-        # Create XML with duplicate ID causing apparent cycle
+        """Verify breadcrumb handles duplicate section IDs (first-wins)."""
+        # Create XML with duplicate ID — first occurrence is kept
         xml_content = """<?xml version="1.0" encoding="UTF-8"?>
 <BrHelpContent>
     <Section Id="section1" Text="Section 1" File="s1.html">
@@ -147,10 +147,13 @@ class TestBreadcrumbComputation:
         indexer = HelpContentIndexer(temp_help_dir)
         indexer.parse_xml_structure()
 
-        # Breadcrumb should terminate without infinite loop
-        # The second occurrence of section1 overwrites the first
+        # First occurrence is kept (first-wins)
+        assert indexer.pages["section1"].text == "Section 1"
+
+        # page2 is a child of the duplicate section, parent_id=section1
+        # Breadcrumb should work since section1 exists (first instance)
         breadcrumb = indexer.get_breadcrumb("page2")
-        assert len(breadcrumb) < 100  # Should not hit depth limit
+        assert len(breadcrumb) <= 2  # section1 + page2
 
     def test_breadcrumb_depth_limit(self, temp_help_dir):
         """Verify breadcrumb stops at 100 levels."""
@@ -285,6 +288,10 @@ class TestDuplicateIDHandling:
         assert "First Instance" in indexer._duplicate_ids["dup_id"]
         assert "Second Instance" in indexer._duplicate_ids["dup_id"]
 
+        # First occurrence wins
+        assert indexer.pages["dup_id"].text == "First Instance"
+        assert indexer.pages["dup_id"].file_path == "first.html"
+
     def test_duplicate_id_does_not_crash(self, temp_help_dir):
         """Verify parsing continues when duplicate IDs encountered."""
         xml_content = """<?xml version="1.0" encoding="UTF-8"?>
@@ -329,6 +336,10 @@ class TestDuplicateIDHandling:
         assert len(indexer._duplicate_ids["dup_page_id"]) == 2
         assert "First Page" in indexer._duplicate_ids["dup_page_id"]
         assert "Second Page" in indexer._duplicate_ids["dup_page_id"]
+
+        # First occurrence wins
+        assert indexer.pages["dup_page_id"].text == "First Page"
+        assert indexer.pages["dup_page_id"].file_path == "first_page.html"
 
     def test_duplicate_page_id_does_not_crash(self, temp_help_dir):
         """Verify parsing continues when duplicate page IDs encountered."""

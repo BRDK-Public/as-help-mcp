@@ -17,7 +17,7 @@
         "--as-version",
         "6",
         "--force-rebuild",
-        "false",
+        "true",
         "--create-embeddings",
         "true"
       ],

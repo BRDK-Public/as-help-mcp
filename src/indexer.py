@@ -211,12 +211,19 @@ class HelpContentIndexer:
         if not section_id:
             return  # pragma: no cover
 
-        # Check for duplicate ID (B&R XML data issue)
+        # Check for duplicate ID (B&R XML data issue) - keep first occurrence
         if section_id in self.pages:
             existing = self.pages[section_id]
             if section_id not in self._duplicate_ids:
                 self._duplicate_ids[section_id] = [existing.text]
             self._duplicate_ids[section_id].append(text)
+            # Still process children (they may have unique IDs)
+            for child in section_elem:
+                if child.tag in ("Section", "S"):
+                    self._process_section(child, section_id)
+                elif child.tag in ("Page", "P"):
+                    self._process_page(child, section_id)
+            return
 
         # Create section entry
         page = HelpPage(id=section_id, text=text, file_path=file_path, parent_id=parent_id, is_section=True)
@@ -262,12 +269,13 @@ class HelpContentIndexer:
         if not page_id:
             return  # pragma: no cover
 
-        # Check for duplicate ID (B&R XML data issue)
+        # Check for duplicate ID (B&R XML data issue) - keep first occurrence
         if page_id in self.pages:
             existing = self.pages[page_id]
             if page_id not in self._duplicate_ids:
                 self._duplicate_ids[page_id] = [existing.text]
             self._duplicate_ids[page_id].append(text)
+            return
 
         page = HelpPage(id=page_id, text=text, file_path=file_path, parent_id=parent_id, is_section=False)
 

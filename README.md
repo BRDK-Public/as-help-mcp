@@ -1,22 +1,25 @@
 # AS Help MCP Server
 
-MCP server for B&R Automation Studio help documentation search. Provides hybrid semantic + keyword search using LanceDB with Reciprocal Rank Fusion (RRF).
+MCP server for B&R Automation Studio help documentation search. Provides keyword search by default using LanceDB with Tantivy FTS, and optional hybrid semantic + keyword search using Reciprocal Rank Fusion (RRF) when an embedding API is configured.
 
 ## Features
 
-- Hybrid search combining vector similarity and keyword matching via RRF
-- Local sentence-transformer embeddings (no API keys needed)
+- **Keyword search** (default): Fast full-text search using LanceDB + Tantivy — no external dependencies
+- **Hybrid search** (optional): RRF fusion of vector similarity and keyword matching when embeddings are enabled
+- **API-based embeddings**: Works with any OpenAI-compatible endpoint (Ollama, OpenAI, Azure OpenAI, GitHub Models, LiteLLM) — no local ML models required
+- **Smart ranking**: Query-type detection shifts weights between FTS and vectors (identifiers like `MC_MoveAbsolute` favor exact match; natural language favors semantic similarity)
 - Category filtering and hierarchical browsing
 - Auto-generated links to B&R online help (AS4/AS6)
 - HelpID lookup for context-sensitive help integration
-- Auto-reindex on changes in the help directory via MD5 hash
-- Parallel indexing with multiple threads
+- Incremental reindexing — only changed pages are re-processed
+- Two-phase build: keyword search available within minutes while embeddings build in the background
 
 ## Prerequisites
 
 - B&R Automation Studio installed (with help documentation)
-- Docker Desktop installed and running
+- Python 3.12+ with [uv](https://docs.astral.sh/uv/) — or Docker
 - VS Code with GitHub Copilot extension
+- **Optional** (for hybrid search): An OpenAI-compatible embedding API (e.g., [Ollama](https://ollama.com/) with `nomic-embed-text`)
 
 ## Demo
 https://github.com/user-attachments/assets/b4df6bc7-ed7c-471f-93b8-db84b0110ac3
@@ -82,7 +85,65 @@ Update `--directory` to point to your cloned repository and adjust paths as need
 
 Restart VS Code, then test in Copilot Chat: *"Search AS help for mapp Motion"*
 
-**First run takes 10-15 minutes** to build the search index (includes downloading the embedding model ~22MB and generating embeddings). Subsequent starts are instant.
+**First run takes 2-3 minutes** to build the keyword search index. With embeddings enabled, a full hybrid build takes 15-20 minutes (keyword search is available immediately while embeddings build in the background). Subsequent starts are instant (~3s).
+
+---
+
+## Enabling Hybrid Search (Optional)
+
+By default, the server uses keyword-only search (FTS). To enable hybrid semantic + keyword search, configure an OpenAI-compatible embedding API.
+
+### Example: Ollama (Local, Free)
+
+1. Install [Ollama](https://ollama.com/) and pull an embedding model:
+
+```bash
+ollama pull nomic-embed-text
+```
+
+2. Add `--create-embeddings true` and embedding environment variables to your MCP config:
+
+```json
+{
+  "servers": {
+    "as-help": {
+      "command": "uv",
+      "args": [
+        "run", "--directory", "/path/to/as-help-mcp",
+        "as-help-server",
+        "--help-root", "C:\\Program Files (x86)\\BRAutomation\\AS6\\Help-en\\Data",
+        "--db-path", "..\\data\\as6\\.ashelp_lance",
+        "--metadata-dir", "..\\data\\as6\\.ashelp_metadata",
+        "--as-version", "6",
+        "--create-embeddings", "true"
+      ],
+      "env": {
+        "EMBEDDING_API_ENDPOINT": "http://localhost:11434",
+        "EMBEDDING_API_KEY": "ollama",
+        "EMBEDDING_MODEL": "nomic-embed-text",
+        "EMBEDDING_DIMENSIONS": "768",
+        "EMBEDDING_BATCH_SIZE": "100",
+        "EMBEDDING_MAX_CHARS": "4000"
+      }
+    }
+  }
+}
+```
+
+Any OpenAI-compatible endpoint works — OpenAI, Azure OpenAI, GitHub Models, LiteLLM, etc. Just update the endpoint, key, model, and dimensions accordingly.
+
+### How Hybrid Search Works
+
+When embeddings are enabled, the server uses **Reciprocal Rank Fusion (RRF)** to combine four search signals:
+
+| Signal | NL Weight | ID Weight | Description |
+|--------|-----------|-----------|-------------|
+| Title vector | 2.0 | 0.5 | Semantic similarity between query and title+breadcrumb embeddings |
+| Content vector | 1.0 | 0.5 | Semantic similarity between query and breadcrumb+content embeddings |
+| FTS keyword | 1.5 | 3.0 | Tantivy full-text search on title+breadcrumb+content |
+| Title match | 3.0 | 4.0 | Exact/substring match of query in page titles |
+
+**Query-type detection** automatically selects weights: identifier queries (e.g., `MC_MoveAbsolute`, `X20DI9371`) shift toward FTS + title match; natural language queries favor vector similarity.
 
 ---
 
@@ -93,7 +154,7 @@ Restart VS Code, then test in Copilot Chat: *"Search AS help for mapp Motion"*
 ```bash
 # Clone and install
 git clone <repository-url>
-cd as-help
+cd as-help-mcp
 uv sync --extra test --extra dev
 
 # Run server with command line arguments (precedence over .env)
@@ -123,8 +184,20 @@ Run `uv run as-help-server --help` for full details.
 | `--metadata-dir` | `AS_HELP_METADATA_DIR` | Path to the indexing metadata directory |
 | `--as-version` | `AS_HELP_VERSION` | AS version for online help (`4` or `6`) |
 | `--force-rebuild` | `AS_HELP_FORCE_REBUILD` | Force a full index rebuild |
-| `--embedding-device` | `AS_HELP_EMBEDDING_DEVICE` | Optional embedding device override (`cpu`, `cuda`, `mps`) |
-| `--embed-batch-size` | `AS_HELP_EMBED_BATCH_SIZE` | Optional embedding batch size override (integer > 0) |
+| `--create-embeddings` | `CREATE_EMBEDDINGS` | Enable API-based embeddings for hybrid search |
+
+### Embedding Configuration (Environment Variables)
+
+These are only needed when `--create-embeddings true` is set:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `EMBEDDING_API_ENDPOINT` | *(required)* | Base URL of OpenAI-compatible API |
+| `EMBEDDING_API_KEY` | *(required)* | API key / bearer token |
+| `EMBEDDING_MODEL` | *(required)* | Model name (e.g., `nomic-embed-text`, `text-embedding-3-small`) |
+| `EMBEDDING_DIMENSIONS` | *(required)* | Vector dimensions (e.g., `768`, `1536`) |
+| `EMBEDDING_BATCH_SIZE` | `100` | Texts per API call |
+| `EMBEDDING_MAX_CHARS` | `8000` | Truncate input texts to this length |
 
 ### Option 3: Docker Compose
 
@@ -161,69 +234,16 @@ Use the launch configurations in `.vscode/launch.json`:
 
 ---
 
-## Environment Variables & CLI Arguments
+## Performance
 
-The server supports configuration via both environment variables and command-line arguments. **CLI arguments take precedence.** Relative paths are automatically resolved to absolute paths.
-
-| CLI Argument | Environment Variable | Default | Description |
-|--------------|----------------------|---------|-------------|
-| `--help-root` | `AS_HELP_ROOT` | `/data/help` | Path to AS Help Data folder |
-| `--as-version` | `AS_HELP_VERSION` | `4` | AS version for online help (`4` or `6`) |
-| `--force-rebuild` | `AS_HELP_FORCE_REBUILD` | `false` | Force index rebuild |
-| `--db-path` | `AS_HELP_DB_PATH` | `{root}/.ashelp_lance` | LanceDB directory |
-| `--metadata-dir` | `AS_HELP_METADATA_DIR` | `{root}/.ashelp_metadata` | Metadata directory |
-| `--embedding-device` | `AS_HELP_EMBEDDING_DEVICE` | `auto` | Embedding device: auto-detect CUDA/MPS/CPU (override optional) |
-| `--embed-batch-size` | `AS_HELP_EMBED_BATCH_SIZE` | `auto` | Embedding batch size (auto if unset) |
-
-## Performance And GPU Acceleration
-
-By default, the server installs **CPU-only PyTorch** (~200 MB) and runs embeddings on CPU. This works out of the box with no extra configuration.
-
-### Optional: Enable CUDA GPU Acceleration
-
-If you have an NVIDIA GPU and want faster embedding (especially for first-time index builds), install with the `cuda` extra:
-
-```bash
-uv sync --extra cuda
-```
-
-This downloads the CUDA-enabled PyTorch (~2.4 GiB) and enables GPU-accelerated embeddings. The server auto-detects the best device at startup:
-
-1. `cuda` if available (requires `--extra cuda` install)
-2. `mps` on Apple Silicon
-3. `cpu` fallback
-
-Optional overrides are available for troubleshooting or benchmarking:
-
-```bash
-uv run as-help-server --embedding-device cuda --embed-batch-size 512
-```
-
-Recommended batch sizes:
-
-- GPU (`cuda`): start with `--embed-batch-size 512` (increase if VRAM allows)
-- CPU: start with `--embed-batch-size 128`
-
-## Troubleshooting Slow Model Import
-
-If startup repeatedly shows:
-
-`Still loading embedding model (importing sentence_transformers)...`
-
-for a long time, use this checklist:
-
-1. Ensure only one `as-help-server` process is running.
-2. Wait for first-run import/download to complete once (cold environment can be slow).
-3. Set `HF_TOKEN` to improve Hugging Face download rate limits.
-4. Temporarily force CPU to verify GPU stack health:
-
-```bash
-uv run as-help-server --embedding-device cpu
-```
-
-5. If CPU works and CUDA hangs, update NVIDIA driver / CUDA runtime / PyTorch CUDA build alignment.
-
-The server now logs periodic model-load heartbeat messages and uses a cross-process build lock to avoid duplicate heavy rebuilds.
+| Operation | Time | Notes |
+|-----------|------|-------|
+| XML parse | ~2s | 58K+ pages in-memory |
+| First index build (FTS-only) | ~2-3 min | Parallel HTML extraction + FTS indexing |
+| First index build (hybrid) | 15-20 min | + embedding via API (keyword search available immediately) |
+| Subsequent startup | ~3s | Load existing index |
+| Search query | 10-50ms | RRF hybrid or FTS keyword |
+| Memory usage | 10-30MB | Runtime after index load |
 
 ---
 
@@ -237,7 +257,7 @@ The server now logs periodic model-load heartbeat messages and uses a cross-proc
 | `get_page_by_id` | Get full page content |
 | `get_page_by_help_id` | Retrieve page by numeric HelpID |
 | `get_breadcrumb` | Get navigation path |
-| `get_help_statistics` | Get content statistics |
+| `get_help_statistics` | Get content and index build statistics |
 
 ## Prompts
 

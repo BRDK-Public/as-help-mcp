@@ -372,7 +372,7 @@ class HelpSearchEngine:
 
     def _records_to_fts_arrow(self, records) -> pa.Table:
         """Convert records to a FTS-only PyArrow table (no vectors)."""
-        search_texts = [f"{r[1]} {r[2]}" for r in records]
+        search_texts = [f"{r[1]} {r[6]} {r[2]}" for r in records]
         data = {
             "page_id": [r[0] for r in records],
             "title": [r[1] for r in records],
@@ -388,7 +388,7 @@ class HelpSearchEngine:
 
     def _records_to_hybrid_arrow(self, records, title_vectors, content_vectors) -> pa.Table:
         """Convert records + embeddings to a hybrid PyArrow table."""
-        search_texts = [f"{r[1]} {r[2]}" for r in records]
+        search_texts = [f"{r[1]} {r[6]} {r[2]}" for r in records]
         data = {
             "page_id": [r[0] for r in records],
             "title": [r[1] for r in records],
@@ -405,7 +405,11 @@ class HelpSearchEngine:
         return pa.table(data, schema=self._get_hybrid_schema())
 
     def _build_content_vectors(self, records, title_vectors) -> list[list[float]]:
-        """Build content vectors; reuse title vectors for sections (empty content)."""
+        """Build content vectors; reuse title vectors for pages without content.
+
+        Prepends the breadcrumb path to the content text before embedding to
+        give the vector context about which product/section the page belongs to.
+        """
         content_indices: list[int] = []
         content_texts: list[str] = []
 
@@ -413,12 +417,15 @@ class HelpSearchEngine:
             content = record[2]
             if content:
                 content_indices.append(idx)
-                content_texts.append(content)
+                # Prepend breadcrumb for product/section context
+                breadcrumb = record[6]
+                embed_text = f"{breadcrumb} | {content}" if breadcrumb else content
+                content_texts.append(embed_text)
 
         content_vectors = list(title_vectors)
 
         if content_texts:
-            embedded_contents = self.embedder.embed_batch(content_texts)  # type: ignore[union-attr]
+            embedded_contents = self.embedder.embed_batch(content_texts, show_progress=False)  # type: ignore[union-attr]
             for idx, vec in zip(content_indices, embedded_contents, strict=True):
                 content_vectors[idx] = vec
 
@@ -499,7 +506,10 @@ class HelpSearchEngine:
 
             processed = already_done + chunk_start + len(chunk)
             self._build_status["pages_processed"] = processed
-            logger.info(f"Chunk {chunk_num}/{total_chunks}: {processed}/{total_pages} pages indexed")
+            pct = processed * 100 // total_pages
+            elapsed = time.time() - start_time
+            rate = processed / elapsed if elapsed > 0 else 0
+            logger.info(f"Phase 1: {pct}% ({processed}/{total_pages} pages, {rate:.0f} pages/s)")
             sys.stderr.flush()
 
         self._finalize_fts_build(start_time, total_pages)
@@ -603,7 +613,10 @@ class HelpSearchEngine:
 
             processed = already_done + chunk_start + len(chunk)
             self._build_status["pages_processed"] = processed
-            logger.info(f"Phase 1 chunk {chunk_num}/{total_chunks}: {processed}/{total_pages} pages indexed")
+            pct = processed * 100 // total_pages
+            elapsed_p1 = time.time() - start_time
+            rate = processed / elapsed_p1 if elapsed_p1 > 0 else 0
+            logger.info(f"Phase 1: {pct}% ({processed}/{total_pages} pages, {rate:.0f} pages/s)")
             sys.stderr.flush()
 
         # Build FTS index -> keyword search available
@@ -636,19 +649,26 @@ class HelpSearchEngine:
         all_title_vectors: list[list[float]] = []
         all_content_vectors: list[list[float]] = []
 
+        phase2_start = time.time()
         for chunk_start in range(0, embed_total, BUILD_CHUNK_SIZE):
             chunk_records = all_records_for_embed[chunk_start : chunk_start + BUILD_CHUNK_SIZE]
             chunk_num = chunk_start // BUILD_CHUNK_SIZE + 1
 
-            titles = [r[1] for r in chunk_records]
+            # Embed titles with breadcrumb context for better semantic signal
+            titles = [f"{r[1]} | {r[6]}" if r[6] else r[1] for r in chunk_records]
             self._build_status["phase"] = f"embedding (chunk {chunk_num}/{embed_chunks})"
-            title_vectors = self.embedder.embed_batch(titles)  # type: ignore[union-attr]
+            title_vectors = self.embedder.embed_batch(titles, show_progress=False)  # type: ignore[union-attr]
             content_vectors = self._build_content_vectors(chunk_records, title_vectors)
 
             all_title_vectors.extend(title_vectors)
             all_content_vectors.extend(content_vectors)
 
-            logger.info(f"Phase 2 embedding chunk {chunk_num}/{embed_chunks}")
+            embedded_so_far = min(chunk_start + len(chunk_records), embed_total)
+            pct = embedded_so_far * 100 // embed_total
+            elapsed_p2 = time.time() - phase2_start
+            rate = embedded_so_far / elapsed_p2 if elapsed_p2 > 0 else 0
+            eta = (embed_total - embedded_so_far) / rate if rate > 0 else 0
+            logger.info(f"Phase 2: {pct}% ({embedded_so_far}/{embed_total} pages, {rate:.0f} pages/s, ETA {eta:.0f}s)")
             sys.stderr.flush()
 
         # Overwrite table with real vectors
@@ -757,7 +777,7 @@ class HelpSearchEngine:
             if self._embeddings_enabled:
                 titles = [r[1] for r in records]
                 self._build_status["phase"] = "embedding titles"
-                title_vectors = self.embedder.embed_batch(titles)  # type: ignore[union-attr]
+                title_vectors = self.embedder.embed_batch(titles, show_progress=False)  # type: ignore[union-attr]
                 self._build_status["phase"] = "embedding content"
                 content_vectors = self._build_content_vectors(records, title_vectors)
                 new_data = self._records_to_hybrid_arrow(records, title_vectors, content_vectors)

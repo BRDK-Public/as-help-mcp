@@ -14,8 +14,12 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+
+class EmbeddingTooLargeError(Exception):
+    """Raised when the input exceeds the model's context length."""
+
 # Defaults
-DEFAULT_BATCH_SIZE = 100
+DEFAULT_BATCH_SIZE = 50
 DEFAULT_MAX_CHARS = 8000
 DEFAULT_TIMEOUT = 60  # seconds per API call
 
@@ -112,12 +116,13 @@ class EmbeddingService:
         result = self._call_api([truncated])
         return result[0]
 
-    def embed_batch(self, texts: list[str], batch_size: int | None = None) -> list[list[float]]:
+    def embed_batch(self, texts: list[str], batch_size: int | None = None, *, show_progress: bool = True) -> list[list[float]]:
         """Embed a batch of texts via chunked API calls.
 
         Args:
             texts: List of texts to embed.
             batch_size: Override instance batch_size for this call.
+            show_progress: Log per-batch progress (disable when caller tracks progress).
 
         Returns:
             List of embedding vectors in the same order as input.
@@ -132,7 +137,8 @@ class EmbeddingService:
         # Truncate
         truncated = [t[: self.max_chars] if len(t) > self.max_chars else t for t in texts]
 
-        logger.info("Embedding %d texts (batch_size=%d, model=%s)...", total, bs, self.model_name)
+        if show_progress:
+            logger.info("Embedding %d texts (batch_size=%d, model=%s)...", total, bs, self.model_name)
         start = time.time()
 
         for offset in range(0, total, bs):
@@ -140,30 +146,61 @@ class EmbeddingService:
             # Replace empty strings with a single space (API rejects empty input)
             chunk = [t if t.strip() else " " for t in chunk]
 
-            chunk_vectors = self._call_api(chunk)
+            try:
+                chunk_vectors = self._call_api(chunk)
+            except EmbeddingTooLargeError:
+                # At least one text in this batch exceeds the model context.
+                # Fall back to embedding each text individually.
+                logger.warning(
+                    "Batch at offset %d failed (input too large), falling back to one-by-one",
+                    offset,
+                )
+                chunk_vectors = self._embed_chunk_individually(chunk)
             all_embeddings.extend(chunk_vectors)
 
-            done = min(offset + bs, total)
-            elapsed = time.time() - start
-            rate = done / elapsed if elapsed > 0 else 0
-            if done < total:
-                eta = (total - done) / rate if rate > 0 else 0
-                logger.info(
-                    "  Progress: %d/%d (%d%%, %.0f texts/s, ETA %.0fs)",
-                    done, total, done * 100 // total, rate, eta,
-                )
-            else:
-                logger.info("  Done: %d/%d (%.0f texts/s)", done, total, rate)
+            if show_progress:
+                done = min(offset + bs, total)
+                elapsed = time.time() - start
+                rate = done / elapsed if elapsed > 0 else 0
+                if done < total:
+                    eta = (total - done) / rate if rate > 0 else 0
+                    logger.info(
+                        "  Progress: %d/%d (%d%%, %.0f texts/s, ETA %.0fs)",
+                        done, total, done * 100 // total, rate, eta,
+                    )
+                else:
+                    logger.info("  Done: %d/%d (%.0f texts/s)", done, total, rate)
 
         elapsed = time.time() - start
-        logger.info("Embedded %d texts in %.1fs", total, elapsed)
+        if show_progress:
+            logger.info("Embedded %d texts in %.1fs", total, elapsed)
         return all_embeddings
+
+    def _embed_chunk_individually(self, chunk: list[str]) -> list[list[float]]:
+        """Embed texts one-by-one, returning zero vectors for any that fail."""
+        vectors: list[list[float]] = []
+        zero = [0.0] * self._dimension
+        failed = 0
+        for text in chunk:
+            try:
+                vecs = self._call_api([text])
+                vectors.append(vecs[0])
+            except (EmbeddingTooLargeError, httpx.HTTPStatusError):
+                vectors.append(zero)
+                failed += 1
+        if failed:
+            logger.warning(
+                "  %d/%d texts in chunk exceeded model context -- used zero vectors",
+                failed, len(chunk),
+            )
+        return vectors
 
     def _call_api(self, texts: list[str]) -> list[list[float]]:
         """Make a single API call with retry on transient errors.
 
         Retries up to 3 times on 429 (rate limit) and 5xx (server error)
-        with exponential backoff.
+        with exponential backoff.  Raises ``EmbeddingTooLargeError`` on 400
+        when the error message indicates the input exceeds the model context.
         """
         payload: dict = {
             "input": texts,
@@ -200,6 +237,17 @@ class EmbeddingService:
                     body = response.text[:500]
                 except Exception:
                     body = "(could not read response body)"
+
+                # Check if this is a context-length error (Ollama / vLLM pattern)
+                if response.status_code == 400 and "context length" in body.lower():
+                    logger.warning(
+                        "Embedding API: input too large for %d texts (%d chars max): %s",
+                        len(texts),
+                        max(len(t) for t in texts) if texts else 0,
+                        body,
+                    )
+                    raise EmbeddingTooLargeError(body)
+
                 logger.error(
                     "Embedding API error %d for %d texts: %s",
                     response.status_code, len(texts), body,
