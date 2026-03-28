@@ -557,11 +557,18 @@ class HelpSearchEngine:
         self._build_status["pages_processed"] = already_done
 
         if not pages_to_process:
-            logger.info("All pages already indexed, finalizing...")
-            self._finalize_fts_build(start_time, total_pages)
-            self._fts_ready.set()
-            self._build_status["state"] = "fts_ready"
-            return
+            if not resume_ids:
+                # No pages at all (edge case) — finalize and return
+                logger.info("No pages to index, finalizing...")
+                self._finalize_fts_build(start_time, total_pages)
+                self._fts_ready.set()
+                self._build_status["state"] = "fts_ready"
+                return
+            # Resume with Phase 1 complete: build FTS, then fall through to Phase 2
+            logger.info(
+                f"Phase 1 already complete ({already_done} pages resumed). "
+                "Building FTS index, then proceeding to Phase 2 for embeddings..."
+            )
 
         self._save_build_progress()
 
