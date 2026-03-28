@@ -24,7 +24,7 @@
         "EMBEDDING_MODEL": "nomic-embed-text",
         "EMBEDDING_DIMENSIONS": "768",
         "EMBEDDING_BATCH_SIZE": "50",
-        "EMBEDDING_MAX_CHARS": "2000"
+        "EMBEDDING_MAX_CHARS": "4000"
       }
     },
     // Option 2: UV (local development)
@@ -55,7 +55,7 @@
         "EMBEDDING_MODEL": "nomic-embed-text",
         "EMBEDDING_DIMENSIONS": "768",
         "EMBEDDING_BATCH_SIZE": "50",
-        "EMBEDDING_MAX_CHARS": "2000"
+        "EMBEDDING_MAX_CHARS": "4000"
       }
     },
     // Option 3: Docker Compose (local build)
@@ -74,7 +74,7 @@
         "-e", "EMBEDDING_MODEL=nomic-embed-text",
         "-e", "EMBEDDING_DIMENSIONS=768",
         "-e", "EMBEDDING_BATCH_SIZE=50",
-        "-e", "EMBEDDING_MAX_CHARS=2000",
+        "-e", "EMBEDDING_MAX_CHARS=4000",
         "as-help-local"
       ]
     },

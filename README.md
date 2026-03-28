@@ -173,6 +173,8 @@ When embeddings are enabled, the server uses **Reciprocal Rank Fusion (RRF)** to
 
 **Query-type detection** automatically selects weights: identifier queries (e.g., `MC_MoveAbsolute`, `X20DI9371`) shift toward FTS + title match; natural language queries favor vector similarity.
 
+For a deep dive into the RAG architecture — chunking strategy, two-phase build, RRF fusion, embedding model choice, and alternatives considered — see **[RAG.md](RAG.md)**.
+
 ---
 
 ## Local Development Setup
