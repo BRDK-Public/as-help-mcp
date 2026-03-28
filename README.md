@@ -293,21 +293,6 @@ Use the launch configurations in `.vscode/launch.json`:
 |--------|-------------|
 | `help_search` | Structured search with page IDs, breadcrumbs, and HelpIDs |
 | `help_details` | Deep research with content synthesis from multiple pages |
-| `search_hardware` | Filter: X20 modules, PLCs, drives, motors |
-| `search_motion` | Filter: ACOPOS, mapp Motion, MC_* blocks |
-| `search_visualization` | Filter: mapp View, widgets, HMI |
-| `search_safety` | Filter: SafeLOGIC, safety functions |
-| `search_vision` | Filter: mapp Vision, Smart Camera |
-| `search_communication` | Filter: POWERLINK, OPC UA, Modbus |
-| `search_programming` | Filter: IEC 61131-3, C/C++, libraries |
-| `search_mapp_services` | Filter: AlarmX, Recipe, UserX |
-
-## Resources
-
-| URI | Description |
-|-----|-------------|
-| `help://page/{page_id}` | Plain text content |
-| `help://html/{page_id}` | Raw HTML content |
 
 ---
 

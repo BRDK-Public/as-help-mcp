@@ -46,7 +46,6 @@ This is a **Model Context Protocol (MCP) server** that provides keyword and opti
    - **Intentionally truncated previews** (~100 chars) to force LLM to call `get_page_by_id`
    - Server instructions guide LLM to make **multiple searches and page retrievals**
    - Uses Pydantic models for structured responses
-   - Resource endpoint: `help://page/{page_id}` for direct text/HTML access
    - Reads `CREATE_EMBEDDINGS` env var to conditionally create `EmbeddingService`
 
 ### Data Flow

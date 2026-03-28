@@ -12,11 +12,9 @@ from src.server import (
     get_as_version_config,
     get_breadcrumb,
     get_categories,
-    get_help_page_resource,
     get_help_statistics,
     get_page_by_help_id,
     get_page_by_id,
-    get_page_html,
     search_help,
 )
 
@@ -529,64 +527,3 @@ class TestSearchResultTransformation:
         assert result.total == 0
         assert len(result.results) == 0
         assert result.query == "nonexistent"
-
-
-class TestResourceHandlers:
-    """Test MCP resource handlers."""
-
-    @pytest.fixture
-    def mock_context(self, mock_indexer):
-        """Create mock context."""
-        app_context = AppContext(
-            indexer=mock_indexer,
-            search_engine=MagicMock(),
-            as_version="4",
-            online_help_base_url="https://help.br-automation.com/#/en/4/",
-        )
-
-        ctx = MagicMock()
-        ctx.request_context.lifespan_context = app_context
-
-        return ctx
-
-    def test_get_help_page_resource_returns_text(self, mock_context, mock_indexer):
-        """Verify get_help_page_resource returns plain text content."""
-        mock_indexer.extract_plain_text.return_value = "This is plain text content"
-        mock_indexer.extract_html_content.return_value = "<html>HTML</html>"
-
-        result = get_help_page_resource(page_id="page1", ctx=mock_context)
-
-        assert result == "This is plain text content"
-
-    def test_get_help_page_resource_fallback_to_html(self, mock_context, mock_indexer):
-        """Verify get_help_page_resource falls back to HTML when text is empty."""
-        mock_indexer.extract_plain_text.return_value = None
-        mock_indexer.extract_html_content.return_value = "<html>Fallback HTML</html>"
-
-        result = get_help_page_resource(page_id="page1", ctx=mock_context)
-
-        assert result == "<html>Fallback HTML</html>"
-
-    def test_get_help_page_resource_not_found_raises(self, mock_context, mock_indexer):
-        """Verify get_help_page_resource raises ValueError for missing page."""
-        mock_indexer.extract_plain_text.return_value = None
-        mock_indexer.extract_html_content.return_value = None
-
-        with pytest.raises(ValueError, match="Page nonexistent not found"):
-            get_help_page_resource(page_id="nonexistent", ctx=mock_context)
-
-    def test_get_page_html_returns_html(self, mock_context, mock_indexer):
-        """Verify get_page_html returns HTML content."""
-        mock_indexer.extract_html_content.return_value = "<html><body>Content</body></html>"
-
-        result = get_page_html(page_id="page1", ctx=mock_context)
-
-        assert result == "<html><body>Content</body></html>"
-
-    def test_get_page_html_not_found_returns_message(self, mock_context, mock_indexer):
-        """Verify get_page_html returns error message for missing page."""
-        mock_indexer.extract_html_content.return_value = None
-
-        result = get_page_html(page_id="nonexistent", ctx=mock_context)
-
-        assert result == "Page not found: nonexistent"
