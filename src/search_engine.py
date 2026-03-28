@@ -678,18 +678,22 @@ class HelpSearchEngine:
             logger.info(f"Phase 2: {pct}% ({embedded_so_far}/{embed_total} pages, {rate:.0f} pages/s, ETA {eta:.0f}s)")
             sys.stderr.flush()
 
-        # Overwrite table with real vectors
+        # Overwrite table with real vectors — suspend FTS availability during swap
+        self._fts_ready.clear()
+        self._build_status["state"] = "building"
         self._build_status["phase"] = "writing vectors to index"
-        logger.info("Writing vectors to index...")
+        logger.info("Writing vectors to index (keyword search temporarily unavailable)...")
         full_data = self._records_to_hybrid_arrow(all_records_for_embed, all_title_vectors, all_content_vectors)
         self.db.drop_table(self.TABLE_NAME)
         self.db.create_table(self.TABLE_NAME, full_data)
 
-        # Rebuild FTS after table overwrite
+        # Rebuild FTS after table overwrite, then re-enable search
         self._build_status["phase"] = "rebuilding FTS index"
         logger.info("Rebuilding FTS index...")
         table = self.db.open_table(self.TABLE_NAME)
         table.create_fts_index("search_text", replace=True)
+        self._fts_ready.set()
+        self._build_status["state"] = "fts_ready"
 
         self._save_metadata()
         self._clear_build_progress()
@@ -743,6 +747,9 @@ class HelpSearchEngine:
         # Fall back to full rebuild if >50% changed
         if len(to_upsert) > len(new_ids) * 0.5:
             logger.info(f"Too many changes ({len(to_upsert)}/{len(new_ids)}) - falling back to full rebuild")
+            # Suspend search availability during full rebuild
+            self._fts_ready.clear()
+            self._build_status["state"] = "building"
             if self._embeddings_enabled:
                 self._build_index_two_phase()
             else:
