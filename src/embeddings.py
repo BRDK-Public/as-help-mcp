@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import httpx
 
@@ -19,8 +20,9 @@ class EmbeddingTooLargeError(Exception):
     """Raised when the input exceeds the model's context length."""
 
 # Defaults
-DEFAULT_BATCH_SIZE = 50
+DEFAULT_BATCH_SIZE = 200
 DEFAULT_MAX_CHARS = 8000
+DEFAULT_MAX_WORKERS = 4  # concurrent API calls in embed_batch
 DEFAULT_TIMEOUT = 60  # seconds per API call
 
 
@@ -35,6 +37,7 @@ class EmbeddingService:
     * ``EMBEDDING_DIMENSIONS``   - expected vector dimensionality (required)
     * ``EMBEDDING_BATCH_SIZE``   - texts per API call (default 100)
     * ``EMBEDDING_MAX_CHARS``    - truncate input texts to this length (default 8000)
+    * ``EMBEDDING_MAX_WORKERS``  - concurrent API calls (default 4, set 1 to disable)
     """
 
     def __init__(
@@ -46,6 +49,7 @@ class EmbeddingService:
         dimensions: int | None = None,
         batch_size: int | None = None,
         max_chars: int | None = None,
+        max_workers: int | None = None,
     ):
         self.api_endpoint = (api_endpoint or os.getenv("EMBEDDING_API_ENDPOINT", "")).rstrip("/")
         self.api_key = api_key or os.getenv("EMBEDDING_API_KEY", "")
@@ -59,6 +63,9 @@ class EmbeddingService:
 
         mc_str = os.getenv("EMBEDDING_MAX_CHARS", "")
         self.max_chars = max_chars or (int(mc_str) if mc_str.strip() else DEFAULT_MAX_CHARS)
+
+        mw_str = os.getenv("EMBEDDING_MAX_WORKERS", "")
+        self.max_workers = max_workers or (int(mw_str) if mw_str.strip() else DEFAULT_MAX_WORKERS)
 
         # Validate required fields
         if not self.api_endpoint:
@@ -91,11 +98,12 @@ class EmbeddingService:
         )
 
         logger.info(
-            "EmbeddingService configured: endpoint=%s model=%s dim=%d batch=%d",
+            "EmbeddingService configured: endpoint=%s model=%s dim=%d batch=%d workers=%d",
             self.api_endpoint,
             self.model_name,
             self._dimension,
             self.batch_size,
+            self.max_workers,
         )
 
     @property
@@ -119,6 +127,8 @@ class EmbeddingService:
     def embed_batch(self, texts: list[str], batch_size: int | None = None, *, show_progress: bool = True) -> list[list[float]]:
         """Embed a batch of texts via chunked API calls.
 
+        Uses concurrent workers (``max_workers``) to overlap API calls.
+
         Args:
             texts: List of texts to embed.
             batch_size: Override instance batch_size for this call.
@@ -132,49 +142,84 @@ class EmbeddingService:
 
         bs = batch_size or self.batch_size
         total = len(texts)
-        all_embeddings: list[list[float]] = []
 
-        # Truncate
+        # Truncate and sanitize
         truncated = [t[: self.max_chars] if len(t) > self.max_chars else t for t in texts]
-
-        if show_progress:
-            logger.info("Embedding %d texts (batch_size=%d, model=%s)...", total, bs, self.model_name)
-        start = time.time()
-
+        batches: list[list[str]] = []
         for offset in range(0, total, bs):
             chunk = truncated[offset : offset + bs]
-            # Replace empty strings with a single space (API rejects empty input)
-            chunk = [t if t.strip() else " " for t in chunk]
+            batches.append([t if t.strip() else " " for t in chunk])
 
-            try:
-                chunk_vectors = self._call_api(chunk)
-            except EmbeddingTooLargeError:
-                # At least one text in this batch exceeds the model context.
-                # Fall back to embedding each text individually.
-                logger.warning(
-                    "Batch at offset %d failed (input too large), falling back to one-by-one",
-                    offset,
-                )
-                chunk_vectors = self._embed_chunk_individually(chunk)
-            all_embeddings.extend(chunk_vectors)
+        if show_progress:
+            logger.info("Embedding %d texts (batch_size=%d, workers=%d, model=%s)...",
+                        total, bs, self.max_workers, self.model_name)
+        start = time.time()
 
-            if show_progress:
-                done = min(offset + bs, total)
-                elapsed = time.time() - start
-                rate = done / elapsed if elapsed > 0 else 0
-                if done < total:
-                    eta = (total - done) / rate if rate > 0 else 0
-                    logger.info(
-                        "  Progress: %d/%d (%d%%, %.0f texts/s, ETA %.0fs)",
-                        done, total, done * 100 // total, rate, eta,
-                    )
-                else:
-                    logger.info("  Done: %d/%d (%.0f texts/s)", done, total, rate)
+        all_embeddings: list[list[float]] = []
+        workers = min(self.max_workers, len(batches))
+
+        if workers > 1:
+            # Concurrent: dispatch batches across threads
+            batch_results: list[list[list[float]] | None] = [None] * len(batches)
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                future_to_idx = {
+                    pool.submit(self._embed_one_batch, b): i
+                    for i, b in enumerate(batches)
+                }
+                done_count = 0
+                for future in as_completed(future_to_idx):
+                    idx = future_to_idx[future]
+                    batch_results[idx] = future.result()
+                    done_count += 1
+                    if show_progress and done_count % max(len(batches) // 5, 1) == 0:
+                        done_texts = min(done_count * bs, total)
+                        elapsed = time.time() - start
+                        rate = done_texts / elapsed if elapsed > 0 else 0
+                        logger.info("  Progress: %d/%d (%d%%, %.0f texts/s)",
+                                    done_texts, total, done_texts * 100 // total, rate)
+            for br in batch_results:
+                all_embeddings.extend(br)  # type: ignore[arg-type]
+        else:
+            # Sequential
+            for i, chunk in enumerate(batches):
+                all_embeddings.extend(self._embed_one_batch(chunk))
+                if show_progress:
+                    done = min((i + 1) * bs, total)
+                    elapsed = time.time() - start
+                    rate = done / elapsed if elapsed > 0 else 0
+                    if done < total:
+                        eta = (total - done) / rate if rate > 0 else 0
+                        logger.info("  Progress: %d/%d (%d%%, %.0f texts/s, ETA %.0fs)",
+                                    done, total, done * 100 // total, rate, eta)
 
         elapsed = time.time() - start
         if show_progress:
-            logger.info("Embedded %d texts in %.1fs", total, elapsed)
+            logger.info("Embedded %d texts in %.1fs (%.0f texts/s)", total, elapsed,
+                        total / elapsed if elapsed > 0 else 0)
         return all_embeddings
+
+    def _embed_one_batch(self, chunk: list[str]) -> list[list[float]]:
+        """Embed a single batch, using binary-split fallback on context overflow.
+
+        When a batch fails because one or more texts exceed the model's context
+        window, recursively splits the batch in half to isolate the bad text(s)
+        instead of re-embedding every text individually.  For a batch of N with
+        1 bad text this takes ~2*log2(N) API calls instead of N.
+        """
+        try:
+            return self._call_api(chunk)
+        except EmbeddingTooLargeError:
+            if len(chunk) == 1:
+                logger.warning(
+                    "Text too large for model (%d chars) -- using zero vector",
+                    len(chunk[0]),
+                )
+                return [[0.0] * self._dimension]
+            mid = len(chunk) // 2
+            logger.debug("Batch of %d failed, splitting into %d + %d", len(chunk), mid, len(chunk) - mid)
+            left = self._embed_one_batch(chunk[:mid])
+            right = self._embed_one_batch(chunk[mid:])
+            return left + right
 
     def _embed_chunk_individually(self, chunk: list[str]) -> list[list[float]]:
         """Embed texts one-by-one, returning zero vectors for any that fail."""
@@ -240,11 +285,10 @@ class EmbeddingService:
 
                 # Check if this is a context-length error (Ollama / vLLM pattern)
                 if response.status_code == 400 and "context length" in body.lower():
-                    logger.warning(
-                        "Embedding API: input too large for %d texts (%d chars max): %s",
+                    logger.debug(
+                        "Embedding API: input too large for %d texts (%d chars max)",
                         len(texts),
                         max(len(t) for t in texts) if texts else 0,
-                        body,
                     )
                     raise EmbeddingTooLargeError(body)
 

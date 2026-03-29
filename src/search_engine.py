@@ -490,7 +490,7 @@ class HelpSearchEngine:
 
         self._save_build_progress()
 
-        max_workers = min(int(os.cpu_count() or 4), 10)
+        max_workers = min(int(os.cpu_count() or 4), 20)
         remaining = len(pages_to_process)
         total_chunks = (remaining + BUILD_CHUNK_SIZE - 1) // BUILD_CHUNK_SIZE
 
@@ -608,7 +608,7 @@ class HelpSearchEngine:
 
         self._save_build_progress()
 
-        max_workers = min(int(os.cpu_count() or 4), 10)
+        max_workers = min(int(os.cpu_count() or 4), 20)
         remaining = len(pages_to_process)
         total_chunks = (remaining + BUILD_CHUNK_SIZE - 1) // BUILD_CHUNK_SIZE
         dim = self.embedder.dimension  # type: ignore[union-attr]
@@ -679,7 +679,7 @@ class HelpSearchEngine:
         embed_total = total_pages
         embed_chunks = (embed_total + BUILD_CHUNK_SIZE - 1) // BUILD_CHUNK_SIZE
         self._build_status["phase"] = "embedding via API"
-        logger.info(f"Phase 2: Embedding {embed_total} pages via API (chunked, low memory)...")
+        logger.info(f"Phase 2: Embedding {embed_total} pages via API (chunked)...")
         sys.stderr.flush()
 
         staging_created = False
@@ -701,10 +701,34 @@ class HelpSearchEngine:
                 for result in extraction_results:
                     records.append(result)
 
-            # Embed titles with breadcrumb context
+            # Embed titles and content in parallel (independent work)
             titles = [f"{r[1]} | {r[6]}" if r[6] else r[1] for r in records]
-            title_vectors = self.embedder.embed_batch(titles, show_progress=False)  # type: ignore[union-attr]
-            content_vectors = self._build_content_vectors(records, title_vectors)
+            content_indices: list[int] = []
+            content_texts: list[str] = []
+            for idx, record in enumerate(records):
+                content = record[2]
+                if content:
+                    content_indices.append(idx)
+                    breadcrumb = record[6]
+                    embed_text = f"{breadcrumb} | {content}" if breadcrumb else content
+                    content_texts.append(embed_text)
+
+            with ThreadPoolExecutor(max_workers=2) as embed_pool:
+                title_future = embed_pool.submit(
+                    self.embedder.embed_batch, titles, show_progress=False  # type: ignore[union-attr]
+                )
+                content_future = embed_pool.submit(
+                    self.embedder.embed_batch, content_texts, show_progress=False  # type: ignore[union-attr]
+                ) if content_texts else None
+
+                title_vectors = title_future.result()
+                if content_future is not None:
+                    embedded_contents = content_future.result()
+                    content_vectors = list(title_vectors)
+                    for idx, vec in zip(content_indices, embedded_contents, strict=True):
+                        content_vectors[idx] = vec
+                else:
+                    content_vectors = list(title_vectors)
 
             # Write chunk to staging table
             chunk_data = self._records_to_hybrid_arrow(records, title_vectors, content_vectors)

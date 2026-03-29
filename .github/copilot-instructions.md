@@ -142,6 +142,7 @@ uv run python test_search.py   # Runs sample queries
 - `EMBEDDING_DIMENSIONS` - Vector dimensions (e.g., `1536`, `384`)
 - `EMBEDDING_BATCH_SIZE` - Texts per API call (default: 100)
 - `EMBEDDING_MAX_CHARS` - Text truncation limit (default: 8000)
+- `EMBEDDING_MAX_WORKERS` - Concurrent API calls (default: 4, set 1 for sequential)
 
 ### Abbreviated XML Tags (Critical!)
 

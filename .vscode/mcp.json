@@ -23,8 +23,9 @@
         "EMBEDDING_API_KEY": "ollama",
         "EMBEDDING_MODEL": "nomic-embed-text",
         "EMBEDDING_DIMENSIONS": "768",
-        "EMBEDDING_BATCH_SIZE": "50",
-        "EMBEDDING_MAX_CHARS": "4000"
+        "EMBEDDING_BATCH_SIZE": "200",
+        "EMBEDDING_MAX_CHARS": "4000",
+        "EMBEDDING_MAX_WORKERS": "4"
       }
     },
     // Option 2: UV (local development)
@@ -55,7 +56,8 @@
         "EMBEDDING_MODEL": "nomic-embed-text",
         "EMBEDDING_DIMENSIONS": "768",
         "EMBEDDING_BATCH_SIZE": "50",
-        "EMBEDDING_MAX_CHARS": "4000"
+        "EMBEDDING_MAX_CHARS": "4000",
+        "EMBEDDING_MAX_WORKERS": "4"
       }
     },
     // Option 3: Docker Compose (local build)

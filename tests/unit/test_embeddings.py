@@ -358,41 +358,44 @@ class TestBatchFallback:
         s.close()
 
     def test_batch_fallback_on_context_length_error(self, service):
-        """Verify batch falls back to one-by-one when API returns context-length 400."""
+        """Verify batch falls back to binary-split when API returns context-length 400."""
         context_error = httpx.Response(
             400, text='{"error":{"message":"the input length exceeds the context length"}}',
         )
         context_error.request = httpx.Request("POST", "https://api.test/v1/embeddings")
 
-        ok1 = httpx.Response(200, json=_make_embedding_response([[1, 2, 3, 4]]))
-        ok2 = httpx.Response(200, json=_make_embedding_response([[5, 6, 7, 8]]))
-        ok3 = httpx.Response(200, json=_make_embedding_response([[9, 10, 11, 12]]))
+        # Batch of 3 fails -> split [a] + [b,c]
+        # [a] succeeds, [b,c] succeeds
+        ok_a = httpx.Response(200, json=_make_embedding_response([[1, 2, 3, 4]]))
+        ok_bc = httpx.Response(200, json=_make_embedding_response([[5, 6, 7, 8], [9, 10, 11, 12]]))
 
         service._client = MagicMock()
-        # First call (batch of 3) fails, then 3 individual calls succeed
-        service._client.post.side_effect = [context_error, ok1, ok2, ok3]
+        service._client.post.side_effect = [context_error, ok_a, ok_bc]
 
         result = service.embed_batch(["a", "b", "c"])
         assert result == [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]]
-        assert service._client.post.call_count == 4
+        assert service._client.post.call_count == 3
 
     def test_fallback_uses_zero_vector_for_individual_failure(self, service):
-        """Verify individual texts that still fail get zero vectors."""
+        """Verify individual texts that still fail get zero vectors via binary split."""
         context_error = httpx.Response(
             400, text='{"error":{"message":"the input length exceeds the context length"}}',
         )
         context_error.request = httpx.Request("POST", "https://api.test/v1/embeddings")
 
-        ok = httpx.Response(200, json=_make_embedding_response([[1, 2, 3, 4]]))
+        ok_a = httpx.Response(200, json=_make_embedding_response([[1, 2, 3, 4]]))
+        ok_c = httpx.Response(200, json=_make_embedding_response([[9, 10, 11, 12]]))
 
         service._client = MagicMock()
-        # Batch fails, then text 1 ok, text 2 still too large, text 3 ok
-        service._client.post.side_effect = [context_error, ok, context_error, ok]
+        # Batch [a, long, c] fails -> split [a] + [long, c]
+        # [a] ok, [long, c] fails -> split [long] + [c]
+        # [long] fails (zero vec), [c] ok
+        service._client.post.side_effect = [context_error, ok_a, context_error, context_error, ok_c]
 
         result = service.embed_batch(["a", "long_text", "c"])
         assert result[0] == [1, 2, 3, 4]
         assert result[1] == [0.0, 0.0, 0.0, 0.0]  # zero vector
-        assert result[2] == [1, 2, 3, 4]
+        assert result[2] == [9, 10, 11, 12]
 
     def test_fallback_all_fail_returns_all_zeros(self, service):
         """Verify all texts failing individually returns all zero vectors."""
