@@ -27,7 +27,8 @@ This is a **Model Context Protocol (MCP) server** that provides keyword and opti
 
 3. **`search_engine.py`** - LanceDB Dual-Mode Search Engine
    - **FTS-only mode** (default, `CREATE_EMBEDDINGS=false`):
-     - Tantivy-powered full-text keyword search
+     - Lance native full-text keyword search (BM25 ranking)
+     - Tokenizer: stemming, stop-word removal, ASCII folding enabled
      - PyArrow schema: 9 columns (page metadata + `search_text` for FTS)
      - No vector columns — minimal storage overhead
    - **Hybrid mode** (`CREATE_EMBEDDINGS=true`):
@@ -37,7 +38,7 @@ This is a **Model Context Protocol (MCP) server** that provides keyword and opti
        - FTS keyword search (weight 1.5x)
      - PyArrow schema: 11 columns (adds `title_vector` + `content_vector`)
    - LanceDB directory-based storage (`.ashelp_lance/`)
-   - **Query sanitization** for FTS special characters
+   - **Query sanitization** for FTS special characters (shared between Lance native FTS and legacy Tantivy syntax)
    - Parallel text extraction using ThreadPoolExecutor
    - Metadata sidecar (`_index_metadata.json`) tracks XML hash, `embeddings_enabled`, and optional model info
 
@@ -70,12 +71,12 @@ Hybrid mode (CREATE_EMBEDDINGS=true):
 
 ### Search Ranking
 
-**FTS-only mode:** Tantivy BM25 keyword ranking on combined title+content text, with over-fetching (limit×3) and title-match + breadcrumb-match reranking.
+**FTS-only mode:** Lance native BM25 keyword ranking on combined title+content text, with stemming/stop-word removal, over-fetching (limit×3) and title-match + breadcrumb-match reranking.
 
 **Hybrid mode (RRF):**
 - **Title vector** (weight 2x NL / 0.5x identifier): Semantic similarity between query and title+breadcrumb embeddings
 - **Content vector** (weight 1x NL / 0.5x identifier): Semantic similarity between query and breadcrumb+content embeddings
-- **FTS keyword** (weight 1.5x NL / 3x identifier): Tantivy-powered full-text search on title+breadcrumb+content
+- **FTS keyword** (weight 1.5x NL / 3x identifier): Lance native full-text search on title+breadcrumb+content
 - **Title match** (weight 3x NL / 4x identifier): Exact/substring match of query in page titles
 - **Breadcrumb match** (weight 2x NL / 3x identifier): Query terms found in breadcrumb path (helps pages with generic titles under relevant sections)
 - **Query-type detection**: Identifier queries (e.g., `MC_MoveAbsolute`, `X20DI9371`) shift weights toward FTS+title+breadcrumb match; natural language queries favor vector similarity

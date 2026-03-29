@@ -1,8 +1,12 @@
 """LanceDB search engine with FTS (default) and optional hybrid RRF search.
 
-By default, uses LanceDB for full-text keyword search only (no embeddings).
-When an embedding API is configured (CREATE_EMBEDDINGS=true), adds vector
-columns and enables hybrid search with Reciprocal Rank Fusion (RRF).
+By default, uses Lance native full-text search (FTS) for keyword search only
+(no embeddings).  When an embedding API is configured (CREATE_EMBEDDINGS=true),
+adds vector columns and enables hybrid search with Reciprocal Rank Fusion (RRF).
+
+FTS uses Lance's built-in inverted index with BM25 ranking, configurable
+tokenization (stemming, stop-word removal, ASCII folding), and the
+``with_position=False`` optimisation since we don't need phrase queries.
 """
 
 import json
@@ -68,13 +72,25 @@ def _is_identifier_query(query: str) -> bool:
 class HelpSearchEngine:
     """Search engine using LanceDB with FTS and optional vector hybrid search.
 
-    When `embedding_service` is None (default), only FTS keyword search is
-    available.  When an `EmbeddingService` is provided, the engine creates
-    vector columns and uses RRF fusion of title vectors, content vectors, and
-    FTS keywords.
+    When `embedding_service` is None (default), only Lance native FTS keyword
+    search is available.  When an `EmbeddingService` is provided, the engine
+    creates vector columns and uses RRF fusion of title vectors, content
+    vectors, and FTS keywords.
     """
 
     TABLE_NAME = "help_pages"
+
+    # FTS tokenizer configuration for Lance native full-text search.
+    # Stemming + stop-word removal + ASCII folding improve recall for
+    # B&R technical docs written in English.  with_position is False
+    # because we never issue phrase queries, which saves index space.
+    _FTS_CONFIG: dict = {
+        "stem": True,
+        "remove_stop_words": True,
+        "ascii_folding": True,
+        "with_position": False,
+        "language": "English",
+    }
 
     # Class-level tracking of active db_paths in this process
     _active_db_paths: set[str] = set()
@@ -272,6 +288,11 @@ class HelpSearchEngine:
                 logger.info("Embedding model changed - full rebuild required")
                 return "full"
 
+        # FTS tokenizer config changed -> full rebuild
+        if metadata.get("fts_config") != self._FTS_CONFIG:
+            logger.info("FTS tokenizer config changed - full rebuild required")
+            return "full"
+
         # XML unchanged -> nothing to do
         if metadata.get("xml_hash") == self.indexer._get_xml_hash():
             return "none"
@@ -292,6 +313,7 @@ class HelpSearchEngine:
             "page_count": len(self.indexer.pages),
             "help_id_count": len(self.indexer.help_id_map),
             "embeddings_enabled": self._embeddings_enabled,
+            "fts_config": self._FTS_CONFIG,
             "page_fingerprints": self.indexer.get_page_fingerprints(),
         }
         if self._embeddings_enabled and self.embedder is not None:
@@ -517,12 +539,16 @@ class HelpSearchEngine:
         self._finalize_fts_build(start_time, total_pages)
         self._fts_ready.set()
 
+    def _create_fts_index(self, table) -> None:
+        """Create a Lance native FTS index with configured tokenizer settings."""
+        table.create_fts_index("search_text", replace=True, **self._FTS_CONFIG)
+
     def _finalize_fts_build(self, start_time: float, total_pages: int):
         """Create FTS index and save metadata after text extraction."""
         table = self.db.open_table(self.TABLE_NAME)
         self._build_status["phase"] = "creating FTS index"
         logger.info("Creating FTS index...")
-        table.create_fts_index("search_text", replace=True)
+        self._create_fts_index(table)
 
         self._save_metadata()
         self._clear_build_progress()
@@ -636,7 +662,7 @@ class HelpSearchEngine:
         self._build_status["phase"] = "creating FTS index (keyword search)"
         logger.info("Creating FTS index...")
         table = self.db.open_table(self.TABLE_NAME)
-        table.create_fts_index("search_text", replace=True)
+        self._create_fts_index(table)
 
         self._fts_ready.set()
         self._build_status["state"] = "fts_ready"
@@ -765,7 +791,7 @@ class HelpSearchEngine:
         self._build_status["phase"] = "rebuilding FTS index"
         logger.info("Rebuilding FTS index...")
         table = self.db.open_table(self.TABLE_NAME)
-        table.create_fts_index("search_text", replace=True)
+        self._create_fts_index(table)
         self._fts_ready.set()
         self._build_status["state"] = "fts_ready"
 
@@ -871,7 +897,7 @@ class HelpSearchEngine:
         # Rebuild FTS index
         self._build_status["phase"] = "rebuilding FTS index"
         logger.info("Rebuilding FTS index...")
-        table.create_fts_index("search_text", replace=True)
+        self._create_fts_index(table)
 
         self._save_metadata()
 
@@ -913,7 +939,12 @@ class HelpSearchEngine:
             return []
 
     def _fts_search(self, table, query: str, limit: int, where_clause: str | None) -> list[dict]:
-        """Run full-text keyword search with query sanitization."""
+        """Run Lance native full-text keyword search with query sanitization.
+
+        Special characters that are part of the FTS query syntax are stripped
+        to avoid parse errors.  Reserved boolean keywords (and/or/not) are
+        also removed so they don't alter query semantics unexpectedly.
+        """
         sanitized = query
         for char in "\"'*:(){}^+[]-":
             sanitized = sanitized.replace(char, " ")

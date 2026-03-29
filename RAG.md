@@ -32,9 +32,9 @@ brhelpcontent.xml ──► Indexer ──► Page Tree (in-memory, ~100K pages)
         FTS-only mode                            Hybrid mode
         (default)                        (CREATE_EMBEDDINGS=true)
               │                                           │
-    LanceDB + Tantivy FTS              Embedding API ──► Vectors
+    LanceDB native FTS                Embedding API ─► Vectors
               │                                  │
-              │                         LanceDB + Tantivy FTS + Vectors
+              │                         LanceDB native FTS + Vectors
               │                                  │
               ▼                                  ▼
        Keyword search                   RRF Hybrid search
@@ -66,7 +66,7 @@ Each help page or section in B&R's documentation maps directly to one search doc
 |-------|---------|----------|
 | `title` | Page title from XML | Display, title-match ranking |
 | `content` | Plain text extracted from HTML via lxml | Semantic search, snippets |
-| `search_text` | `"{title} {breadcrumb} {content}"` | FTS keyword index (Tantivy) |
+| `search_text` | `"{title} {breadcrumb} {content}"` | FTS keyword index (Lance native) |
 | `breadcrumb_path` | Full path like `"Hardware > X20 System > X20DI9371"` | Category filtering, context |
 | `title_vector` | Embedding of `"{title} \| {breadcrumb}"` | Vector similarity on title |
 | `content_vector` | Embedding of `"{breadcrumb} \| {content}"` | Vector similarity on content |
@@ -93,7 +93,7 @@ When embeddings are enabled, the index is built in two phases to provide **progr
 1. Parse `brhelpcontent.xml` into an in-memory page tree (~2s)
 2. Extract plain text from HTML files using parallel `ThreadPoolExecutor` (configurable workers, chunks of 5,000 pages)
 3. Write rows to LanceDB with **zero vectors** (placeholder `[0.0, 0.0, ...]`)
-4. Build Tantivy FTS index on the `search_text` column
+4. Build Lance native FTS index on the `search_text` column (with stemming, stop-word removal, ASCII folding)
 5. **Set `_fts_ready` event** → keyword search is now available
 
 ### Phase 2: Chunked Embedding + Staging Table
@@ -181,7 +181,7 @@ The server operates in one of two modes depending on configuration and index sta
 ### Keyword-only mode (FTS)
 
 - **When:** `CREATE_EMBEDDINGS=false` (default), or during Phase 1 of a two-phase build
-- **Engine:** Tantivy (built into LanceDB) with BM25 scoring
+- **Engine:** Lance native FTS (built into LanceDB) with BM25 scoring
 - **Index field:** `search_text` = concatenation of title, breadcrumb, and content
 - **Ranking:** BM25 term frequency scoring + title-match bonus via RRF
 
@@ -207,7 +207,7 @@ When hybrid mode is active, every query runs four search "legs" in parallel, eac
 |---|--------|------------------|---------------|-------------|-------------|
 | 1 | **Title vector** | Semantic similarity of query vs. `title \| breadcrumb` | `title_vector` | 2.0 | 0.5 |
 | 2 | **Content vector** | Semantic similarity of query vs. `breadcrumb \| content` | `content_vector` | 1.0 | 0.5 |
-| 3 | **FTS keyword** | BM25 keyword match on `title + breadcrumb + content` | — (Tantivy) | 1.5 | 3.0 |
+| 3 | **FTS keyword** | BM25 keyword match on `title + breadcrumb + content` | — (Lance FTS) | 1.5 | 3.0 |
 | 4 | **Title match** | Exact/substring match of query in page titles | — (in-memory) | 3.0 | 4.0 |
 | 5 | **Breadcrumb match** | Query terms found in breadcrumb path | — (in-memory) | 2.0 | 3.0 |
 
@@ -270,7 +270,7 @@ Examples:
 |--------|-----------|-----------|-----------|
 | Title vector | 2.0 | 0.5 | Semantic similarity helps NL queries; identifiers match better via keywords |
 | Content vector | 1.0 | 0.5 | Same reasoning — vectors help with meaning, not exact names |
-| FTS keyword | 1.5 | 3.0 | Tantivy BM25 excels at matching exact identifiers and product codes |
+| FTS keyword | 1.5 | 3.0 | Lance BM25 excels at matching exact identifiers and product codes |
 | Title match | 3.0 | 4.0 | Highest signal for both — direct title match is the strongest quality signal |
 | Breadcrumb match | 2.0 | 3.0 | Helps surface pages under relevant sections even with generic titles |
 

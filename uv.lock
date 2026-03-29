@@ -74,7 +74,7 @@ requires-dist = [
     { name = "bandit", marker = "extra == 'dev'", specifier = ">=1.8.0" },
     { name = "defusedxml", specifier = ">=0.0.1" },
     { name = "httpx", specifier = ">=0.27.0" },
-    { name = "lancedb", specifier = ">=0.20.0" },
+    { name = "lancedb", specifier = ">=0.29.0,<0.30.0" },
     { name = "lxml", specifier = ">=5.3.0" },
     { name = "lxml-stubs", marker = "extra == 'dev'", specifier = ">=0.5.1" },
     { name = "lxml-stubs", marker = "extra == 'test'", specifier = ">=0.5.1" },

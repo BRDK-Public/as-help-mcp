@@ -1,10 +1,10 @@
 # AS Help MCP Server
 
-MCP server for B&R Automation Studio help documentation search. Provides keyword search by default using LanceDB with Tantivy FTS, and optional hybrid semantic + keyword search using Reciprocal Rank Fusion (RRF) when an embedding API is configured.
+MCP server for B&R Automation Studio help documentation search. Provides keyword search by default using LanceDB's native full-text search (FTS), and optional hybrid semantic + keyword search using Reciprocal Rank Fusion (RRF) when an embedding API is configured.
 
 ## Features
 
-- **Keyword search** (default): Fast full-text search using LanceDB + Tantivy — no external dependencies
+- **Keyword search** (default): Fast full-text search using LanceDB's native FTS — no external dependencies
 - **Hybrid search** (optional): RRF fusion of vector similarity and keyword matching when embeddings are enabled
 - **API-based embeddings**: Works with any OpenAI-compatible endpoint (Ollama, OpenAI, Azure OpenAI, GitHub Models, LiteLLM) — no local ML models required
 - **Smart ranking**: Query-type detection shifts weights between FTS and vectors (identifiers like `MC_MoveAbsolute` favor exact match; natural language favors semantic similarity)
@@ -168,7 +168,7 @@ When embeddings are enabled, the server uses **Reciprocal Rank Fusion (RRF)** to
 |--------|-----------|-----------|-------------|
 | Title vector | 2.0 | 0.5 | Semantic similarity between query and title+breadcrumb embeddings |
 | Content vector | 1.0 | 0.5 | Semantic similarity between query and breadcrumb+content embeddings |
-| FTS keyword | 1.5 | 3.0 | Tantivy full-text search on title+breadcrumb+content |
+| FTS keyword | 1.5 | 3.0 | Lance native full-text search on title+breadcrumb+content |
 | Title match | 3.0 | 4.0 | Exact/substring match of query in page titles |
 
 **Query-type detection** automatically selects weights: identifier queries (e.g., `MC_MoveAbsolute`, `X20DI9371`) shift toward FTS + title match; natural language queries favor vector similarity.
