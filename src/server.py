@@ -253,10 +253,15 @@ async def app_lifespan(server: FastMCP):
 
     # Initialize search engine (constructor is fast — just connects to LanceDB)
     logger.info("Initializing search engine...")
-    search_engine = HelpSearchEngine(
-        db_path=db_path, indexer=indexer, force_rebuild=force_rebuild,
-        embedding_service=embedding_service,
-    )
+    try:
+        search_engine = HelpSearchEngine(
+            db_path=db_path, indexer=indexer, force_rebuild=force_rebuild,
+            embedding_service=embedding_service,
+        )
+    except Exception:
+        if embedding_service is not None:
+            embedding_service.close()
+        raise
 
     # Build/load the index in a background thread so the MCP server can respond
     # to initialize immediately. The search tool will wait for readiness.

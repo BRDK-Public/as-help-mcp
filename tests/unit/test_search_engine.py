@@ -940,7 +940,8 @@ class TestReadyStateSemantics:
                 engine.initialize()
 
         # Event is set to release waiters, but index is not queryable.
-        assert engine.wait_until_ready(timeout=0.0) is True
+        # wait_until_ready returns False because the build ended in error state.
+        assert engine.wait_until_ready(timeout=0.0) is False
         assert engine.ready is False
         assert engine.build_status["state"] == "error"
         engine.close()
