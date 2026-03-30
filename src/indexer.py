@@ -164,7 +164,9 @@ class HelpContentIndexer:
 
             # Report duplicate IDs found in XML (resolved with synthetic IDs)
             if self._duplicate_ids:
-                logger.info(f"Resolved {len(self._duplicate_ids)} duplicate IDs in brhelpcontent.xml with synthetic IDs")
+                logger.info(
+                    f"Resolved {len(self._duplicate_ids)} duplicate IDs in brhelpcontent.xml with synthetic IDs"
+                )
                 for dup_id, titles in list(self._duplicate_ids.items())[:5]:
                     logger.debug(f"  Duplicate ID '{dup_id}': used by {titles}")
                 if len(self._duplicate_ids) > 5:
@@ -224,8 +226,11 @@ class HelpContentIndexer:
             synthetic_id = f"{section_id}__dup_{count}"
 
             dup_page = HelpPage(
-                id=synthetic_id, text=text, file_path=file_path,
-                parent_id=parent_id, is_section=True,
+                id=synthetic_id,
+                text=text,
+                file_path=file_path,
+                parent_id=parent_id,
+                is_section=True,
             )
 
             # Extract HelpID for the duplicate section
@@ -311,8 +316,11 @@ class HelpContentIndexer:
             synthetic_id = f"{page_id}__dup_{count}"
 
             dup_page = HelpPage(
-                id=synthetic_id, text=text, file_path=file_path,
-                parent_id=parent_id, is_section=False,
+                id=synthetic_id,
+                text=text,
+                file_path=file_path,
+                parent_id=parent_id,
+                is_section=False,
             )
 
             # Extract HelpID for the duplicate page

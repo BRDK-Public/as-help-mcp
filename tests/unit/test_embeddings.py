@@ -1,6 +1,5 @@
 """Unit tests for embeddings.py - API-based EmbeddingService."""
 
-import json
 from unittest.mock import MagicMock, patch
 
 import httpx
@@ -102,18 +101,14 @@ class TestEmbeddingServiceInit:
     def test_zero_dimensions_raises(self):
         """Verify zero dimensions raises ValueError."""
         with pytest.raises(ValueError, match="EMBEDDING_DIMENSIONS"):
-            EmbeddingService(
-                api_endpoint="https://api.test", api_key="key", model_name="model", dimensions=0
-            )
+            EmbeddingService(api_endpoint="https://api.test", api_key="key", model_name="model", dimensions=0)
 
 
 class TestURLConstruction:
     """Test embedding API URL construction."""
 
     def _make(self, endpoint: str) -> EmbeddingService:
-        return EmbeddingService(
-            api_endpoint=endpoint, api_key="key", model_name="m", dimensions=8
-        )
+        return EmbeddingService(api_endpoint=endpoint, api_key="key", model_name="m", dimensions=8)
 
     def test_plain_base_url(self):
         """Verify /v1/embeddings is appended to plain base URL."""
@@ -145,9 +140,7 @@ class TestEmbedText:
 
     @pytest.fixture
     def service(self):
-        s = EmbeddingService(
-            api_endpoint="https://api.test", api_key="key", model_name="model", dimensions=4
-        )
+        s = EmbeddingService(api_endpoint="https://api.test", api_key="key", model_name="model", dimensions=4)
         yield s
         s.close()
 
@@ -193,8 +186,11 @@ class TestEmbedBatch:
     @pytest.fixture
     def service(self):
         s = EmbeddingService(
-            api_endpoint="https://api.test", api_key="key", model_name="model",
-            dimensions=4, batch_size=2,
+            api_endpoint="https://api.test",
+            api_key="key",
+            model_name="model",
+            dimensions=4,
+            batch_size=2,
         )
         yield s
         s.close()
@@ -249,18 +245,14 @@ class TestAPIRetry:
 
     @pytest.fixture
     def service(self):
-        s = EmbeddingService(
-            api_endpoint="https://api.test", api_key="key", model_name="model", dimensions=4
-        )
+        s = EmbeddingService(api_endpoint="https://api.test", api_key="key", model_name="model", dimensions=4)
         yield s
         s.close()
 
     def test_retry_on_429(self, service):
         """Verify retry on rate limit (429)."""
         rate_limit_response = httpx.Response(429, json={"error": "rate limited"})
-        success_response = httpx.Response(
-            200, json=_make_embedding_response([[1, 2, 3, 4]])
-        )
+        success_response = httpx.Response(200, json=_make_embedding_response([[1, 2, 3, 4]]))
 
         service._client = MagicMock()
         service._client.post.side_effect = [rate_limit_response, success_response]
@@ -274,9 +266,7 @@ class TestAPIRetry:
     def test_retry_on_500(self, service):
         """Verify retry on server error (500)."""
         error_response = httpx.Response(500, json={"error": "internal"})
-        success_response = httpx.Response(
-            200, json=_make_embedding_response([[1, 2, 3, 4]])
-        )
+        success_response = httpx.Response(200, json=_make_embedding_response([[1, 2, 3, 4]]))
 
         service._client = MagicMock()
         service._client.post.side_effect = [error_response, success_response]
@@ -288,9 +278,7 @@ class TestAPIRetry:
 
     def test_retry_on_timeout(self, service):
         """Verify retry on timeout."""
-        success_response = httpx.Response(
-            200, json=_make_embedding_response([[1, 2, 3, 4]])
-        )
+        success_response = httpx.Response(200, json=_make_embedding_response([[1, 2, 3, 4]]))
 
         service._client = MagicMock()
         service._client.post.side_effect = [
@@ -351,8 +339,11 @@ class TestBatchFallback:
     @pytest.fixture
     def service(self):
         s = EmbeddingService(
-            api_endpoint="https://api.test", api_key="key", model_name="model",
-            dimensions=4, batch_size=3,
+            api_endpoint="https://api.test",
+            api_key="key",
+            model_name="model",
+            dimensions=4,
+            batch_size=3,
         )
         yield s
         s.close()
@@ -360,7 +351,8 @@ class TestBatchFallback:
     def test_batch_fallback_on_context_length_error(self, service):
         """Verify batch falls back to binary-split when API returns context-length 400."""
         context_error = httpx.Response(
-            400, text='{"error":{"message":"the input length exceeds the context length"}}',
+            400,
+            text='{"error":{"message":"the input length exceeds the context length"}}',
         )
         context_error.request = httpx.Request("POST", "https://api.test/v1/embeddings")
 
@@ -379,7 +371,8 @@ class TestBatchFallback:
     def test_fallback_uses_zero_vector_for_individual_failure(self, service):
         """Verify individual texts that still fail get zero vectors via binary split."""
         context_error = httpx.Response(
-            400, text='{"error":{"message":"the input length exceeds the context length"}}',
+            400,
+            text='{"error":{"message":"the input length exceeds the context length"}}',
         )
         context_error.request = httpx.Request("POST", "https://api.test/v1/embeddings")
 
@@ -400,7 +393,8 @@ class TestBatchFallback:
     def test_fallback_all_fail_returns_all_zeros(self, service):
         """Verify all texts failing individually returns all zero vectors."""
         context_error = httpx.Response(
-            400, text='{"error":{"message":"the input length exceeds the context length"}}',
+            400,
+            text='{"error":{"message":"the input length exceeds the context length"}}',
         )
         context_error.request = httpx.Request("POST", "https://api.test/v1/embeddings")
 
@@ -416,9 +410,7 @@ class TestResponseOrdering:
 
     @pytest.fixture
     def service(self):
-        s = EmbeddingService(
-            api_endpoint="https://api.test", api_key="key", model_name="model", dimensions=4
-        )
+        s = EmbeddingService(api_endpoint="https://api.test", api_key="key", model_name="model", dimensions=4)
         yield s
         s.close()
 

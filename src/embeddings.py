@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 class EmbeddingTooLargeError(Exception):
     """Raised when the input exceeds the model's context length."""
 
+
 # Defaults
 DEFAULT_BATCH_SIZE = 200
 DEFAULT_MAX_CHARS = 8000
@@ -124,7 +125,9 @@ class EmbeddingService:
         result = self._call_api([truncated])
         return result[0]
 
-    def embed_batch(self, texts: list[str], batch_size: int | None = None, *, show_progress: bool = True) -> list[list[float]]:
+    def embed_batch(
+        self, texts: list[str], batch_size: int | None = None, *, show_progress: bool = True
+    ) -> list[list[float]]:
         """Embed a batch of texts via chunked API calls.
 
         Uses concurrent workers (``max_workers``) to overlap API calls.
@@ -151,8 +154,13 @@ class EmbeddingService:
             batches.append([t if t.strip() else " " for t in chunk])
 
         if show_progress:
-            logger.info("Embedding %d texts (batch_size=%d, workers=%d, model=%s)...",
-                        total, bs, self.max_workers, self.model_name)
+            logger.info(
+                "Embedding %d texts (batch_size=%d, workers=%d, model=%s)...",
+                total,
+                bs,
+                self.max_workers,
+                self.model_name,
+            )
         start = time.time()
 
         all_embeddings: list[list[float]] = []
@@ -162,10 +170,7 @@ class EmbeddingService:
             # Concurrent: dispatch batches across threads
             batch_results: list[list[list[float]] | None] = [None] * len(batches)
             with ThreadPoolExecutor(max_workers=workers) as pool:
-                future_to_idx = {
-                    pool.submit(self._embed_one_batch, b): i
-                    for i, b in enumerate(batches)
-                }
+                future_to_idx = {pool.submit(self._embed_one_batch, b): i for i, b in enumerate(batches)}
                 done_count = 0
                 for future in as_completed(future_to_idx):
                     idx = future_to_idx[future]
@@ -175,8 +180,9 @@ class EmbeddingService:
                         done_texts = min(done_count * bs, total)
                         elapsed = time.time() - start
                         rate = done_texts / elapsed if elapsed > 0 else 0
-                        logger.info("  Progress: %d/%d (%d%%, %.0f texts/s)",
-                                    done_texts, total, done_texts * 100 // total, rate)
+                        logger.info(
+                            "  Progress: %d/%d (%d%%, %.0f texts/s)", done_texts, total, done_texts * 100 // total, rate
+                        )
             for br in batch_results:
                 all_embeddings.extend(br)  # type: ignore[arg-type]
         else:
@@ -189,13 +195,20 @@ class EmbeddingService:
                     rate = done / elapsed if elapsed > 0 else 0
                     if done < total:
                         eta = (total - done) / rate if rate > 0 else 0
-                        logger.info("  Progress: %d/%d (%d%%, %.0f texts/s, ETA %.0fs)",
-                                    done, total, done * 100 // total, rate, eta)
+                        logger.info(
+                            "  Progress: %d/%d (%d%%, %.0f texts/s, ETA %.0fs)",
+                            done,
+                            total,
+                            done * 100 // total,
+                            rate,
+                            eta,
+                        )
 
         elapsed = time.time() - start
         if show_progress:
-            logger.info("Embedded %d texts in %.1fs (%.0f texts/s)", total, elapsed,
-                        total / elapsed if elapsed > 0 else 0)
+            logger.info(
+                "Embedded %d texts in %.1fs (%.0f texts/s)", total, elapsed, total / elapsed if elapsed > 0 else 0
+            )
         return all_embeddings
 
     def _embed_one_batch(self, chunk: list[str]) -> list[list[float]]:
@@ -247,7 +260,7 @@ class EmbeddingService:
                     return [item["embedding"] for item in embeddings_data]
 
                 if response.status_code in (429, 500, 502, 503, 504) and attempt < max_retries:
-                    wait = 2 ** attempt
+                    wait = 2**attempt
                     logger.warning(
                         "Embedding API returned %d (attempt %d/%d), retrying in %ds...",
                         response.status_code,
@@ -275,16 +288,20 @@ class EmbeddingService:
 
                 logger.error(
                     "Embedding API error %d for %d texts: %s",
-                    response.status_code, len(texts), body,
+                    response.status_code,
+                    len(texts),
+                    body,
                 )
                 response.raise_for_status()
 
             except httpx.TimeoutException:
                 if attempt < max_retries:
-                    wait = 2 ** attempt
+                    wait = 2**attempt
                     logger.warning(
                         "Embedding API timeout (attempt %d/%d), retrying in %ds...",
-                        attempt + 1, max_retries, wait,
+                        attempt + 1,
+                        max_retries,
+                        wait,
                     )
                     time.sleep(wait)
                     continue

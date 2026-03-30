@@ -1032,9 +1032,7 @@ class TestFTSOnlyMode:
     def fts_engine(self, initialized_indexer, tmp_path):
         """Create search engine in FTS-only mode (no embedding service)."""
         db_path = tmp_path / "fts_lance"
-        engine = HelpSearchEngine(
-            db_path, initialized_indexer, force_rebuild=True, embedding_service=None
-        )
+        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=None)
         engine.initialize()
         yield engine
         engine.close()
@@ -1076,6 +1074,7 @@ class TestFTSOnlyMode:
     def test_fts_mode_metadata_no_embedding_model(self, fts_engine):
         """Verify metadata does not contain embedding model info."""
         import json
+
         with open(fts_engine._metadata_path) as f:
             metadata = json.load(f)
         assert metadata["embeddings_enabled"] is False
@@ -1085,15 +1084,11 @@ class TestFTSOnlyMode:
     def test_fts_mode_reload_without_rebuild(self, initialized_indexer, tmp_path):
         """Verify FTS-only index can be reloaded without rebuilding."""
         db_path = tmp_path / "fts_reload"
-        engine1 = HelpSearchEngine(
-            db_path, initialized_indexer, force_rebuild=True, embedding_service=None
-        )
+        engine1 = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=None)
         engine1.initialize()
         engine1.close()
 
-        engine2 = HelpSearchEngine(
-            db_path, initialized_indexer, force_rebuild=False, embedding_service=None
-        )
+        engine2 = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=False, embedding_service=None)
         assert engine2._build_strategy == "none"
         engine2.initialize()
 
@@ -1106,9 +1101,7 @@ class TestFTSOnlyMode:
         db_path = tmp_path / "fts_to_hybrid"
 
         # Build FTS-only
-        engine1 = HelpSearchEngine(
-            db_path, initialized_indexer, force_rebuild=True, embedding_service=None
-        )
+        engine1 = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=None)
         engine1.initialize()
         engine1.close()
 
@@ -1131,9 +1124,7 @@ class TestFTSOnlyMode:
         engine1.close()
 
         # Switch to FTS-only
-        engine2 = HelpSearchEngine(
-            db_path, initialized_indexer, force_rebuild=False, embedding_service=None
-        )
+        engine2 = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=False, embedding_service=None)
         assert engine2._build_strategy == "full"
         engine2.close()
 
@@ -1274,9 +1265,7 @@ class TestTitleMatchBoost:
     def fts_engine(self, initialized_indexer, tmp_path):
         """Create search engine in FTS-only mode."""
         db_path = tmp_path / "fts_lance_tm"
-        engine = HelpSearchEngine(
-            db_path, initialized_indexer, force_rebuild=True, embedding_service=None
-        )
+        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=None)
         engine.initialize()
         yield engine
         engine.close()
@@ -1321,9 +1310,7 @@ class TestBreadcrumbMatchBoost:
             "p2": {"breadcrumb_path": "Motion control > ACP10/ARNC0 > Revision Information"},
         }
         rrf_scores = {"p1": 0.0, "p2": 0.0}
-        HelpSearchEngine._apply_breadcrumb_bonus(
-            "ACP10 revision information", page_data, rrf_scores, weight=2.0
-        )
+        HelpSearchEngine._apply_breadcrumb_bonus("ACP10 revision information", page_data, rrf_scores, weight=2.0)
         # p2 has "ACP10", "revision", "information" → 3 hits
         # p1 has "ACP10" → 1 hit
         assert rrf_scores["p2"] > rrf_scores["p1"]
@@ -1347,9 +1334,7 @@ class TestBreadcrumbMatchBoost:
     def fts_engine_bc(self, initialized_indexer, tmp_path):
         """FTS-only engine for breadcrumb integration tests."""
         db_path = tmp_path / "fts_lance_bc"
-        engine = HelpSearchEngine(
-            db_path, initialized_indexer, force_rebuild=True, embedding_service=None
-        )
+        engine = HelpSearchEngine(db_path, initialized_indexer, force_rebuild=True, embedding_service=None)
         engine.initialize()
         yield engine
         engine.close()
@@ -1384,9 +1369,7 @@ class TestBreadcrumbMatchBoost:
         """SQL LIKE wildcards in query (%,_) should be escaped, not interpreted."""
         table = fts_engine_bc.db.open_table(fts_engine_bc.TABLE_NAME)
         # Query with LIKE wildcards should not cause errors or match everything
-        results = fts_engine_bc._breadcrumb_retrieval(
-            table, "100% mapp Motion", limit=20, where_clause=None
-        )
+        results = fts_engine_bc._breadcrumb_retrieval(table, "100% mapp Motion", limit=20, where_clause=None)
         # Should not crash. "100%" → "100\%" in LIKE, won't match breadcrumbs
         assert isinstance(results, list)
 

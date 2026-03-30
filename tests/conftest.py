@@ -6,7 +6,6 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from src.embeddings import EmbeddingService
 from src.indexer import HelpContentIndexer, HelpPage
 
 
@@ -42,7 +41,9 @@ class MockEmbeddingService:
             vector = [v / norm for v in vector]
         return vector
 
-    def embed_batch(self, texts: list[str], batch_size: int | None = None, *, show_progress: bool = True) -> list[list[float]]:
+    def embed_batch(
+        self, texts: list[str], batch_size: int | None = None, *, show_progress: bool = True
+    ) -> list[list[float]]:
         return [self.embed_text(t) for t in texts]
 
     def close(self):

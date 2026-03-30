@@ -179,8 +179,7 @@ class HelpSearchEngine:
                 resume_ids = self._get_indexed_page_ids()
                 remaining = len(self.indexer.pages) - len(resume_ids)
                 logger.info(
-                    f"Resuming interrupted build: {len(resume_ids)} pages already indexed, "
-                    f"{remaining} remaining..."
+                    f"Resuming interrupted build: {len(resume_ids)} pages already indexed, {remaining} remaining..."
                 )
                 sys.stderr.flush()
                 if self._embeddings_enabled:
@@ -282,7 +281,8 @@ class HelpSearchEngine:
         if stored_embeddings != self._embeddings_enabled:
             logger.info(
                 "Embedding mode changed (%s -> %s) - full rebuild required",
-                stored_embeddings, self._embeddings_enabled,
+                stored_embeddings,
+                self._embeddings_enabled,
             )
             return "full"
 
@@ -348,8 +348,8 @@ class HelpSearchEngine:
 
         return (
             page_id,
-            page.text,       # title
-            plain_text,       # content
+            page.text,  # title
+            plain_text,  # content
             page.file_path,
             page.help_id or "",
             1 if page.is_section else 0,
@@ -363,34 +363,38 @@ class HelpSearchEngine:
 
     def _get_fts_schema(self) -> pa.Schema:
         """PyArrow schema for FTS-only mode (no vector columns)."""
-        return pa.schema([
-            pa.field("page_id", pa.utf8()),
-            pa.field("title", pa.utf8()),
-            pa.field("content", pa.utf8()),
-            pa.field("search_text", pa.utf8()),
-            pa.field("file_path", pa.utf8()),
-            pa.field("help_id", pa.utf8()),
-            pa.field("is_section", pa.int32()),
-            pa.field("breadcrumb_path", pa.utf8()),
-            pa.field("category", pa.utf8()),
-        ])
+        return pa.schema(
+            [
+                pa.field("page_id", pa.utf8()),
+                pa.field("title", pa.utf8()),
+                pa.field("content", pa.utf8()),
+                pa.field("search_text", pa.utf8()),
+                pa.field("file_path", pa.utf8()),
+                pa.field("help_id", pa.utf8()),
+                pa.field("is_section", pa.int32()),
+                pa.field("breadcrumb_path", pa.utf8()),
+                pa.field("category", pa.utf8()),
+            ]
+        )
 
     def _get_hybrid_schema(self) -> pa.Schema:
         """PyArrow schema with vector columns for hybrid search."""
         dim = self.embedder.dimension  # type: ignore[union-attr]
-        return pa.schema([
-            pa.field("page_id", pa.utf8()),
-            pa.field("title", pa.utf8()),
-            pa.field("content", pa.utf8()),
-            pa.field("search_text", pa.utf8()),
-            pa.field("file_path", pa.utf8()),
-            pa.field("help_id", pa.utf8()),
-            pa.field("is_section", pa.int32()),
-            pa.field("breadcrumb_path", pa.utf8()),
-            pa.field("category", pa.utf8()),
-            pa.field("title_vector", pa.list_(pa.float32(), dim)),
-            pa.field("content_vector", pa.list_(pa.float32(), dim)),
-        ])
+        return pa.schema(
+            [
+                pa.field("page_id", pa.utf8()),
+                pa.field("title", pa.utf8()),
+                pa.field("content", pa.utf8()),
+                pa.field("search_text", pa.utf8()),
+                pa.field("file_path", pa.utf8()),
+                pa.field("help_id", pa.utf8()),
+                pa.field("is_section", pa.int32()),
+                pa.field("breadcrumb_path", pa.utf8()),
+                pa.field("category", pa.utf8()),
+                pa.field("title_vector", pa.list_(pa.float32(), dim)),
+                pa.field("content_vector", pa.list_(pa.float32(), dim)),
+            ]
+        )
 
     def _get_table_schema(self) -> pa.Schema:
         """Return the appropriate schema based on embedding mode."""
@@ -719,11 +723,19 @@ class HelpSearchEngine:
 
             with ThreadPoolExecutor(max_workers=2) as embed_pool:
                 title_future = embed_pool.submit(
-                    self.embedder.embed_batch, titles, show_progress=False  # type: ignore[union-attr]
+                    self.embedder.embed_batch,
+                    titles,
+                    show_progress=False,  # type: ignore[union-attr]
                 )
-                content_future = embed_pool.submit(
-                    self.embedder.embed_batch, content_texts, show_progress=False  # type: ignore[union-attr]
-                ) if content_texts else None
+                content_future = (
+                    embed_pool.submit(
+                        self.embedder.embed_batch,
+                        content_texts,
+                        show_progress=False,  # type: ignore[union-attr]
+                    )
+                    if content_texts
+                    else None
+                )
 
                 title_vectors = title_future.result()
                 if content_future is not None:
@@ -767,7 +779,7 @@ class HelpSearchEngine:
     def _cleanup_staging_table(self):
         """Remove any leftover staging table from a previous interrupted build."""
         try:
-            tables = self.db.list_tables().tables if hasattr(self.db.list_tables(), 'tables') else self.db.list_tables()
+            tables = self.db.list_tables().tables if hasattr(self.db.list_tables(), "tables") else self.db.list_tables()
             if self.STAGING_TABLE in tables:
                 self.db.drop_table(self.STAGING_TABLE)
         except Exception:
@@ -886,7 +898,7 @@ class HelpSearchEngine:
             batch_size = 500
             for i in range(0, len(delete_list), batch_size):
                 batch = delete_list[i : i + batch_size]
-                id_literals = ", ".join(f"'{pid.replace(chr(39), chr(39)+chr(39))}'" for pid in batch)
+                id_literals = ", ".join(f"'{pid.replace(chr(39), chr(39) + chr(39))}'" for pid in batch)
                 table.delete(f"page_id IN ({id_literals})")
             logger.info(f"Deleted {len(to_delete)} rows from index")
 
@@ -1049,9 +1061,7 @@ class HelpSearchEngine:
         for rank, (pid, _hits) in enumerate(breadcrumb_hits):
             rrf_scores[pid] = rrf_scores.get(pid, 0.0) + weight / (RRF_K + rank + 1)
 
-    def _breadcrumb_retrieval(
-        self, table, query: str, limit: int, where_clause: str | None
-    ) -> list[dict]:
+    def _breadcrumb_retrieval(self, table, query: str, limit: int, where_clause: str | None) -> list[dict]:
         """Retrieve pages whose breadcrumb contains ALL distinctive query terms.
 
         Uses a SQL scan with AND filter to find pages where the breadcrumb path
@@ -1069,8 +1079,11 @@ class HelpSearchEngine:
             sanitized = sanitized.replace(char, " ")
 
         fts_keywords = {"and", "or", "not", "near"}
-        terms = [t.strip().lower() for t in sanitized.split()
-                 if len(t.strip()) >= 3 and t.strip().lower() not in fts_keywords]
+        terms = [
+            t.strip().lower()
+            for t in sanitized.split()
+            if len(t.strip()) >= 3 and t.strip().lower() not in fts_keywords
+        ]
 
         # Require at least 2 terms — single-term breadcrumb matches are too broad
         # (e.g. "ACP10" alone matches 200+ pages, just adding noise)
@@ -1093,12 +1106,7 @@ class HelpSearchEngine:
         try:
             # Use a generous scan limit since AND filter is narrow
             scan_limit = max(limit * 5, 200)
-            raw_results = (
-                table.search()
-                .where(combined_filter)
-                .limit(scan_limit)
-                .to_list()
-            )
+            raw_results = table.search().where(combined_filter).limit(scan_limit).to_list()
 
             if not raw_results:
                 return []
@@ -1194,14 +1202,10 @@ class HelpSearchEngine:
             # 4th leg: title exact / substring match bonus
             query_lower = query.strip().lower()
             title_match_candidates = sorted(
-                [
-                    (pid, data)
-                    for pid, data in page_data.items()
-                    if query_lower in data.get("title", "").lower()
-                ],
+                [(pid, data) for pid, data in page_data.items() if query_lower in data.get("title", "").lower()],
                 key=lambda x: (
                     x[1].get("title", "").lower() != query_lower,  # exact match first
-                    len(x[1].get("title", "")),                    # shorter titles first
+                    len(x[1].get("title", "")),  # shorter titles first
                 ),
             )
             for rank, (pid, _data) in enumerate(title_match_candidates):
@@ -1233,11 +1237,7 @@ class HelpSearchEngine:
             # Title match bonus in keyword mode too
             query_lower = query.strip().lower()
             title_match_candidates = sorted(
-                [
-                    (pid, data)
-                    for pid, data in page_data.items()
-                    if query_lower in data.get("title", "").lower()
-                ],
+                [(pid, data) for pid, data in page_data.items() if query_lower in data.get("title", "").lower()],
                 key=lambda x: (
                     x[1].get("title", "").lower() != query_lower,
                     len(x[1].get("title", "")),
@@ -1261,18 +1261,20 @@ class HelpSearchEngine:
         for pid in sorted_ids:
             row = page_data[pid]
             snippet = self._generate_snippet(row.get("content", ""), query)
-            results.append({
-                "page_id": pid,
-                "title": row.get("title", ""),
-                "file_path": row.get("file_path", ""),
-                "help_id": row.get("help_id") or None,
-                "is_section": bool(row.get("is_section", 0)),
-                "breadcrumb_path": row.get("breadcrumb_path") or None,
-                "category": row.get("category") or None,
-                "score": rrf_scores[pid],
-                "snippet": snippet,
-                "search_mode": search_mode,
-            })
+            results.append(
+                {
+                    "page_id": pid,
+                    "title": row.get("title", ""),
+                    "file_path": row.get("file_path", ""),
+                    "help_id": row.get("help_id") or None,
+                    "is_section": bool(row.get("is_section", 0)),
+                    "breadcrumb_path": row.get("breadcrumb_path") or None,
+                    "category": row.get("category") or None,
+                    "score": rrf_scores[pid],
+                    "snippet": snippet,
+                    "search_mode": search_mode,
+                }
+            )
 
         logger.info(f"Search for '{query}' (cat={category}, mode={search_mode}) returned {len(results)} results")
         return results
@@ -1367,7 +1369,7 @@ class HelpSearchEngine:
                                 f"Another as-help-server (PID {other_pid}) is already using "
                                 f"database at {self.db_path}. Stop the other instance first, "
                                 f"or use a different --db-path for each help root."
-                            )
+                            ) from None
                     # Stale lock (dead PID or unreadable) — remove and retry once
                     if attempt == 0:
                         logger.debug("Removing stale instance lock at %s", self._instance_lock_path)
@@ -1377,9 +1379,8 @@ class HelpSearchEngine:
                             pass
                     else:
                         raise RuntimeError(
-                            f"Could not acquire instance lock at {self._instance_lock_path} "
-                            f"after removing stale lock."
-                        )
+                            f"Could not acquire instance lock at {self._instance_lock_path} after removing stale lock."
+                        ) from None
 
             self._active_db_paths.add(resolved)
 

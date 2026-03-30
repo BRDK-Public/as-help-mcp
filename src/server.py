@@ -255,7 +255,9 @@ async def app_lifespan(server: FastMCP):
     logger.info("Initializing search engine...")
     try:
         search_engine = HelpSearchEngine(
-            db_path=db_path, indexer=indexer, force_rebuild=force_rebuild,
+            db_path=db_path,
+            indexer=indexer,
+            force_rebuild=force_rebuild,
             embedding_service=embedding_service,
         )
     except Exception:
@@ -329,12 +331,17 @@ mcp = FastMCP(  # pragma: no cover
 @mcp.tool()
 def search_help(
     ctx: Context,
-    query: str = Field(description="Search query — use specific identifiers (e.g., 'MC_BR_MoveAbsolute') or natural language (e.g., 'how to move an axis'). Try different keywords for better coverage."),
+    query: str = Field(
+        description="Search query — use specific identifiers (e.g., 'MC_BR_MoveAbsolute') or natural language (e.g., 'how to move an axis'). Try different keywords for better coverage."
+    ),
     limit: int = Field(
         default=5,
         description="Max results to return. Use smaller limits with multiple searches rather than one large search.",
     ),
-    content_search: bool = Field(default=True, description="True = search titles + content (default). False = titles only (faster, use for known identifiers)."),
+    content_search: bool = Field(
+        default=True,
+        description="True = search titles + content (default). False = titles only (faster, use for known identifiers).",
+    ),
     category: str | None = Field(
         default=None,
         description="Filter by top-level category. MUST call get_categories() first to get valid values — do not guess category names.",
@@ -471,9 +478,7 @@ def get_categories(ctx: Context) -> CategoriesResult:
 @mcp.tool()
 def browse_section(
     ctx: Context,
-    section_id: str = Field(
-        description="Section ID from get_categories or a previous browse_section call."
-    ),
+    section_id: str = Field(description="Section ID from get_categories or a previous browse_section call."),
 ) -> SectionChildren | None:
     """Browse the children of a section in the help tree.
 
@@ -508,7 +513,9 @@ def browse_section(
 def get_page_by_id(
     ctx: Context,
     page_id: str = Field(description="Page ID from search results."),
-    include_html: bool = Field(default=False, description="Include raw HTML (only needed for rendering or link extraction)."),
+    include_html: bool = Field(
+        default=False, description="Include raw HTML (only needed for rendering or link extraction)."
+    ),
     include_text: bool = Field(default=True, description="Include full plain text content."),
     include_breadcrumb: bool = Field(default=True, description="Include navigation breadcrumb path."),
 ) -> PageContent | None:
@@ -558,12 +565,12 @@ def get_page_by_id(
 @mcp.tool()
 def get_page_by_help_id(
     ctx: Context,
-    help_id: str = Field(description="Numeric HelpID value (e.g., '3002099'). Found in error messages, context help, and AS project references."),
+    help_id: str = Field(
+        description="Numeric HelpID value (e.g., '3002099'). Found in error messages, context help, and AS project references."
+    ),
     include_html: bool = Field(default=False, description="Include raw HTML."),
     include_text: bool = Field(default=True, description="Include plain text content."),
-    include_breadcrumb: bool = Field(
-        default=True, description="Include breadcrumb trail."
-    ),
+    include_breadcrumb: bool = Field(default=True, description="Include breadcrumb trail."),
 ) -> PageContent | None:
     """Retrieve a help page by its numeric HelpID.
 
