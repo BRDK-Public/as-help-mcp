@@ -13,7 +13,7 @@
         "--as-version",
         "6",
         "--force-rebuild",
-        "true",
+        "false",
         "--create-embeddings",
         "false"
       ],
@@ -47,7 +47,7 @@
         "--force-rebuild",
         "false",
         "--create-embeddings",
-        "true"
+        "false"
       ],
       // Optional: only needed when --create-embeddings is true
       "env": {
@@ -67,9 +67,9 @@
         "compose",
         "run", "--rm", "-T",
         "-v", "/mnt/c/Program Files (x86)/BRAutomation/AS6/Help-en/Data:/data/help:ro",
-        "-e", "AS_HELP_FORCE_REBUILD=true",
+        "-e", "AS_HELP_FORCE_REBUILD=false",
         "-e", "AS_HELP_VERSION=6",
-        "-e", "CREATE_EMBEDDINGS=true",
+        "-e", "CREATE_EMBEDDINGS=false",
         // Optional: only needed when CREATE_EMBEDDINGS=true
         "-e", "EMBEDDING_API_ENDPOINT=http://host.docker.internal:11434",
         "-e", "EMBEDDING_API_KEY=ollama",

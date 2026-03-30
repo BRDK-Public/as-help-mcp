@@ -1343,19 +1343,44 @@ class HelpSearchEngine:
                     f"or use a different --db-path for each help root."
                 )
 
-            lock_info = self._read_instance_lock()
-            if lock_info is not None:
-                other_pid = lock_info.get("pid")
-                if other_pid and self._is_process_alive(other_pid) and other_pid != os.getpid():
-                    raise RuntimeError(
-                        f"Another as-help-server (PID {other_pid}) is already using "
-                        f"database at {self.db_path}. Stop the other instance first, "
-                        f"or use a different --db-path for each help root."
+            # Atomic file creation: O_CREAT | O_EXCL fails if file exists,
+            # preventing the race where two processes both read "no lock"
+            # and both proceed to write.
+            for attempt in range(2):
+                try:
+                    fd = os.open(
+                        str(self._instance_lock_path),
+                        os.O_CREAT | os.O_EXCL | os.O_WRONLY,
                     )
-                if other_pid and other_pid != os.getpid():
-                    logger.debug("Overwriting stale instance lock (PID %s no longer running)", other_pid)
+                    try:
+                        lock_data = json.dumps({"pid": os.getpid(), "started_at": time.time()})
+                        os.write(fd, lock_data.encode())
+                    finally:
+                        os.close(fd)
+                    break  # lock acquired
+                except FileExistsError:
+                    lock_info = self._read_instance_lock()
+                    if lock_info is not None:
+                        other_pid = lock_info.get("pid")
+                        if other_pid and self._is_process_alive(other_pid) and other_pid != os.getpid():
+                            raise RuntimeError(
+                                f"Another as-help-server (PID {other_pid}) is already using "
+                                f"database at {self.db_path}. Stop the other instance first, "
+                                f"or use a different --db-path for each help root."
+                            )
+                    # Stale lock (dead PID or unreadable) — remove and retry once
+                    if attempt == 0:
+                        logger.debug("Removing stale instance lock at %s", self._instance_lock_path)
+                        try:
+                            self._instance_lock_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                    else:
+                        raise RuntimeError(
+                            f"Could not acquire instance lock at {self._instance_lock_path} "
+                            f"after removing stale lock."
+                        )
 
-            self._write_instance_lock()
             self._active_db_paths.add(resolved)
 
         self._instance_lock_owned = True
@@ -1383,10 +1408,6 @@ class HelpSearchEngine:
                 return json.load(f)  # type: ignore[no-any-return]
         except (OSError, json.JSONDecodeError, ValueError):
             return None
-
-    def _write_instance_lock(self):
-        with open(self._instance_lock_path, "w") as f:
-            json.dump({"pid": os.getpid(), "started_at": time.time()}, f)
 
     @staticmethod
     def _is_process_alive(pid: int) -> bool:
