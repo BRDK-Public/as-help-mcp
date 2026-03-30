@@ -1077,12 +1077,13 @@ class HelpSearchEngine:
         if len(terms) < 2:
             return []
 
-        # Escape SQL LIKE wildcards in query terms to prevent unexpected matches
-        def _escape_like(term: str) -> str:
-            return term.replace("%", "\\%").replace("_", "\\_")
-
         # Build WHERE clause: breadcrumb must contain ALL query terms (AND)
-        bc_conditions = [f"lower(breadcrumb_path) LIKE '%{_escape_like(t)}%'" for t in terms]
+        # Note: underscore (_) in LIKE is a single-char wildcard, but this is
+        # harmless here — it matches the literal '_' in B&R identifiers too.
+        # Escaping with backslash does NOT work in DataFusion (LanceDB's SQL
+        # engine) without an explicit ESCAPE clause, and would actually break
+        # matching for identifiers like MC_MoveAbsolute.
+        bc_conditions = [f"lower(breadcrumb_path) LIKE '%{t}%'" for t in terms]
         bc_filter = " AND ".join(bc_conditions)
         if where_clause:
             combined_filter = f"({bc_filter}) AND ({where_clause})"
