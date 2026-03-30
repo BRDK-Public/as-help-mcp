@@ -861,7 +861,10 @@ def main():
     if transport == "streamable-http":
         mcp.settings.host = os.environ.get("MCP_HOST", "0.0.0.0")
         mcp.settings.port = int(os.environ.get("MCP_PORT", "8000"))
-        mcp.settings.transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+        # Only disable DNS rebinding protection when explicitly opted in
+        if os.environ.get("MCP_DISABLE_DNS_REBINDING_PROTECTION", "false").lower() == "true":
+            logger.warning("DNS rebinding protection is DISABLED — only safe behind a reverse proxy or firewall")
+            mcp.settings.transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
     mcp.run(transport=transport)
 
 
