@@ -1320,7 +1320,8 @@ class HelpSearchEngine:
     def _get_indexed_page_ids(self) -> set[str]:
         try:
             table = self.db.open_table(self.TABLE_NAME)
-            arrow_table = table.to_arrow().select(["page_id"])
+            # Project at scan level to avoid loading large vector columns into memory
+            arrow_table = table.search().select(["page_id"]).limit(len(self.indexer.pages) + 1000).to_arrow()
             return set(arrow_table["page_id"].to_pylist())
         except Exception as e:
             logger.warning(f"Could not read existing page IDs: {e}")
