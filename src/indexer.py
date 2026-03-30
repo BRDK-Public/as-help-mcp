@@ -61,6 +61,7 @@ class HelpContentIndexer:
         self.help_id_map: dict[str, str] = {}  # Maps HelpID -> page ID
         self._breadcrumb_cache: dict[str, list[HelpPage]] = {}  # Cache breadcrumbs to avoid recomputation
         self._duplicate_ids: dict[str, list[str]] = {}  # Track duplicate IDs: id -> [first_title, second_title, ...]
+        self._dup_id_counter: dict[str, int] = {}  # Counter for generating unique synthetic IDs
 
         # Ensure directories exist
         self.help_root.mkdir(parents=True, exist_ok=True)
@@ -161,13 +162,13 @@ class HelpContentIndexer:
             logger.info(f"Indexed {len(self.pages)} pages and sections in {elapsed:.2f}s")
             logger.info(f"Found {len(self.help_id_map)} HelpID mappings")
 
-            # Report duplicate IDs found in XML (these cause breadcrumb issues)
+            # Report duplicate IDs found in XML (resolved with synthetic IDs)
             if self._duplicate_ids:
-                logger.warning(f"Found {len(self._duplicate_ids)} duplicate IDs in brhelpcontent.xml (B&R data issue)")
+                logger.info(f"Resolved {len(self._duplicate_ids)} duplicate IDs in brhelpcontent.xml with synthetic IDs")
                 for dup_id, titles in list(self._duplicate_ids.items())[:5]:
-                    logger.warning(f"  Duplicate ID '{dup_id}': used by {titles}")
+                    logger.debug(f"  Duplicate ID '{dup_id}': used by {titles}")
                 if len(self._duplicate_ids) > 5:
-                    logger.warning(f"  ... and {len(self._duplicate_ids) - 5} more duplicates")  # pragma: no cover
+                    logger.debug(f"  ... and {len(self._duplicate_ids) - 5} more duplicates")  # pragma: no cover
 
             if len(self.help_id_map) == 0:
                 logger.warning("No HelpIDs found! Checking first 5 pages for debugging...")
@@ -209,18 +210,48 @@ class HelpContentIndexer:
         if not section_id:
             return  # pragma: no cover
 
-        # Check for duplicate ID (B&R XML data issue) - keep first occurrence
+        # Check for duplicate ID (B&R XML data issue)
+        # Generate a unique synthetic ID so this occurrence gets its own
+        # identity and its children trace the correct breadcrumb path.
         if section_id in self.pages:
             existing = self.pages[section_id]
             if section_id not in self._duplicate_ids:
                 self._duplicate_ids[section_id] = [existing.text]
             self._duplicate_ids[section_id].append(text)
-            # Still process children (they may have unique IDs)
+
+            count = self._dup_id_counter.get(section_id, 0) + 1
+            self._dup_id_counter[section_id] = count
+            synthetic_id = f"{section_id}__dup_{count}"
+
+            dup_page = HelpPage(
+                id=synthetic_id, text=text, file_path=file_path,
+                parent_id=parent_id, is_section=True,
+            )
+
+            # Extract HelpID for the duplicate section
+            dup_identifiers = section_elem.find("Identifiers")
+            if dup_identifiers is None:
+                dup_identifiers = section_elem.find("I")
+            if dup_identifiers is not None:
+                dup_help_id_elem = dup_identifiers.find("HelpID")
+                if dup_help_id_elem is None:
+                    dup_help_id_elem = dup_identifiers.find("H")
+                if dup_help_id_elem is not None:
+                    dup_help_id = dup_help_id_elem.get("Value")
+                    if dup_help_id is None:
+                        dup_help_id = dup_help_id_elem.get("v")
+                    if dup_help_id:
+                        dup_page.help_id = dup_help_id
+                        self.help_id_map[dup_help_id] = synthetic_id
+
+            self.pages[synthetic_id] = dup_page
+
+            # Process children with the synthetic ID as parent
             for child in section_elem:
                 if child.tag in ("Section", "S"):
-                    self._process_section(child, section_id)
+                    self._process_section(child, synthetic_id)
                 elif child.tag in ("Page", "P"):
-                    self._process_page(child, section_id)
+                    self._process_page(child, synthetic_id)
             return
 
         # Create section entry
@@ -267,12 +298,40 @@ class HelpContentIndexer:
         if not page_id:
             return  # pragma: no cover
 
-        # Check for duplicate ID (B&R XML data issue) - keep first occurrence
+        # Check for duplicate ID (B&R XML data issue)
+        # Generate a unique synthetic ID so this occurrence keeps the correct parent.
         if page_id in self.pages:
             existing = self.pages[page_id]
             if page_id not in self._duplicate_ids:
                 self._duplicate_ids[page_id] = [existing.text]
             self._duplicate_ids[page_id].append(text)
+
+            count = self._dup_id_counter.get(page_id, 0) + 1
+            self._dup_id_counter[page_id] = count
+            synthetic_id = f"{page_id}__dup_{count}"
+
+            dup_page = HelpPage(
+                id=synthetic_id, text=text, file_path=file_path,
+                parent_id=parent_id, is_section=False,
+            )
+
+            # Extract HelpID for the duplicate page
+            dup_identifiers = page_elem.find("Identifiers")
+            if dup_identifiers is None:
+                dup_identifiers = page_elem.find("I")
+            if dup_identifiers is not None:
+                dup_help_id_elem = dup_identifiers.find("HelpID")
+                if dup_help_id_elem is None:
+                    dup_help_id_elem = dup_identifiers.find("H")
+                if dup_help_id_elem is not None:
+                    dup_help_id = dup_help_id_elem.get("Value")
+                    if dup_help_id is None:
+                        dup_help_id = dup_help_id_elem.get("v")
+                    if dup_help_id:
+                        dup_page.help_id = dup_help_id
+                        self.help_id_map[dup_help_id] = synthetic_id
+
+            self.pages[synthetic_id] = dup_page
             return
 
         page = HelpPage(id=page_id, text=text, file_path=file_path, parent_id=parent_id, is_section=False)

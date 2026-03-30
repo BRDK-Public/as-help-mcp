@@ -13,9 +13,9 @@
         "--as-version",
         "6",
         "--force-rebuild",
-        "false",
+        "true",
         "--create-embeddings",
-        "true"
+        "false"
       ],
       // Optional: only needed when --create-embeddings is true
       "env": {
