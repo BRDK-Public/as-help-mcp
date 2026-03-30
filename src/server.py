@@ -420,8 +420,13 @@ def search_help(
 
         search_results.append(result)
 
-    # Determine search mode from results (all results share the same mode)
-    search_mode = results[0].get("search_mode", "hybrid") if results else "hybrid"
+    # Determine search mode from engine state, not from result data.
+    # This ensures correct reporting even when the result set is empty.
+    engine = app_ctx.search_engine
+    if engine._embeddings_enabled and engine.ready:
+        search_mode = "hybrid"
+    else:
+        search_mode = "keyword"
 
     # Add status message only when embeddings are enabled but not yet ready
     # (i.e., hybrid mode is expected but temporarily degraded to keyword-only)
