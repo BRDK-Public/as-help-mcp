@@ -1125,7 +1125,13 @@ class HelpSearchEngine:
         if not query.strip():
             return []
 
-        table = self.db.open_table(self.TABLE_NAME)
+        try:
+            table = self.db.open_table(self.TABLE_NAME)
+        except Exception:
+            # Table may be temporarily unavailable during Phase 2 table swap
+            if not self._fts_ready.is_set():
+                return []
+            raise
         where_clause = self._build_category_filter(category)
 
         # Use vectors only when embeddings are enabled AND index is fully ready
