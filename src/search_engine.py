@@ -237,8 +237,12 @@ class HelpSearchEngine:
         return status
 
     def wait_until_ready(self, timeout: float | None = None) -> bool:
-        """Block until the index is ready. Returns True if ready, False on timeout."""
-        return self._ready.wait(timeout=timeout)
+        """Block until the index is ready. Returns True if ready, False on timeout or error."""
+        finished = self._ready.wait(timeout=timeout)
+        if not finished:
+            return False
+        # _ready is set in finally, so also check that initialization actually succeeded
+        return self._build_status.get("state") != "error"
 
     def __enter__(self):
         return self
