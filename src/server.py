@@ -868,9 +868,10 @@ def main():
 
     # Run with stdio transport by default (for local MCP clients like Claude Desktop)
     # To expose over HTTP, set MCP_TRANSPORT=streamable-http and configure host/port with MCP_HOST/MCP_PORT
+    # Default host is 127.0.0.1 (localhost only); set MCP_HOST=0.0.0.0 to bind all interfaces
     transport = os.environ.get("MCP_TRANSPORT", "stdio")
     if transport == "streamable-http":
-        mcp.settings.host = os.environ.get("MCP_HOST", "0.0.0.0")
+        mcp.settings.host = os.environ.get("MCP_HOST", "127.0.0.1")
         mcp.settings.port = int(os.environ.get("MCP_PORT", "8000"))
         # Only disable DNS rebinding protection when explicitly opted in
         if os.environ.get("MCP_DISABLE_DNS_REBINDING_PROTECTION", "false").lower() == "true":
