@@ -221,25 +221,6 @@ class EmbeddingService:
             right = self._embed_one_batch(chunk[mid:])
             return left + right
 
-    def _embed_chunk_individually(self, chunk: list[str]) -> list[list[float]]:
-        """Embed texts one-by-one, returning zero vectors for any that fail."""
-        vectors: list[list[float]] = []
-        zero = [0.0] * self._dimension
-        failed = 0
-        for text in chunk:
-            try:
-                vecs = self._call_api([text])
-                vectors.append(vecs[0])
-            except (EmbeddingTooLargeError, httpx.HTTPStatusError):
-                vectors.append(zero)
-                failed += 1
-        if failed:
-            logger.warning(
-                "  %d/%d texts in chunk exceeded model context -- used zero vectors",
-                failed, len(chunk),
-            )
-        return vectors
-
     def _call_api(self, texts: list[str]) -> list[list[float]]:
         """Make a single API call with retry on transient errors.
 
