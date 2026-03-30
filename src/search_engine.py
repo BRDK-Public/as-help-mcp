@@ -721,17 +721,19 @@ class HelpSearchEngine:
                     embed_text = f"{breadcrumb} | {content}" if breadcrumb else content
                     content_texts.append(embed_text)
 
+            assert self.embedder is not None
+            embedder = self.embedder
             with ThreadPoolExecutor(max_workers=2) as embed_pool:
                 title_future = embed_pool.submit(
-                    self.embedder.embed_batch,
+                    embedder.embed_batch,
                     titles,
-                    show_progress=False,  # type: ignore[union-attr]
+                    show_progress=False,
                 )
                 content_future = (
                     embed_pool.submit(
-                        self.embedder.embed_batch,
+                        embedder.embed_batch,
                         content_texts,
-                        show_progress=False,  # type: ignore[union-attr]
+                        show_progress=False,
                     )
                     if content_texts
                     else None
@@ -1106,7 +1108,7 @@ class HelpSearchEngine:
         try:
             # Use a generous scan limit since AND filter is narrow
             scan_limit = max(limit * 5, 200)
-            raw_results = table.search().where(combined_filter).limit(scan_limit).to_list()
+            raw_results: list[dict] = table.search().where(combined_filter).limit(scan_limit).to_list()
 
             if not raw_results:
                 return []

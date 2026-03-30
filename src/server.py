@@ -11,6 +11,7 @@ from argparse import ArgumentTypeError
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal, cast
 
 from dotenv import load_dotenv
 from mcp.server.fastmcp import Context, FastMCP
@@ -884,7 +885,7 @@ def main():
         if os.environ.get("MCP_DISABLE_DNS_REBINDING_PROTECTION", "false").lower() == "true":
             logger.warning("DNS rebinding protection is DISABLED — only safe behind a reverse proxy or firewall")
             mcp.settings.transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
-    mcp.run(transport=transport)
+    mcp.run(transport=cast(Literal["stdio", "sse", "streamable-http"], transport))
 
 
 if __name__ == "__main__":

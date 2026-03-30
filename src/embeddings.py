@@ -52,7 +52,7 @@ class EmbeddingService:
         max_chars: int | None = None,
         max_workers: int | None = None,
     ):
-        self.api_endpoint = (api_endpoint or os.getenv("EMBEDDING_API_ENDPOINT", "")).rstrip("/")
+        self.api_endpoint = (api_endpoint or os.getenv("EMBEDDING_API_ENDPOINT") or "").rstrip("/")
         self.api_key = api_key or os.getenv("EMBEDDING_API_KEY", "")
         self.model_name = model_name or os.getenv("EMBEDDING_MODEL", "")
 
