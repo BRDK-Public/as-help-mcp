@@ -906,7 +906,7 @@ class HelpSearchEngine:
             self._build_status["pages_processed"] = len(records)
 
             if self._embeddings_enabled:
-                titles = [r[1] for r in records]
+                titles = [f"{r[1]} | {r[6]}" if r[6] else r[1] for r in records]
                 self._build_status["phase"] = "embedding titles"
                 title_vectors = self.embedder.embed_batch(titles, show_progress=False)  # type: ignore[union-attr]
                 self._build_status["phase"] = "embedding content"
