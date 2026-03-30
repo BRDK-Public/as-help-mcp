@@ -6,16 +6,18 @@
       "args": [
         "run",
         "--directory",
-        "./as-help-mcp",
+        "${workspaceFolder}",
         "as-help-server",
         "--help-root",
         "C:\\Program Files (x86)\\BRAutomation\\AS6\\Help-en\\Data",
         "--db-path",
-        "..\\data\\as6\\.ashelp\\search.db",
+        "..\\data\\as6\\.ashelp_lance",
         "--metadata-dir",
         "..\\data\\as6\\.ashelp_metadata",
         "--as-version",
-        "6"
+        "6",
+        "--force-rebuild",
+        "false"
       ]
     },
      "as-help-local": {

@@ -1,56 +1,222 @@
-"""SQLite FTS5 search engine with persistent indexing."""
+"""LanceDB hybrid search engine with RRF (Reciprocal Rank Fusion).
 
+Combines three search signals for superior relevance:
+1. Title vector similarity (semantic title match)
+2. Content vector similarity (semantic content match)
+3. Full-text keyword search (weight 1.5x)
+Results are fused using Reciprocal Rank Fusion (RRF).
+"""
+
+import json
 import logging
 import os
-import sqlite3
+import re
+import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import lancedb
+import pyarrow as pa
+
+from src.embeddings import EmbeddingService
 from src.indexer import HelpContentIndexer
 
 logger = logging.getLogger(__name__)
 
+# Standard RRF constant (from the original RRF paper)
+RRF_K = 60
+
+# RRF weights for each search signal
+WEIGHT_TITLE_VECTOR = 2.0
+WEIGHT_CONTENT_VECTOR = 1.0
+WEIGHT_FTS_KEYWORD = 1.5
+
+# Number of pages per chunk during index build (saves progress after each chunk)
+BUILD_CHUNK_SIZE = 5000
+
+# Retry interval (seconds) when waiting for the instance lock to be released
+LOCK_RETRY_INTERVAL_SECONDS = 2
+
 
 class HelpSearchEngine:
-    """Full-text search engine using SQLite FTS5."""
+    """Hybrid search engine using LanceDB with RRF fusion.
 
-    def __init__(self, db_path: Path, indexer: HelpContentIndexer, force_rebuild: bool = False):
+    Combines title vector search, content vector search, and full-text keyword
+    search via Reciprocal Rank Fusion for best-of-both-worlds relevance.
+    """
+
+    TABLE_NAME = "help_pages"
+
+    # Class-level tracking of active db_paths in this process (for same-process detection)
+    _active_db_paths: set[str] = set()
+    _active_db_paths_lock = threading.Lock()
+
+    def __init__(
+        self,
+        db_path: Path,
+        indexer: HelpContentIndexer,
+        force_rebuild: bool = False,
+        embedding_service: EmbeddingService | None = None,
+        _lock_timeout: int | None = None,
+    ):
         """Initialize search engine.
 
         Args:
-            db_path: Path to SQLite database file
+            db_path: Path to LanceDB directory
             indexer: HelpContentIndexer for accessing help data
             force_rebuild: Force rebuild even if valid index exists
+            embedding_service: Optional EmbeddingService instance (created internally if not provided)
+            _lock_timeout: Seconds to wait for the instance lock before giving up.
+                Defaults to the ``AS_HELP_LOCK_TIMEOUT`` env var (default 60).
+                The leading underscore signals this is intended for tests only.
         """
         self.db_path = Path(db_path)
         self.indexer = indexer
+        self.embedder = embedding_service or EmbeddingService()
+        self._ready = threading.Event()
+        self._fts_ready = threading.Event()
+        self._build_error: Exception | None = None
 
-        # Ensure parent directory exists
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        # Build status tracking (thread-safe via GIL for simple dict updates)
+        self._build_status: dict = {
+            "state": "initializing",  # initializing | building | fts_ready | ready | error
+            "build_type": None,  # full | incremental | none
+            "phase": "",  # current phase description
+            "pages_total": 0,
+            "pages_processed": 0,
+            "started_at": None,
+            "completed_at": None,
+            "error": None,
+            "incremental_stats": None,  # {added, removed, changed, unchanged} for incremental builds
+        }
 
-        # Connect to database with thread safety for async MCP handlers
-        # check_same_thread=False is safe because we don't use multiple concurrent writers
-        # timeout=30 allows waiting for locks (important for Docker/volume mounts)
-        self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=30)
-        self.conn.row_factory = sqlite3.Row  # Enable column access by name
+        # Ensure directory exists
+        self.db_path.mkdir(parents=True, exist_ok=True)
 
-        # Enable WAL mode for better concurrent access on volume mounts
-        try:
-            self.conn.execute("PRAGMA journal_mode=WAL")
-            logger.info("SQLite WAL mode enabled for better concurrent access")
-        except Exception as e:  # pragma: no cover
-            logger.warning(f"Could not enable WAL mode: {e} (continuing with default journal)")  # pragma: no cover
+        # Connect to LanceDB (directory-based, lightweight)
+        self.db = lancedb.connect(str(self.db_path))
 
-        # Determine if we need to build the index
-        needs_build = force_rebuild or not self._index_exists() or self._needs_reindex()
+        # Metadata sidecar file for change detection
+        self._metadata_path = self.db_path / "_index_metadata.json"
 
-        if needs_build:
-            logger.info("Building new search index...")
-            self._build_index()
+        # Build progress marker for resume support
+        self._build_progress_path = self.db_path / "_build_progress.json"
+        # Build lock to avoid concurrent heavy rebuild/model-load in multiple processes
+        self._build_lock_path = self.db_path / "_build.lock"
+        self._build_lock_owned = False
+
+        # Per-db-path instance lock: prevents multiple servers using the same database.
+        # Different db paths (e.g. AS4 vs AS6) can run concurrently.
+        self._instance_lock_path = self.db_path / "_instance.lock"
+        self._instance_lock_owned = False
+        lock_timeout = _lock_timeout if _lock_timeout is not None else int(os.getenv("AS_HELP_LOCK_TIMEOUT", "60"))
+        self._acquire_instance_lock(timeout_seconds=lock_timeout)
+
+        # Determine build strategy: full, resume, incremental, or none
+        if force_rebuild:
+            self._build_strategy = "full"
+        elif self._has_resumable_build():
+            self._build_strategy = "resume"
+        elif not self._index_exists():
+            self._build_strategy = "full"
         else:
-            logger.info("Loading existing search index...")
-            self._load_index()
+            self._build_strategy = self._detect_build_strategy()
+
+        self._build_status["build_type"] = self._build_strategy
+
+    def initialize(self):
+        """Build or load the search index (may be slow on first run).
+
+        For full/resume builds, uses a two-phase approach:
+        - Phase 1: Extract text → write with zero vectors → build FTS → keyword search available
+        - Phase 2: Load embedding model → embed → overwrite table → full hybrid search
+
+        Call this after construction. Can be run in a background thread to
+        avoid blocking the MCP server startup.
+
+        Returns:
+            self, for convenience chaining in tests.
+        """
+        try:
+            self._build_status["started_at"] = time.time()
+            self._build_status["state"] = "building"
+            self._build_status["pages_total"] = len(self.indexer.pages)
+
+            if self._build_strategy in ("full", "incremental", "resume"):
+                self._acquire_build_lock()
+
+            if self._build_strategy == "full":
+                logger.info("Building new search index (full, two-phase)...")
+                sys.stderr.flush()
+                self._build_index_two_phase()
+            elif self._build_strategy == "resume":
+                resume_ids = self._get_indexed_page_ids()
+                logger.info(f"Resuming interrupted build ({len(resume_ids)} pages already indexed)...")
+                sys.stderr.flush()
+                self._build_index_two_phase(resume_ids=resume_ids)
+            elif self._build_strategy == "incremental":
+                # Existing index already has FTS — make it available immediately
+                self._fts_ready.set()
+                self._build_status["state"] = "fts_ready"
+                logger.info("Performing incremental index update (keyword search available)...")
+                sys.stderr.flush()
+                self._incremental_update()
+            else:
+                self._build_status["phase"] = "loading existing index"
+                logger.info("Loading existing search index...")
+                sys.stderr.flush()
+                self._load_index()
+                # Existing index: both FTS and vectors are ready
+                self._fts_ready.set()
+
+            self._build_status["state"] = "ready"
+            self._build_status["phase"] = "complete"
+            self._build_status["completed_at"] = time.time()
+        except Exception as e:
+            self._build_error = e
+            self._build_status["state"] = "error"
+            self._build_status["error"] = str(e)
+            logger.error(f"Search index initialization failed: {e}")
+            raise
+        finally:
+            self._release_build_lock()
+            self._ready.set()
+        return self
+
+    @property
+    def ready(self) -> bool:
+        """Whether the search index is fully ready (hybrid search with vectors)."""
+        # _ready is set in finally{} for both success and error to unblock waiters.
+        # A usable index requires explicit ready state.
+        return self._ready.is_set() and self._build_status.get("state") == "ready"
+
+    @property
+    def fts_ready(self) -> bool:
+        """Whether keyword (FTS) search is available.
+
+        True when the FTS index exists and can serve keyword queries,
+        even if vector embeddings are still being computed.
+        """
+        return self._fts_ready.is_set() and self._build_status.get("state") in ("fts_ready", "ready")
+
+    @property
+    def build_status(self) -> dict:
+        """Current build status snapshot (safe to read from any thread)."""
+        status = dict(self._build_status)
+        # Add elapsed time for in-progress builds
+        if status["started_at"] and not status["completed_at"]:
+            status["elapsed_seconds"] = round(time.time() - status["started_at"], 1)
+        elif status["started_at"] and status["completed_at"]:
+            status["elapsed_seconds"] = round(status["completed_at"] - status["started_at"], 1)
+        else:
+            status["elapsed_seconds"] = None
+        return status
+
+    def wait_until_ready(self, timeout: float | None = None) -> bool:
+        """Block until the index is ready. Returns True if ready, False on timeout."""
+        return self._ready.wait(timeout=timeout)
 
     def __enter__(self):
         return self
@@ -60,74 +226,79 @@ class HelpSearchEngine:
         return False
 
     def _index_exists(self) -> bool:
-        """Check if FTS5 table exists and has data."""
-        cursor = self.conn.execute("""
-            SELECT name FROM sqlite_master
-            WHERE type='table' AND name='help_fts'
-        """)
-        if not cursor.fetchone():
+        """Check if LanceDB table exists and has data."""
+        try:
+            if self.TABLE_NAME not in self.db.list_tables().tables:
+                return False
+            table = self.db.open_table(self.TABLE_NAME)
+            if table.count_rows() == 0:
+                logger.info("LanceDB table exists but is empty - will rebuild")
+                return False
+            return True
+        except Exception:
             return False
 
-        # Also check if the table actually has data
-        cursor = self.conn.execute("SELECT COUNT(*) FROM help_fts")
-        count = cursor.fetchone()[0]
-        if count == 0:
-            logger.info("FTS5 table exists but is empty - will rebuild")  # pragma: no cover
-            return False  # pragma: no cover
-
-        return True
-
     def _needs_reindex(self) -> bool:
-        """Check if XML has changed since last index."""
-        cursor = self.conn.execute("""
-            SELECT name FROM sqlite_master
-            WHERE type='table' AND name='index_metadata'
-        """)
-        if not cursor.fetchone():
-            return True  # pragma: no cover
-
-        cursor = self.conn.execute("SELECT xml_hash FROM index_metadata LIMIT 1")
-        row = cursor.fetchone()
-        if not row:
-            return True  # pragma: no cover
-
-        return str(row[0]) != self.indexer._get_xml_hash()
-
-    def _create_tables(self):
-        """Create FTS5 table and metadata table."""
-        # Create FTS5 virtual table for search
-        # Note: category is stored as UNINDEXED for exact-match filtering (faster than LIKE on file_path)
-        self.conn.execute("""
-            CREATE VIRTUAL TABLE IF NOT EXISTS help_fts USING fts5(
-                page_id UNINDEXED,
-                title,
-                content,
-                file_path UNINDEXED,
-                help_id UNINDEXED,
-                is_section UNINDEXED,
-                breadcrumb_path UNINDEXED,
-                category UNINDEXED,
-                tokenize='porter unicode61'
+        """Check if XML or embedding model has changed since last index."""
+        if not self._metadata_path.exists():
+            return True
+        try:
+            with open(self._metadata_path) as f:
+                metadata = json.load(f)
+            return (  # type: ignore[no-any-return]
+                metadata.get("xml_hash") != self.indexer._get_xml_hash()
+                or metadata.get("embedding_model") != self.embedder.model_name
             )
-        """)
+        except (json.JSONDecodeError, KeyError, OSError):
+            return True
 
-        # Create metadata table for tracking changes
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS index_metadata (
-                xml_hash TEXT PRIMARY KEY,
-                indexed_at REAL,
-                page_count INTEGER,
-                help_id_count INTEGER
-            )
-        """)
+    def _detect_build_strategy(self) -> str:
+        """Determine whether we need a full rebuild, incremental update, or nothing.
 
-        # Don't commit here - let caller control transaction
+        Returns:
+            "full" - No metadata, embedding model changed, or no stored fingerprints
+            "incremental" - XML changed but we have page fingerprints to diff against
+            "none" - Nothing changed
+        """
+        if not self._metadata_path.exists():
+            return "full"
+        try:
+            with open(self._metadata_path) as f:
+                metadata = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return "full"
 
-    def _load_index(self):
-        """Load existing search index."""
-        cursor = self.conn.execute("SELECT COUNT(*) FROM help_fts")
-        doc_count = cursor.fetchone()[0]
-        logger.info(f"Loaded search index with {doc_count} documents")
+        # Embedding model change → must re-embed everything
+        if metadata.get("embedding_model") != self.embedder.model_name:
+            logger.info("Embedding model changed - full rebuild required")
+            return "full"
+
+        # XML unchanged → nothing to do
+        if metadata.get("xml_hash") == self.indexer._get_xml_hash():
+            return "none"
+
+        # XML changed — can we do incremental?
+        if metadata.get("page_fingerprints"):
+            logger.info("XML changed - incremental update possible")
+            return "incremental"
+
+        # XML changed but no stored fingerprints → full rebuild
+        logger.info("XML changed but no page fingerprints stored - full rebuild required")
+        return "full"
+
+    def _save_metadata(self):
+        """Save index metadata including per-page fingerprints to JSON sidecar file."""
+        metadata = {
+            "xml_hash": self.indexer._get_xml_hash(),
+            "indexed_at": time.time(),
+            "page_count": len(self.indexer.pages),
+            "help_id_count": len(self.indexer.help_id_map),
+            "embedding_model": self.embedder.model_name,
+            "embedding_dimension": self.embedder.dimension,
+            "page_fingerprints": self.indexer.get_page_fingerprints(),
+        }
+        with open(self._metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2)
 
     def _extract_text_for_page(self, page_id: str, page) -> tuple:
         """Extract text for a single page (used for parallel processing).
@@ -165,327 +336,863 @@ class HelpSearchEngine:
             category,
         )
 
-    def _build_index(self):
-        """Build search index from help content with parallel text extraction."""
-        start_time = time.time()
-
-        # Close any existing connection and remove lock files to ensure clean state
-        # This is critical on Docker volume mounts where file locks can persist
+    def _has_resumable_build(self) -> bool:
+        """Check if there's a partial build from an interrupted session that can be resumed."""
+        if not self._build_progress_path.exists():
+            return False
         try:
-            if self.conn:
-                self.conn.close()
-                logger.info("Closed existing connection for clean rebuild")
-        except Exception as e:  # pragma: no cover
-            logger.warning(f"Error closing existing connection: {e}")  # pragma: no cover
+            if self.TABLE_NAME not in self.db.list_tables().tables:
+                return False
+            table = self.db.open_table(self.TABLE_NAME)
+            if table.count_rows() == 0:
+                return False
+            with open(self._build_progress_path) as f:
+                progress = json.load(f)
+            return (  # type: ignore[no-any-return]
+                progress.get("xml_hash") == self.indexer._get_xml_hash()
+                and progress.get("embedding_model") == self.embedder.model_name
+            )
+        except (json.JSONDecodeError, OSError, Exception):
+            return False
 
-        # Remove lock/journal files that might be stale (esp. on volume mounts)
-        for lock_file in [f"{self.db_path}-wal", f"{self.db_path}-shm", f"{self.db_path}.lock"]:
+    def _save_build_progress(self):
+        """Save marker that a build is in progress (for resume detection on restart)."""
+        progress = {
+            "xml_hash": self.indexer._get_xml_hash(),
+            "embedding_model": self.embedder.model_name,
+        }
+        with open(self._build_progress_path, "w") as f:
+            json.dump(progress, f)
+
+    # ------------------------------------------------------------------
+    # Instance lock: one server per db_path
+    # ------------------------------------------------------------------
+
+    def _acquire_instance_lock(self, timeout_seconds: int = 60):
+        """Acquire a per-db-path instance lock.
+
+        When another live process already holds the lock (e.g. a concurrent startup
+        or a health-check probe), this method waits up to *timeout_seconds* for the
+        lock to be released before giving up.  Raises RuntimeError on timeout or if
+        the same Python process tries to open the same path twice.
+
+        Args:
+            timeout_seconds: How long to wait for another process to release the
+                lock before raising.  Defaults to 60 seconds (analogous to SQLite's
+                ``PRAGMA busy_timeout``).
+        """
+        resolved = str(self.db_path.resolve())
+
+        # Same-process check (e.g. two engines in the same Python process)
+        with self._active_db_paths_lock:
+            if resolved in self._active_db_paths:
+                raise RuntimeError(
+                    f"Another HelpSearchEngine in this process is already using "
+                    f"database at {self.db_path}. Close it first, "
+                    f"or use a different --db-path for each help root."
+                )
+
+        start = time.time()
+        warned = False
+
+        while True:
+            # Cross-process check via lock file
+            lock_info = self._read_instance_lock()
+            if lock_info is not None:
+                other_pid = lock_info.get("pid")
+                if other_pid and self._is_process_alive(other_pid) and other_pid != os.getpid():
+                    elapsed = time.time() - start
+                    if elapsed >= timeout_seconds:
+                        raise RuntimeError(
+                            f"Database is locked by another as-help-server process "
+                            f"(PID {other_pid}) at {self.db_path}. "
+                            f"Stop the other instance first, or use a different "
+                            f"--db-path for each help root."
+                        )
+                    if not warned:
+                        logger.warning(
+                            "Database at %s is held by another as-help-server (PID %s). "
+                            "Waiting up to %ds for it to be released...",
+                            self.db_path,
+                            other_pid,
+                            timeout_seconds,
+                        )
+                        warned = True
+                    time.sleep(LOCK_RETRY_INTERVAL_SECONDS)
+                    continue
+                # Stale lock from a dead process -- safe to overwrite
+                if other_pid and other_pid != os.getpid():
+                    logger.debug("Overwriting stale instance lock (PID %s no longer running)", other_pid)
+
+            self._write_instance_lock()
+            with self._active_db_paths_lock:
+                self._active_db_paths.add(resolved)
+            self._instance_lock_owned = True
+            logger.info("Acquired instance lock for %s (PID %s)", self.db_path, os.getpid())
+            return
+
+    def _release_instance_lock(self):
+        """Release instance lock if owned by this process."""
+        if not self._instance_lock_owned:
+            return
+        try:
+            self._instance_lock_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            resolved = str(self.db_path.resolve())
+            with self._active_db_paths_lock:
+                self._active_db_paths.discard(resolved)
+        except Exception:
+            pass
+        finally:
+            self._instance_lock_owned = False
+
+    def _read_instance_lock(self) -> dict | None:
+        """Read instance lock file, or None if absent/corrupt."""
+        try:
+            with open(self._instance_lock_path) as f:
+                return json.load(f)  # type: ignore[no-any-return]
+        except (OSError, json.JSONDecodeError, ValueError):
+            return None
+
+    def _write_instance_lock(self):
+        """Write current PID to instance lock file."""
+        with open(self._instance_lock_path, "w") as f:
+            json.dump({"pid": os.getpid(), "started_at": time.time()}, f)
+
+    @staticmethod
+    def _is_process_alive(pid: int) -> bool:
+        """Check whether a process with the given PID is still running."""
+        if sys.platform == "win32":
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.windll.kernel32
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            STILL_ACTIVE = 259
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                return False
             try:
-                lock_path = Path(lock_file)
-                if lock_path.exists():
-                    lock_path.unlink()  # pragma: no cover
-                    logger.info(f"Removed stale lock file: {lock_file}")  # pragma: no cover
-            except Exception as e:  # pragma: no cover
-                logger.warning(f"Could not remove lock file {lock_file}: {e}")  # pragma: no cover
-
-        # Reconnect with fresh connection
-        self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=30)
-        self.conn.row_factory = sqlite3.Row
-
-        # Enable WAL mode if not already enabled
+                exit_code = wintypes.DWORD()
+                if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                    return exit_code.value == STILL_ACTIVE
+                return False
+            finally:
+                kernel32.CloseHandle(handle)
         try:
-            self.conn.execute("PRAGMA journal_mode=WAL")
-        except Exception as e:  # pragma: no cover
-            logger.warning(f"Could not enable WAL mode: {e}")  # pragma: no cover
+            os.kill(pid, 0)
+            return True
+        except (OSError, ProcessLookupError):
+            return False
 
-        cursor = self.conn.cursor()
-        cursor.execute("PRAGMA synchronous = OFF")  # Disable sync during build
-        cursor.execute("PRAGMA journal_mode = MEMORY")  # Keep journal in memory
-        cursor.execute("PRAGMA cache_size = -64000")  # 64MB cache
-        cursor.execute("PRAGMA temp_store = MEMORY")  # Store temp tables in memory
+    # ------------------------------------------------------------------
+    # Build lock: serialises heavy rebuild/model-load across processes
+    # ------------------------------------------------------------------
 
-        # Drop existing tables
-        cursor.execute("DROP TABLE IF EXISTS help_fts")
-        cursor.execute("DROP TABLE IF EXISTS index_metadata")
+    def _acquire_build_lock(self, timeout_seconds: int = 1800):
+        """Acquire a file-based lock so only one process runs heavy build work."""
+        if self._build_lock_owned:
+            return
 
-        # Create tables
-        self._create_tables()
+        start = time.time()
+        warned = False
 
-        # Start single transaction for entire index
-        cursor.execute("BEGIN TRANSACTION")
+        while True:
+            try:
+                fd = os.open(str(self._build_lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                with os.fdopen(fd, "w") as f:
+                    json.dump({"pid": os.getpid(), "started_at": time.time()}, f)
+                self._build_lock_owned = True
+                logger.info("Acquired build lock")
+                return
+            except FileExistsError:
+                # Reap stale lock files from crashed processes.
+                try:
+                    lock_data = json.loads(self._build_lock_path.read_text())
+                    lock_pid = lock_data.get("pid")
+                except (OSError, json.JSONDecodeError, ValueError):
+                    lock_pid = None
 
-        # Disable FTS5 automerge during bulk insert (prevents slowdown at ~25k pages)
-        cursor.execute("INSERT INTO help_fts(help_fts, rank) VALUES('automerge', 0)")
-        cursor.execute("INSERT INTO help_fts(help_fts, rank) VALUES('crisismerge', 16384)")
+                # If we hold the instance lock, we know no other live server
+                # is using this db path — any build lock is leftover from a crash.
+                if self._instance_lock_owned:
+                    logger.warning("Removing stale build lock (this process holds instance lock)")
+                    self._build_lock_path.unlink(missing_ok=True)
+                    continue
 
-        # Prepare batch insert
-        indexed_count = 0
-        batch_size = 1000  # Larger batches since we're in one transaction
-        batch = []
+                # Check if the lock holder is still alive
+                if lock_pid and not self._is_process_alive(lock_pid):
+                    logger.warning("Removing stale build lock (PID %s no longer running)", lock_pid)
+                    self._build_lock_path.unlink(missing_ok=True)
+                    continue
 
-        logger.info(f"Indexing {len(self.indexer.pages)} pages...")
+                # Fallback: reap very old locks (e.g. PID was recycled)
+                try:
+                    age = time.time() - self._build_lock_path.stat().st_mtime
+                    if age > 6 * 3600:
+                        logger.warning("Removing stale build lock older than 6h")
+                        self._build_lock_path.unlink(missing_ok=True)
+                        continue
+                except OSError:
+                    pass
 
-        # Use ThreadPoolExecutor for parallel I/O operations
-        max_workers = int(os.cpu_count() or 4)
-        logger.info(f"Extracting text content in parallel using {max_workers} CPUs (this may take 1-2 minutes)...")
+                if not warned:
+                    logger.info("Another as-help-server instance is rebuilding. Waiting for build lock...")
+                    warned = True
 
-        # Process in chunks to avoid memory buildup and FTS5 segment merge delays
+                if time.time() - start > timeout_seconds:
+                    raise TimeoutError("Timed out waiting for build lock") from None
+
+                time.sleep(2)
+
+    def _release_build_lock(self):
+        """Release build lock if owned by this process."""
+        if not self._build_lock_owned:
+            return
+        try:
+            self._build_lock_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        finally:
+            self._build_lock_owned = False
+
+    def _clear_build_progress(self):
+        """Remove build progress marker (build completed successfully)."""
+        if self._build_progress_path.exists():
+            self._build_progress_path.unlink()
+
+    def _get_indexed_page_ids(self) -> set[str]:
+        """Get set of page_ids already in the LanceDB table."""
+        try:
+            table = self.db.open_table(self.TABLE_NAME)
+            # Read only page_id column via lance scanner to avoid loading vectors
+            try:
+                arrow_table = table.to_lance().to_table(columns=["page_id"])
+                return set(arrow_table["page_id"].to_pylist())
+            except (AttributeError, Exception):
+                # Fallback: read full table (slower but always works)
+                df = table.to_pandas()
+                return set(df["page_id"].tolist())
+        except Exception as e:
+            logger.warning(f"Could not read existing page IDs: {e}")
+            return set()
+
+    def _get_table_schema(self) -> pa.Schema:
+        """Get the PyArrow schema for the LanceDB help_pages table."""
+        dim = self.embedder.dimension
+        return pa.schema(
+            [
+                pa.field("page_id", pa.utf8()),
+                pa.field("title", pa.utf8()),
+                pa.field("content", pa.utf8()),
+                pa.field("search_text", pa.utf8()),
+                pa.field("file_path", pa.utf8()),
+                pa.field("help_id", pa.utf8()),
+                pa.field("is_section", pa.int32()),
+                pa.field("breadcrumb_path", pa.utf8()),
+                pa.field("category", pa.utf8()),
+                pa.field("title_vector", pa.list_(pa.float32(), dim)),
+                pa.field("content_vector", pa.list_(pa.float32(), dim)),
+            ]
+        )
+
+    def _records_to_arrow(self, records, title_vectors, content_vectors) -> pa.Table:
+        """Convert extracted records + embeddings to a PyArrow table."""
+        search_texts = [f"{r[1]} {r[2]}" for r in records]
+        data = {
+            "page_id": [r[0] for r in records],
+            "title": [r[1] for r in records],
+            "content": [r[2] for r in records],
+            "search_text": search_texts,
+            "file_path": [r[3] for r in records],
+            "help_id": [r[4] for r in records],
+            "is_section": [r[5] for r in records],
+            "breadcrumb_path": [r[6] for r in records],
+            "category": [r[7] for r in records],
+            "title_vector": title_vectors,
+            "content_vector": content_vectors,
+        }
+        return pa.table(data, schema=self._get_table_schema())
+
+    def _build_content_vectors(self, records, title_vectors) -> list[list[float]]:
+        """Build content vectors efficiently.
+
+        For sections (empty content), we reuse title vectors instead of embedding
+        the same title text again. For regular pages, we embed only non-empty
+        content strings.
+        """
+        content_indices: list[int] = []
+        content_texts: list[str] = []
+
+        for idx, record in enumerate(records):
+            content = record[2]
+            if content:
+                content_indices.append(idx)
+                content_texts.append(content)
+
+        # Default: reuse title vectors (especially useful for section rows)
+        content_vectors = list(title_vectors)
+
+        if content_texts:
+            embedded_contents = self.embedder.embed_batch(content_texts)
+            for idx, vec in zip(content_indices, embedded_contents, strict=True):
+                content_vectors[idx] = vec
+
+        return content_vectors
+
+    def _build_index_two_phase(self, resume_ids: set[str] | None = None):
+        """Build search index in two phases: FTS-first, then vectors.
+
+        Phase 1: Extract text → write to LanceDB with zero vectors → build FTS index
+                 → set _fts_ready (keyword search available immediately)
+        Phase 2: Load embedding model → compute real vectors → overwrite table
+                 → rebuild FTS → set _ready (full hybrid search)
+
+        Args:
+            resume_ids: Set of page_ids already indexed (for resume). None for fresh build.
+        """
+        start_time = time.time()
         all_pages = list(self.indexer.pages.items())
+        total_pages = len(all_pages)
 
-        try:
+        if resume_ids:
+            pages_to_process = [(pid, page) for pid, page in all_pages if pid not in resume_ids]
+            already_done = total_pages - len(pages_to_process)
+            table_created = True
+            logger.info(f"Resuming: {already_done} already indexed, {len(pages_to_process)} remaining")
+        else:
+            pages_to_process = all_pages
+            already_done = 0
+            table_created = False
+            try:
+                if self.TABLE_NAME in self.db.list_tables().tables:
+                    self.db.drop_table(self.TABLE_NAME)
+            except Exception:
+                pass
+
+        self._build_status["pages_total"] = total_pages
+        self._build_status["pages_processed"] = already_done
+
+        if not pages_to_process:
+            logger.info("All pages already indexed, finalizing...")
+            self._finalize_build(start_time, total_pages)
+            self._fts_ready.set()
+            self._build_status["state"] = "fts_ready"
+            return
+
+        self._save_build_progress()
+
+        max_workers = min(int(os.cpu_count() or 4), 10)
+        remaining = len(pages_to_process)
+        total_chunks = (remaining + BUILD_CHUNK_SIZE - 1) // BUILD_CHUNK_SIZE
+        dim = self.embedder.dimension
+
+        # ── Phase 1: Extract text, write with zero vectors, build FTS ──
+        logger.info(f"Phase 1: Extracting text for {remaining} pages ({total_chunks} chunks)...")
+        sys.stderr.flush()
+
+        all_records: list[tuple] = []
+
+        for chunk_start in range(0, remaining, BUILD_CHUNK_SIZE):
+            chunk = pages_to_process[chunk_start : chunk_start + BUILD_CHUNK_SIZE]
+            chunk_num = chunk_start // BUILD_CHUNK_SIZE + 1
+
+            self._build_status["phase"] = f"extracting text (chunk {chunk_num}/{total_chunks})"
+            records = []
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                # Use map() with chunksize for memory-efficient streaming of results
-                # This avoids holding all 10K futures in memory at once
                 extraction_results = executor.map(
                     lambda item: self._extract_text_for_page(item[0], item[1]),
-                    all_pages,
+                    chunk,
                     chunksize=min(100, max(1, max_workers * 2)),
                 )
-
-                chunk_start_time = time.time()
-                chunk_indexed_start = 0
-
-                # Process results as they complete (streaming)
                 for result in extraction_results:
-                    try:
-                        batch.append(result)
-                        indexed_count += 1
+                    records.append(result)
 
-                        # Insert batch when full (no commit, still in transaction)
-                        if len(batch) >= batch_size:
-                            cursor.executemany(
-                                """
-                                INSERT INTO help_fts (page_id, title, content, file_path, help_id, is_section, breadcrumb_path, category)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                            """,
-                                batch,
-                            )
-                            batch = []
+            all_records.extend(records)
 
-                            if indexed_count % 5000 == 0:
-                                elapsed = time.time() - start_time
-                                pages_per_sec = indexed_count / elapsed
-                                recent_elapsed = time.time() - chunk_start_time
-                                recent_rate = (
-                                    (indexed_count - chunk_indexed_start) / recent_elapsed if recent_elapsed > 0 else 0
-                                )
-                                eta = (len(self.indexer.pages) - indexed_count) / pages_per_sec
-                                logger.info(
-                                    f"Indexed {indexed_count}/{len(self.indexer.pages)} pages... "
-                                    f"(avg: {pages_per_sec:.0f} p/s, recent: {recent_rate:.0f} p/s, ETA: {eta:.0f}s)"
-                                )
+            # Write chunk with zero vectors
+            zero_title_vectors = [[0.0] * dim for _ in records]
+            zero_content_vectors = [[0.0] * dim for _ in records]
+            chunk_data = self._records_to_arrow(records, zero_title_vectors, zero_content_vectors)
 
-                    except Exception as e:  # pragma: no cover
-                        # result[0] is page_id from _extract_text_for_page
-                        page_id = (
-                            result[0] if isinstance(result, tuple) and len(result) > 0 else "unknown"
-                        )  # pragma: no cover
-                        logger.warning(f"Failed to extract text for page {page_id}: {e}")  # pragma: no cover
-                        # Add empty entry to maintain progress
-                        page = self.indexer.pages.get(page_id)  # pragma: no cover
-                        if page:  # pragma: no cover
-                            breadcrumb_path = self.indexer.get_breadcrumb_string(page_id)  # pragma: no cover
-                            breadcrumb = self.indexer.get_breadcrumb(page_id)  # pragma: no cover
-                            category = breadcrumb[0].text if breadcrumb else ""  # pragma: no cover
-                            batch.append(  # pragma: no cover
-                                (  # pragma: no cover
-                                    page_id,  # pragma: no cover
-                                    page.text,  # pragma: no cover
-                                    "",  # empty content on error
-                                    page.file_path,  # pragma: no cover
-                                    page.help_id or "",  # pragma: no cover
-                                    1 if page.is_section else 0,  # pragma: no cover
-                                    breadcrumb_path,  # pragma: no cover
-                                    category,  # pragma: no cover
-                                )  # pragma: no cover
-                            )  # pragma: no cover
-                            indexed_count += 1  # pragma: no cover
+            self._build_status["phase"] = f"saving text (chunk {chunk_num}/{total_chunks})"
+            if not table_created:
+                self.db.create_table(self.TABLE_NAME, chunk_data)
+                table_created = True
+            else:
+                table = self.db.open_table(self.TABLE_NAME)
+                table.add(chunk_data)
 
-            # Insert remaining batch
-            if batch:
-                cursor.executemany(
-                    """
-                    INSERT INTO help_fts (page_id, title, content, file_path, help_id, is_section, breadcrumb_path, category)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                    batch,
+            processed = already_done + chunk_start + len(chunk)
+            self._build_status["pages_processed"] = processed
+            logger.info(f"Phase 1 chunk {chunk_num}/{total_chunks}: {processed}/{total_pages} pages")
+            sys.stderr.flush()
+
+        # Build FTS index → keyword search available
+        self._build_status["phase"] = "creating FTS index (keyword search)"
+        logger.info("Creating FTS index...")
+        table = self.db.open_table(self.TABLE_NAME)
+        table.create_fts_index("search_text", replace=True)
+
+        self._fts_ready.set()
+        self._build_status["state"] = "fts_ready"
+        phase1_elapsed = time.time() - start_time
+        logger.info(f"Phase 1 complete in {phase1_elapsed:.1f}s — keyword search is now available")
+        sys.stderr.flush()
+
+        # ── Phase 2: Load embedding model, compute real vectors, overwrite table ──
+        self._build_status["phase"] = "loading embedding model"
+        logger.info("Phase 2: Loading embedding model...")
+        sys.stderr.flush()
+        self.embedder._load_model()
+
+        # Embed in chunks to avoid excessive memory usage
+        logger.info(f"Phase 2: Embedding {len(all_records)} pages...")
+        all_title_vectors: list[list[float]] = []
+        all_content_vectors: list[list[float]] = []
+
+        for chunk_start in range(0, len(all_records), BUILD_CHUNK_SIZE):
+            chunk_records = all_records[chunk_start : chunk_start + BUILD_CHUNK_SIZE]
+            chunk_num = chunk_start // BUILD_CHUNK_SIZE + 1
+
+            titles = [r[1] for r in chunk_records]
+            self._build_status["phase"] = f"embedding (chunk {chunk_num}/{total_chunks})"
+            title_vectors = self.embedder.embed_batch(titles)
+            content_vectors = self._build_content_vectors(chunk_records, title_vectors)
+
+            all_title_vectors.extend(title_vectors)
+            all_content_vectors.extend(content_vectors)
+
+            logger.info(f"Phase 2 embedding chunk {chunk_num}/{total_chunks}")
+            sys.stderr.flush()
+
+        # Overwrite the table with real vectors
+        self._build_status["phase"] = "writing vectors to index"
+        logger.info("Writing vectors to index...")
+        full_data = self._records_to_arrow(all_records, all_title_vectors, all_content_vectors)
+        self.db.drop_table(self.TABLE_NAME)
+        self.db.create_table(self.TABLE_NAME, full_data)
+
+        # Rebuild FTS after table overwrite
+        self._build_status["phase"] = "rebuilding FTS index"
+        logger.info("Rebuilding FTS index...")
+        table = self.db.open_table(self.TABLE_NAME)
+        table.create_fts_index("search_text", replace=True)
+
+        self._save_metadata()
+        self._clear_build_progress()
+
+        self._build_status["pages_processed"] = total_pages
+        elapsed = time.time() - start_time
+        logger.info(f"Phase 2 complete — full hybrid search ready in {elapsed:.1f}s ({total_pages} documents)")
+
+    def _build_index(self, resume_ids: set[str] | None = None):
+        """Build search index in chunks with resume support.
+
+        Processes pages in chunks of BUILD_CHUNK_SIZE, writing each chunk to
+        LanceDB immediately.  If the server is killed mid-build, the next
+        start detects the partial table and resumes where it left off.
+
+        Args:
+            resume_ids: Set of page_ids already indexed (for resume). None for fresh build.
+        """
+        start_time = time.time()
+        all_pages = list(self.indexer.pages.items())
+        total_pages = len(all_pages)
+
+        # For resume: skip already-indexed pages
+        if resume_ids:
+            pages_to_process = [(pid, page) for pid, page in all_pages if pid not in resume_ids]
+            already_done = total_pages - len(pages_to_process)
+            table_created = True  # Table exists from the interrupted build
+            logger.info(f"Resuming: {already_done} already indexed, {len(pages_to_process)} remaining")
+        else:
+            pages_to_process = all_pages
+            already_done = 0
+            table_created = False
+            # Clean start - drop any leftover partial table
+            try:
+                if self.TABLE_NAME in self.db.list_tables().tables:
+                    self.db.drop_table(self.TABLE_NAME)
+            except Exception:
+                pass
+
+        self._build_status["pages_total"] = total_pages
+        self._build_status["pages_processed"] = already_done
+
+        if not pages_to_process:
+            logger.info("All pages already indexed, finalizing...")
+            self._finalize_build(start_time, total_pages)
+            return
+
+        # Save progress marker so we can resume if interrupted
+        self._save_build_progress()
+
+        # Cap workers to avoid starving the MCP event loop / stdio transport
+        max_workers = min(int(os.cpu_count() or 4), 10)
+        remaining = len(pages_to_process)
+        total_chunks = (remaining + BUILD_CHUNK_SIZE - 1) // BUILD_CHUNK_SIZE
+
+        logger.info(f"Processing {remaining} pages in {total_chunks} chunks ({max_workers} workers)...")
+        sys.stderr.flush()
+
+        for chunk_start in range(0, remaining, BUILD_CHUNK_SIZE):
+            chunk = pages_to_process[chunk_start : chunk_start + BUILD_CHUNK_SIZE]
+            chunk_num = chunk_start // BUILD_CHUNK_SIZE + 1
+            chunk_time = time.time()
+
+            # 1. Extract text
+            self._build_status["phase"] = f"extracting text (chunk {chunk_num}/{total_chunks})"
+            records = []
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                extraction_results = executor.map(
+                    lambda item: self._extract_text_for_page(item[0], item[1]),
+                    chunk,
+                    chunksize=min(100, max(1, max_workers * 2)),
                 )
+                for result in extraction_results:
+                    records.append(result)
 
-            # Save metadata
-            cursor.execute(
-                """
-                INSERT INTO index_metadata (xml_hash, indexed_at, page_count, help_id_count)
-                VALUES (?, ?, ?, ?)
-            """,
-                (self.indexer._get_xml_hash(), time.time(), len(self.indexer.pages), len(self.indexer.help_id_map)),
-            )
+            # 2. Embed titles
+            titles = [r[1] for r in records]
+            self._build_status["phase"] = f"embedding (chunk {chunk_num}/{total_chunks})"
+            title_vectors = self.embedder.embed_batch(titles)
 
-            # Commit the single transaction
-            cursor.execute("COMMIT")
+            # 3. Embed content (reuse title vectors for section rows)
+            content_vectors = self._build_content_vectors(records, title_vectors)
 
-            # Re-enable automerge and optimize the FTS5 index
-            logger.info("Optimizing FTS5 index...")
-            cursor.execute("INSERT INTO help_fts(help_fts, rank) VALUES('automerge', 8)")
-            cursor.execute("INSERT INTO help_fts(help_fts) VALUES('optimize')")
-            self.conn.commit()
+            # 4. Write chunk to LanceDB
+            chunk_data = self._records_to_arrow(records, title_vectors, content_vectors)
+            self._build_status["phase"] = f"saving (chunk {chunk_num}/{total_chunks})"
 
-            # Restore safe settings
-            cursor.execute("PRAGMA synchronous = FULL")
-            cursor.execute("PRAGMA journal_mode = DELETE")
+            if not table_created:
+                self.db.create_table(self.TABLE_NAME, chunk_data)
+                table_created = True
+            else:
+                table = self.db.open_table(self.TABLE_NAME)
+                table.add(chunk_data)
 
-            elapsed = time.time() - start_time
-            logger.info(
-                f"Search index built successfully in {elapsed:.1f}s ({indexed_count} documents)"
-            )  # pragma: no cover
+            processed = already_done + chunk_start + len(chunk)
+            self._build_status["pages_processed"] = processed
+            chunk_elapsed = time.time() - chunk_time
+            logger.info(f"Chunk {chunk_num}/{total_chunks}: {processed}/{total_pages} pages ({chunk_elapsed:.1f}s)")
+            sys.stderr.flush()
 
-        except Exception as e:  # pragma: no cover
-            try:  # pragma: no cover
-                if cursor:  # pragma: no cover
-                    cursor.execute("ROLLBACK")  # pragma: no cover
-            except Exception as rollback_error:  # pragma: no cover
-                logger.warning(f"Rollback failed: {rollback_error}")  # pragma: no cover
-            logger.error(f"Index build failed, rolled back: {e}")
-            raise
+        self._finalize_build(start_time, total_pages)
+
+    def _finalize_build(self, start_time: float, total_pages: int):
+        """Create FTS index and save metadata after all chunks are written."""
+        table = self.db.open_table(self.TABLE_NAME)
+
+        self._build_status["phase"] = "creating FTS index"
+        logger.info("Creating FTS index...")
+        table.create_fts_index("search_text", replace=True)
+
+        self._save_metadata()
+        self._clear_build_progress()
+
+        self._build_status["pages_processed"] = total_pages
+        elapsed = time.time() - start_time
+        logger.info(f"Search index built successfully in {elapsed:.1f}s ({total_pages} documents)")
+
+    def _incremental_update(self):
+        """Incrementally update the index by diffing page fingerprints.
+
+        Compares stored per-page fingerprints against current ones to find
+        added, removed, and changed pages.  Only those pages are re-extracted,
+        re-embedded, and written to LanceDB.  The FTS index is rebuilt at the
+        end (required by LanceDB after row mutations).
+        """
+        start_time = time.time()
+
+        # Load old fingerprints from metadata
+        with open(self._metadata_path) as f:
+            metadata = json.load(f)
+        old_fps: dict[str, str] = metadata.get("page_fingerprints", {})
+
+        # Compute current fingerprints from the freshly-parsed XML
+        new_fps = self.indexer.get_page_fingerprints()
+
+        old_ids = set(old_fps.keys())
+        new_ids = set(new_fps.keys())
+
+        added = new_ids - old_ids
+        removed = old_ids - new_ids
+        changed = {pid for pid in (old_ids & new_ids) if old_fps[pid] != new_fps[pid]}
+
+        to_upsert = added | changed
+        to_delete = removed | changed  # delete old rows for changed pages, then re-add
+
+        self._build_status["incremental_stats"] = {
+            "added": len(added),
+            "removed": len(removed),
+            "changed": len(changed),
+            "unchanged": len(new_ids) - len(to_upsert),
+        }
+        self._build_status["pages_total"] = len(to_upsert)
+        self._build_status["phase"] = "computing diff"
+
+        logger.info(
+            f"Incremental diff: {len(added)} added, {len(removed)} removed, "
+            f"{len(changed)} changed, {len(new_ids) - len(to_upsert)} unchanged"
+        )
+
+        # If nothing changed (e.g. XML whitespace change), skip heavy work
+        if not to_upsert and not to_delete:
+            logger.info("No page-level changes detected - skipping update")
+            self._save_metadata()
+            return
+
+        # Fall back to full rebuild if >50% of pages changed (not worth incremental overhead)
+        if len(to_upsert) > len(new_ids) * 0.5:
+            logger.info(f"Too many changes ({len(to_upsert)}/{len(new_ids)}) - falling back to full rebuild")
+            self._build_index()
+            return
+
+        table = self.db.open_table(self.TABLE_NAME)
+
+        # --- Delete removed and changed rows ---
+        if to_delete:
+            self._build_status["phase"] = "deleting old rows"
+            # Build safe filter: page_id IN ('id1', 'id2', ...)
+            # Process in batches to avoid oversized SQL expressions
+            delete_list = list(to_delete)
+            batch_size = 500
+            for i in range(0, len(delete_list), batch_size):
+                batch = delete_list[i : i + batch_size]
+                id_literals = ", ".join(f"'{pid}'" for pid in batch)
+                table.delete(f"page_id IN ({id_literals})")
+            logger.info(f"Deleted {len(to_delete)} rows from index")
+
+        # --- Extract text, embed, and insert new/changed pages ---
+        if to_upsert:
+            self._build_status["phase"] = "extracting text"
+            pages_to_index = [(pid, self.indexer.pages[pid]) for pid in to_upsert]
+            max_workers = int(os.cpu_count() or 4)
+
+            records = []
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                extraction_results = executor.map(
+                    lambda item: self._extract_text_for_page(item[0], item[1]),
+                    pages_to_index,
+                    chunksize=min(100, max(1, max_workers * 2)),
+                )
+                for result in extraction_results:
+                    records.append(result)
+
+            logger.info(f"Extracted text for {len(records)} pages")
+            self._build_status["pages_processed"] = len(records)
+
+            # Embed
+            titles = [r[1] for r in records]
+            self._build_status["phase"] = "embedding titles"
+            title_vectors = self.embedder.embed_batch(titles)
+
+            self._build_status["phase"] = "embedding content"
+            content_vectors = self._build_content_vectors(records, title_vectors)
+
+            new_data = self._records_to_arrow(records, title_vectors, content_vectors)
+            table.add(new_data)
+            logger.info(f"Added {len(records)} rows to index")
+
+        # Rebuild FTS index (required after row mutations)
+        self._build_status["phase"] = "rebuilding FTS index"
+        logger.info("Rebuilding FTS index...")
+        table.create_fts_index("search_text", replace=True)
+
+        # Save updated metadata with new fingerprints
+        self._save_metadata()
+
+        elapsed = time.time() - start_time
+        logger.info(
+            f"Incremental update complete in {elapsed:.1f}s (+{len(added)} -{len(removed)} ~{len(changed)} pages)"
+        )
+
+    def _load_index(self):
+        """Load existing search index and log stats."""
+        table = self.db.open_table(self.TABLE_NAME)
+        doc_count = table.count_rows()
+        logger.info(f"Loaded search index with {doc_count} documents")
+
+    @staticmethod
+    def _build_category_filter(category: str | None) -> str | None:
+        """Build a safe SQL where clause for category filtering.
+
+        Sanitizes input to prevent SQL injection in LanceDB filter expressions.
+        """
+        if not category:
+            return None
+        # Strip characters that could be used for SQL injection
+        safe = re.sub(r"[^\w\s.-]", "", category)
+        return f"lower(category) = '{safe.lower()}'"
+
+    def _vector_search(
+        self, table, query_vector: list[float], column_name: str, limit: int, where_clause: str | None
+    ) -> list[dict]:
+        """Run vector similarity search on a specific column."""
+        try:
+            builder = table.search(query_vector, vector_column_name=column_name)
+            if where_clause:
+                builder = builder.where(where_clause)
+            return builder.limit(limit).to_list()  # type: ignore[no-any-return]
+        except Exception as e:
+            logger.warning(f"Vector search on {column_name} failed: {e}")
+            return []
+
+    def _fts_search(self, table, query: str, limit: int, where_clause: str | None) -> list[dict]:
+        """Run full-text keyword search with query sanitization."""
+        # Sanitize query: remove FTS special characters
+        sanitized = query
+        for char in "\"'*:(){}^+[]-":
+            sanitized = sanitized.replace(char, " ")
+
+        fts_keywords = {"and", "or", "not", "near"}
+        terms = [t.strip() for t in sanitized.split() if len(t.strip()) >= 2 and t.strip().lower() not in fts_keywords]
+
+        if not terms:
+            return []
+
+        fts_query = " ".join(terms)
+        try:
+            builder = table.search(fts_query, query_type="fts")
+            if where_clause:
+                builder = builder.where(where_clause)
+            return builder.limit(limit).to_list()  # type: ignore[no-any-return]
+        except Exception as e:
+            logger.warning(f"FTS search failed for '{fts_query}': {e}")
+            return []
+
+    @staticmethod
+    def _generate_snippet(content: str, query: str) -> str | None:
+        """Generate a text snippet around the first matching term."""
+        if not content:
+            return None
+
+        # Parse search terms from query
+        sanitized = query
+        for char in "\"'*:(){}^+[]-":
+            sanitized = sanitized.replace(char, " ")
+        terms = [t for t in sanitized.split() if len(t) >= 2]
+
+        if terms:
+            lower_content = content.lower()
+            best_pos = len(content)
+            for term in terms:
+                pos = lower_content.find(term.lower())
+                if 0 <= pos < best_pos:
+                    best_pos = pos
+            if best_pos < len(content):
+                start = max(0, best_pos - 40)
+                end = min(len(content), best_pos + 120)
+                return ("..." if start > 0 else "") + content[start:end] + ("..." if end < len(content) else "")
+
+        return content[:160] + ("..." if len(content) > 160 else "")
 
     def search(
         self, query: str, limit: int = 20, search_in_content: bool = True, category: str | None = None
     ) -> list[dict]:
-        """Search for help pages.
+        """Search for help pages using hybrid search with RRF fusion.
+
+        When the index is in fts_ready state (vectors not yet computed), falls
+        back to keyword-only search. Once fully ready, uses full hybrid RRF.
 
         Args:
-            query: Search query
+            query: Search query (keywords or natural language)
             limit: Maximum number of results
             search_in_content: Search in content (True) or titles only (False)
-            category: Optional category filter (matches start of file_path)
+            category: Optional category filter (case-insensitive)
 
         Returns:
-            List of search results with page_id, title, file_path, help_id, is_section, score
+            List of search results with page_id, title, file_path, help_id,
+            is_section, breadcrumb_path, category, score, snippet, search_mode
         """
         if not query.strip():
             return []
 
-        # Sanitize query: remove FTS5 special characters that could break syntax
-        # See: https://www.sqlite.org/fts5.html#full_text_query_syntax
-        sanitized = query.replace('"', " ").replace("'", " ").replace("*", " ")
-        sanitized = sanitized.replace(":", " ").replace("(", " ").replace(")", " ")
-        sanitized = sanitized.replace("{", " ").replace("}", " ").replace("-", " ")
-        sanitized = sanitized.replace("^", " ").replace("+", " ")  # Boost and NEAR operators
-        sanitized = sanitized.replace("[", " ").replace("]", " ")  # Bracket syntax
+        table = self.db.open_table(self.TABLE_NAME)
+        where_clause = self._build_category_filter(category)
 
-        # Split into terms and filter out short terms and FTS5 keywords
-        fts5_keywords = {"and", "or", "not", "near"}  # Case-insensitive FTS5 operators
-        terms = [t.strip() for t in sanitized.split() if len(t.strip()) >= 2 and t.strip().lower() not in fts5_keywords]
-        if not terms:
-            return []
+        # Determine search mode based on readiness
+        use_vectors = self.ready  # Full hybrid only when vectors are computed
 
-        # Build enhanced query with prefix matching for partial words
-        # e.g., "motor speed" -> '"motor"* "speed"*' to match "motors", "speeding", etc.
-        enhanced_terms = [f'"{term}"*' for term in terms]
+        if use_vectors:
+            # Full hybrid search: vectors + FTS with RRF fusion
+            query_vector = self.embedder.embed_text(query)
+            fetch_limit = min(limit * 3, 100)
 
-        # Build FTS5 query
-        if search_in_content:
-            fts_query = " ".join(enhanced_terms)
+            title_results = self._vector_search(table, query_vector, "title_vector", fetch_limit, where_clause)
+            content_results = []
+            if search_in_content:
+                content_results = self._vector_search(table, query_vector, "content_vector", fetch_limit, where_clause)
+            fts_results = self._fts_search(table, query, fetch_limit, where_clause)
+
+            # RRF Fusion
+            rrf_scores: dict[str, float] = {}
+            page_data: dict[str, dict] = {}
+
+            for rank, row in enumerate(title_results):
+                pid = row["page_id"]
+                rrf_scores[pid] = rrf_scores.get(pid, 0.0) + WEIGHT_TITLE_VECTOR / (RRF_K + rank + 1)
+                if pid not in page_data:
+                    page_data[pid] = row
+
+            for rank, row in enumerate(content_results):
+                pid = row["page_id"]
+                rrf_scores[pid] = rrf_scores.get(pid, 0.0) + WEIGHT_CONTENT_VECTOR / (RRF_K + rank + 1)
+                if pid not in page_data:
+                    page_data[pid] = row
+
+            for rank, row in enumerate(fts_results):
+                pid = row["page_id"]
+                rrf_scores[pid] = rrf_scores.get(pid, 0.0) + WEIGHT_FTS_KEYWORD / (RRF_K + rank + 1)
+                if pid not in page_data:
+                    page_data[pid] = row
+
+            sorted_ids = sorted(rrf_scores.keys(), key=lambda pid: rrf_scores[pid], reverse=True)[:limit]
+            search_mode = "hybrid"
         else:
-            fts_query = f"title : {' '.join(enhanced_terms)}"
+            # FTS-only mode (vectors not yet available)
+            fts_results = self._fts_search(table, query, limit, where_clause)
+            rrf_scores = {}
+            page_data = {}
 
-        try:
-            # Build SQL query
-            sql = """
-                SELECT
-                    page_id,
-                    title,
-                    file_path,
-                    help_id,
-                    is_section,
-                    breadcrumb_path,
-                    category,
-                    bm25(help_fts, 10.0, 1.0) as score,
-                    snippet(help_fts, 2, '>>>', '<<<', '...', 32) as snippet
-                FROM help_fts
-                WHERE help_fts MATCH ?
-            """
-            params = [fts_query]
+            for rank, row in enumerate(fts_results):
+                pid = row["page_id"]
+                rrf_scores[pid] = WEIGHT_FTS_KEYWORD / (RRF_K + rank + 1)
+                page_data[pid] = row
 
-            # Add category filter if provided
-            # Uses dedicated category column for efficient exact matching (vs LIKE on file_path)
-            if category:
-                # Case-insensitive comparison using LOWER()
-                sql += " AND LOWER(category) = LOWER(?)"
-                params.append(category)
+            sorted_ids = sorted(rrf_scores.keys(), key=lambda pid: rrf_scores[pid], reverse=True)[:limit]
+            search_mode = "keyword"
 
-            sql += """
-                ORDER BY bm25(help_fts, 10.0, 1.0)
-                LIMIT ?
-            """
-            params.append(str(limit))
+        # Build result dicts
+        results = []
+        for pid in sorted_ids:
+            row = page_data[pid]
+            snippet = self._generate_snippet(row.get("content", ""), query)
+            results.append(
+                {
+                    "page_id": pid,
+                    "title": row.get("title", ""),
+                    "file_path": row.get("file_path", ""),
+                    "help_id": row.get("help_id") or None,
+                    "is_section": bool(row.get("is_section", 0)),
+                    "breadcrumb_path": row.get("breadcrumb_path") or None,
+                    "category": row.get("category") or None,
+                    "score": rrf_scores[pid],
+                    "snippet": snippet,
+                    "search_mode": search_mode,
+                }
+            )
 
-            # Execute query
-            cursor = self.conn.execute(sql, params)
-
-            results = []
-            for row in cursor:
-                results.append(
-                    {
-                        "page_id": row["page_id"],
-                        "title": row["title"],
-                        "file_path": row["file_path"],
-                        "help_id": row["help_id"] if row["help_id"] else None,
-                        "is_section": bool(row["is_section"]),
-                        "breadcrumb_path": row["breadcrumb_path"] if row["breadcrumb_path"] else None,
-                        "category": row["category"] if row["category"] else None,
-                        "score": abs(float(row["score"])),  # BM25 returns negative
-                        "snippet": row["snippet"] if row["snippet"] else None,
-                    }
-                )
-
-            logger.info(f"Search for '{query}' (cat={category}) returned {len(results)} results")  # pragma: no cover
-            return results  # pragma: no cover
-
-        except sqlite3.OperationalError as e:  # pragma: no cover
-            logger.error(f"Search error for query '{query}': {e}")  # pragma: no cover
-            # Fallback: try simple OR search if enhanced query fails
-            try:  # pragma: no cover
-                fallback_terms = " OR ".join([f'"{t}"' for t in terms])  # pragma: no cover
-                sql = """# pragma: no cover
-                    SELECT page_id, title, file_path, help_id, is_section, breadcrumb_path,
-                           category, bm25(help_fts, 10.0, 1.0) as score,
-                           snippet(help_fts, 2, '>>>', '<<<', '...', 32) as snippet
-                    FROM help_fts WHERE help_fts MATCH ?
-                """  # pragma: no cover
-                params = [fallback_terms]  # pragma: no cover
-
-                if category:  # pragma: no cover
-                    sql += " AND LOWER(category) = LOWER(?)"  # pragma: no cover
-                    params.append(category)  # pragma: no cover
-
-                sql += " ORDER BY bm25(help_fts, 10.0, 1.0) LIMIT ?"  # pragma: no cover
-                params.append(str(limit))  # pragma: no cover
-
-                cursor = self.conn.execute(sql, params)  # pragma: no cover
-                results = [  # pragma: no cover
-                    {  # pragma: no cover
-                        "page_id": r["page_id"],  # pragma: no cover
-                        "title": r["title"],  # pragma: no cover
-                        "file_path": r["file_path"],  # pragma: no cover
-                        "help_id": r["help_id"] or None,  # pragma: no cover
-                        "is_section": bool(r["is_section"]),  # pragma: no cover
-                        "breadcrumb_path": r["breadcrumb_path"] or None,  # pragma: no cover
-                        "category": r["category"] or None,  # pragma: no cover
-                        "score": abs(float(r["score"])),  # pragma: no cover
-                        "snippet": r["snippet"] or None,  # pragma: no cover
-                    }  # pragma: no cover
-                    for r in cursor  # pragma: no cover
-                ]  # pragma: no cover
-                logger.info(f"Fallback search returned {len(results)} results")  # pragma: no cover
-                return results
-            except Exception as e2:
-                logger.error(f"Fallback search also failed: {e2}")
-                return []
+        logger.info(f"Search for '{query}' (cat={category}, mode={search_mode}) returned {len(results)} results")
+        return results
 
     def close(self):
-        """Close database connection."""
-        if self.conn:
-            self.conn.close()
+        """Close database connection and release instance lock."""
+        self._release_instance_lock()
+        self.db = None
 
     def __del__(self):
         """Cleanup on deletion."""
