@@ -129,8 +129,8 @@ class TestBreadcrumbComputation:
         assert breadcrumb[2].text == "MC_BR_MoveAbsolute"
 
     def test_breadcrumb_cycle_detection(self, temp_help_dir):
-        """Verify breadcrumb stops on cycle."""
-        # Create XML with duplicate ID causing apparent cycle
+        """Verify breadcrumb handles duplicate section IDs with synthetic IDs."""
+        # Create XML with duplicate ID — each occurrence gets its own identity
         xml_content = """<?xml version="1.0" encoding="UTF-8"?>
 <BrHelpContent>
     <Section Id="section1" Text="Section 1" File="s1.html">
@@ -147,10 +147,19 @@ class TestBreadcrumbComputation:
         indexer = HelpContentIndexer(temp_help_dir)
         indexer.parse_xml_structure()
 
-        # Breadcrumb should terminate without infinite loop
-        # The second occurrence of section1 overwrites the first
+        # First occurrence keeps original ID
+        assert indexer.pages["section1"].text == "Section 1"
+
+        # Second occurrence gets a synthetic ID
+        assert "section1__dup_1" in indexer.pages
+        assert indexer.pages["section1__dup_1"].text == "Section 1 Duplicate"
+
+        # page2 is a child of the duplicate section with synthetic parent
+        assert indexer.pages["page2"].parent_id == "section1__dup_1"
         breadcrumb = indexer.get_breadcrumb("page2")
-        assert len(breadcrumb) < 100  # Should not hit depth limit
+        assert len(breadcrumb) == 2  # synthetic section + page2
+        assert breadcrumb[0].text == "Section 1 Duplicate"
+        assert breadcrumb[1].text == "Page 2"
 
     def test_breadcrumb_depth_limit(self, temp_help_dir):
         """Verify breadcrumb stops at 100 levels."""
@@ -266,7 +275,7 @@ class TestDuplicateIDHandling:
     """Test duplicate ID detection and handling."""
 
     def test_duplicate_id_detection(self, temp_help_dir):
-        """Verify duplicate IDs are tracked in _duplicate_ids dict."""
+        """Verify duplicate IDs are tracked and get synthetic IDs."""
         xml_content = """<?xml version="1.0" encoding="UTF-8"?>
 <BrHelpContent>
     <Section Id="dup_id" Text="First Instance" File="first.html"/>
@@ -285,8 +294,17 @@ class TestDuplicateIDHandling:
         assert "First Instance" in indexer._duplicate_ids["dup_id"]
         assert "Second Instance" in indexer._duplicate_ids["dup_id"]
 
+        # First occurrence keeps original ID
+        assert indexer.pages["dup_id"].text == "First Instance"
+        assert indexer.pages["dup_id"].file_path == "first.html"
+
+        # Second occurrence gets synthetic ID
+        assert "dup_id__dup_1" in indexer.pages
+        assert indexer.pages["dup_id__dup_1"].text == "Second Instance"
+        assert indexer.pages["dup_id__dup_1"].file_path == "second.html"
+
     def test_duplicate_id_does_not_crash(self, temp_help_dir):
-        """Verify parsing continues when duplicate IDs encountered."""
+        """Verify parsing continues when duplicate IDs encountered, children get correct parents."""
         xml_content = """<?xml version="1.0" encoding="UTF-8"?>
 <BrHelpContent>
     <Section Id="dup_id" Text="First" File="first.html">
@@ -308,8 +326,19 @@ class TestDuplicateIDHandling:
         assert "page1" in indexer.pages
         assert "page2" in indexer.pages
 
+        # page1 is under the original section
+        assert indexer.pages["page1"].parent_id == "dup_id"
+        # page2 is under the synthetic duplicate section
+        assert indexer.pages["page2"].parent_id == "dup_id__dup_1"
+
+        # Breadcrumbs are correct for both
+        bc1 = indexer.get_breadcrumb("page1")
+        assert [p.text for p in bc1] == ["First", "Page 1"]
+        bc2 = indexer.get_breadcrumb("page2")
+        assert [p.text for p in bc2] == ["Second", "Page 2"]
+
     def test_duplicate_page_id_detection(self, temp_help_dir):
-        """Verify duplicate page IDs are tracked in _duplicate_ids dict."""
+        """Verify duplicate page IDs are tracked and get synthetic IDs."""
         xml_content = """<?xml version="1.0" encoding="UTF-8"?>
 <BrHelpContent>
     <Section Id="section1" Text="Section 1" File="section1.html">
@@ -329,6 +358,15 @@ class TestDuplicateIDHandling:
         assert len(indexer._duplicate_ids["dup_page_id"]) == 2
         assert "First Page" in indexer._duplicate_ids["dup_page_id"]
         assert "Second Page" in indexer._duplicate_ids["dup_page_id"]
+
+        # First occurrence keeps original ID
+        assert indexer.pages["dup_page_id"].text == "First Page"
+        assert indexer.pages["dup_page_id"].file_path == "first_page.html"
+
+        # Second occurrence gets synthetic ID
+        assert "dup_page_id__dup_1" in indexer.pages
+        assert indexer.pages["dup_page_id__dup_1"].text == "Second Page"
+        assert indexer.pages["dup_page_id__dup_1"].file_path == "second_page.html"
 
     def test_duplicate_page_id_does_not_crash(self, temp_help_dir):
         """Verify parsing continues when duplicate page IDs encountered."""
@@ -354,8 +392,11 @@ class TestDuplicateIDHandling:
         assert "section1" in indexer.pages
         assert "section2" in indexer.pages
         assert "page2" in indexer.pages
-        # The duplicate page ID exists (last occurrence wins)
+        # Original and synthetic duplicate both exist
         assert "dup_page_id" in indexer.pages
+        assert "dup_page_id__dup_1" in indexer.pages
+        # Duplicate page is correctly parented under section2
+        assert indexer.pages["dup_page_id__dup_1"].parent_id == "section2"
 
 
 class TestMetadataOperations:
@@ -435,20 +476,15 @@ class TestContentExtraction:
         assert "X20DI9371" in html
         assert "Digital input module" in html
 
-    def test_extract_html_content_cached(self, temp_help_dir, sample_xml):
-        """Verify HTML content is cached."""
+    def test_extract_html_content_consistent(self, temp_help_dir, sample_xml):
+        """Verify HTML content is returned consistently (read from disk each time)."""
         indexer = HelpContentIndexer(temp_help_dir)
         indexer.parse_xml_structure()
 
-        # First extraction
+        # Two extractions should return equal content
         html1 = indexer.extract_html_content("x20di9371_page")
-
-        # Second extraction should return cached
-        page = indexer.pages["x20di9371_page"]
-        assert page.html_content is not None
-
         html2 = indexer.extract_html_content("x20di9371_page")
-        assert html1 is html2  # Same object reference
+        assert html1 == html2
 
     def test_extract_html_content_unknown_page_id(self, temp_help_dir, sample_xml):
         """Verify extract_html_content returns None for unknown page_id."""
@@ -508,7 +544,7 @@ class TestContentExtraction:
         assert "Content" in text
 
     def test_extract_text_for_page_no_cache(self, temp_help_dir, sample_xml):
-        """Verify _extract_plain_text_no_cache doesn't cache."""
+        """Verify _extract_plain_text_no_cache doesn't store state on the page."""
         indexer = HelpContentIndexer(temp_help_dir)
         indexer.parse_xml_structure()
 
@@ -519,8 +555,9 @@ class TestContentExtraction:
         assert text is not None
         assert "X20DI9371" in text
 
-        # Verify it was NOT cached
-        assert page.plain_text is None
+        # Verify no caching attributes exist on HelpPage
+        assert not hasattr(page, "plain_text")
+        assert not hasattr(page, "html_content")
 
     def test_extract_content_file_not_found(self, temp_help_dir):
         """Verify graceful handling of missing HTML files."""

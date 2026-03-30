@@ -4,11 +4,14 @@ This MCP server provides search and retrieval capabilities for B&R Automation St
 Optimized for thousands of help files with persistent indexing and fast startup.
 """
 
+import asyncio
 import logging
 import os
+from argparse import ArgumentTypeError
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal, cast
 
 from dotenv import load_dotenv
 from mcp.server.fastmcp import Context, FastMCP
@@ -38,6 +41,32 @@ def get_as_version_config() -> tuple[str, str]:
     return "4", "https://help.br-automation.com/#/en/4/"
 
 
+def _build_online_help_url(base_url: str, file_path: str | None) -> str | None:
+    """Build normalized online help URL from a relative file path.
+
+    Percent-encodes special characters (parentheses, spaces, etc.) in each
+    path segment while preserving the '/' separators.
+    """
+    if not file_path:
+        return None
+    from urllib.parse import quote
+
+    normalized_path = file_path.replace("\\", "/")
+    # Encode each path segment individually to preserve '/' separators
+    encoded_path = "/".join(quote(segment, safe="") for segment in normalized_path.split("/"))
+    return f"{base_url}{encoded_path}"
+
+
+def _parse_bool_arg(value: str) -> bool:
+    """Parse strict boolean CLI values for argparse."""
+    normalized = value.strip().lower()
+    if normalized in ("true", "1", "yes"):
+        return True
+    if normalized in ("false", "0", "no"):
+        return False
+    raise ArgumentTypeError(f"Invalid boolean value: '{value}'. Use true/false.")
+
+
 # Configure logging - use stderr so it doesn't interfere with stdio transport
 logging.basicConfig(
     level=logging.INFO,
@@ -45,6 +74,9 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
+
+# Suppress noisy HTTP request logging
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 # Pydantic models for structured output
@@ -57,7 +89,7 @@ class SearchResult(BaseModel):
     online_help_url: str | None = Field(default=None, description="Direct link to B&R online help for this page")
     help_id: str | None = Field(default=None, description="HelpID if available")
     is_section: bool = Field(description="Whether this is a section (True) or page (False)")
-    score: float | None = Field(default=None, description="Search relevance score (lower is better)")
+    score: float | None = Field(default=None, description="Search relevance score (higher is better, RRF fusion)")
     breadcrumb_path: str | None = Field(default=None, description="Navigation path like 'Section > Subsection > Page'")
     category: str | None = Field(default=None, description="Top-level category (e.g., 'Motion', 'Hardware', 'Safety')")
     content_preview: str | None = Field(
@@ -71,6 +103,14 @@ class SearchResults(BaseModel):
     query: str = Field(description="The search query")
     results: list[SearchResult] = Field(description="List of matching pages")
     total: int = Field(description="Total number of results returned")
+    search_mode: str | None = Field(
+        default=None,
+        description="Search mode: 'hybrid' (semantic + keyword, requires embeddings) or 'keyword' (FTS only, default)",
+    )
+    status_message: str | None = Field(
+        default=None,
+        description="Status message when index is not ready (e.g., building). Call get_help_statistics for details.",
+    )
 
 
 class PageContent(BaseModel):
@@ -146,12 +186,12 @@ async def app_lifespan(server: FastMCP):
     help_root = os.getenv("AS_HELP_ROOT", "/data/help")
     help_root_path = Path(help_root).resolve()
 
-    # Get database path for SQLite FTS5 index
+    # Get database path for LanceDB index directory
     # Default to /data/db for Docker volumes (not help root for read-only compatibility)
     if help_root.startswith("/data/"):
-        default_db_path = "/data/db/.ashelp_search.db"
+        default_db_path = "/data/db/.ashelp_lance"
     else:
-        default_db_path = str(help_root_path / ".ashelp_search.db")
+        default_db_path = str(help_root_path / ".ashelp_lance")
 
     db_path = Path(os.getenv("AS_HELP_DB_PATH", default_db_path)).resolve()
 
@@ -190,11 +230,58 @@ async def app_lifespan(server: FastMCP):
     for cat in categories:
         logger.info(f"  - {cat['title']}")
 
-    # Initialize search engine (builds or loads SQLite FTS5 index)
-    logger.info("Initializing search engine...")
-    search_engine = HelpSearchEngine(db_path=db_path, indexer=indexer, force_rebuild=force_rebuild)
+    # Check for old SQLite index and log migration info
+    old_sqlite_db = db_path.parent / ".ashelp_search.db" if db_path.name == ".ashelp_lance" else None
+    if old_sqlite_db and old_sqlite_db.exists():
+        logger.info(f"Found old SQLite FTS5 index at {old_sqlite_db} - it can be safely deleted")
+        logger.info("Migrated from SQLite FTS5 to LanceDB search")
 
-    logger.info("=== Server ready ===")
+    # Optionally create embedding service for hybrid search
+    create_embeddings = os.getenv("CREATE_EMBEDDINGS", "false").lower() == "true"
+    embedding_service = None
+    if create_embeddings:
+        from src.embeddings import EmbeddingService
+
+        logger.info("CREATE_EMBEDDINGS=true — initializing embedding API client...")
+        try:
+            embedding_service = EmbeddingService()
+        except ValueError as e:
+            logger.error(f"Failed to initialize embedding service: {e}")
+            logger.error("Set EMBEDDING_API_ENDPOINT, EMBEDDING_API_KEY, EMBEDDING_MODEL, EMBEDDING_DIMENSIONS")
+            raise
+    else:
+        logger.info("CREATE_EMBEDDINGS is not set — using FTS keyword search only")
+
+    # Initialize search engine (constructor is fast — just connects to LanceDB)
+    logger.info("Initializing search engine...")
+    try:
+        search_engine = HelpSearchEngine(
+            db_path=db_path,
+            indexer=indexer,
+            force_rebuild=force_rebuild,
+            embedding_service=embedding_service,
+        )
+    except Exception:
+        if embedding_service is not None:
+            embedding_service.close()
+        raise
+
+    # Build/load the index in a background thread so the MCP server can respond
+    # to initialize immediately. The search tool will wait for readiness.
+    # Store the future so we can await it during shutdown for a clean exit.
+    build_type = search_engine.build_status["build_type"]
+    init_future = asyncio.get_running_loop().run_in_executor(None, search_engine.initialize)
+
+    if build_type == "none":
+        logger.info("=== Server ready (loading existing index) ===")
+    elif build_type == "resume":
+        logger.info("=== Server ready (resuming interrupted index build in background) ===")
+    elif build_type == "incremental":
+        logger.info("=== Server ready (incremental index update running in background) ===")
+    else:
+        logger.info(
+            f"=== Server ready ({build_type} index build running in background - this may take several minutes) ==="
+        )
 
     # Yield context to the application
     context = AppContext(
@@ -202,6 +289,17 @@ async def app_lifespan(server: FastMCP):
     )
     yield context
 
+    # Wait for the background index thread to finish before exiting.
+    # Exceptions are already captured in search_engine._build_error, so suppress
+    # them here to avoid duplicate error reporting and asyncio warnings.
+    # Log at debug level so unexpected errors remain discoverable.
+    logger.info("Waiting for background index thread to complete...")
+    try:
+        await init_future
+    except Exception as exc:
+        logger.debug("Background index thread raised an exception during teardown: %s", exc)
+
+    search_engine.close()
     logger.info("Shutting down help server")
 
 
@@ -210,23 +308,22 @@ mcp = FastMCP(  # pragma: no cover
     "B&R Automation Studio Help Server",  # pragma: no cover
     instructions=(  # pragma: no cover
         "B&R Automation Studio Help Server - 100k+ pages of technical documentation.\n\n"  # pragma: no cover
+        "CRITICAL: content_preview is ~100 chars. NEVER answer from previews alone. "  # pragma: no cover
+        "You MUST call get_page_by_id to read actual documentation.\n\n"  # pragma: no cover
+        "*** RESEARCH WORKFLOW ***\n\n"  # pragma: no cover
+        "1. search_help — Find pages by keyword or meaning. Returns titles/page_ids only, NO content.\n"  # pragma: no cover
+        "2. get_page_by_id — Get FULL content. Use breadcrumb_path from results to pick relevant pages "  # pragma: no cover
+        "and skip obvious mismatches (e.g., wrong library variant).\n"  # pragma: no cover
+        "3. REPEAT — Search with different keywords or synonyms. Complex questions need 2-5 page retrievals.\n"  # pragma: no cover
+        "4. get_page_by_help_id — Use when you have a numeric HelpID (e.g., from error codes or context help).\n\n"  # pragma: no cover
         "*** DISCOVERY & BROWSING ***\n\n"  # pragma: no cover
-        "- get_categories - List all top-level categories (e.g., Hardware, Motion, Safety)\n"  # pragma: no cover
-        "- browse_section - Navigate into a category/section to see its children\n\n"  # pragma: no cover
-        "*** THOROUGH RESEARCH WORKFLOW ***\n\n"  # pragma: no cover
-        "For comprehensive answers, use MULTIPLE searches and retrieve MULTIPLE pages:\n\n"  # pragma: no cover
-        "1. search_help - Find pages by keyword. Returns titles/page_ids only, NO content.\n"  # pragma: no cover
-        "2. get_page_by_id - Get FULL content. Call for EACH relevant page.\n"  # pragma: no cover
-        "3. REPEAT - Search with different keywords if needed. Get more pages.\n\n"  # pragma: no cover
-        "BEST PRACTICES:\n"  # pragma: no cover
-        "- Use get_categories() to discover valid category names for filtering search_help\n"  # pragma: no cover
-        "- Use browse_section() to explore a category's structure before searching\n"  # pragma: no cover
-        "- Complex questions need 2-5 page retrievals from different angles\n"  # pragma: no cover
-        "- Search for the main topic, then related concepts (e.g., 'MC_BR_MoveAbsolute' then 'axis error handling')\n"  # pragma: no cover
-        "- If first search doesn't have what you need, try synonyms or related terms\n"  # pragma: no cover
-        "- Retrieve pages that look relevant - reading 3 pages is better than guessing\n\n"  # pragma: no cover
-        "WARNING: content_preview is ~100 chars - NEVER answer from previews alone.\n"  # pragma: no cover
-        "You MUST call get_page_by_id to read actual documentation."  # pragma: no cover
+        "- get_categories — List top-level categories. Call BEFORE using the category filter in search_help.\n"  # pragma: no cover
+        "- browse_section — Navigate into a category/section to see its children. "  # pragma: no cover
+        "Prefer search_help for direct lookups; use browse_section only to explore structure or find siblings.\n\n"  # pragma: no cover
+        "TIPS:\n"  # pragma: no cover
+        "- Use specific identifiers when known (e.g., 'MC_BR_MoveAbsolute', 'X20DI9371')\n"  # pragma: no cover
+        "- Try keyword variations: 'axis move' vs 'motion control' vs 'positioning'\n"  # pragma: no cover
+        "- get_help_statistics — Check index build progress if search returns empty results"  # pragma: no cover
     ),  # pragma: no cover
     lifespan=app_lifespan,  # pragma: no cover
 )  # pragma: no cover
@@ -235,33 +332,57 @@ mcp = FastMCP(  # pragma: no cover
 @mcp.tool()
 def search_help(
     ctx: Context,
-    query: str = Field(description="Search query (keywords or phrases). Try different keywords for better coverage."),
+    query: str = Field(
+        description="Search query — use specific identifiers (e.g., 'MC_BR_MoveAbsolute') or natural language (e.g., 'how to move an axis'). Try different keywords for better coverage."
+    ),
     limit: int = Field(
         default=5,
-        description="Results per search. Use smaller limits and do multiple searches with different keywords.",
+        description="Max results to return. Use smaller limits with multiple searches rather than one large search.",
     ),
-    content_search: bool = Field(default=True, description="Search in content (True) or titles only (False)"),
+    content_search: bool = Field(
+        default=True,
+        description="True = search titles + content (default). False = titles only (faster, use for known identifiers).",
+    ),
     category: str | None = Field(
         default=None,
-        description="Filter by category (top-level section name). Common categories: Hardware, Motion, Safety, Vision, Communication, Programming, Visualization, Services. Call get_categories() for complete list.",
+        description="Filter by top-level category. MUST call get_categories() first to get valid values — do not guess category names.",
     ),
 ) -> SearchResults:
-    """Find help pages matching your query. Returns page_ids ONLY - no actual content.
+    """Find help pages by keyword or meaning. Returns page_ids and metadata ONLY — no actual content.
 
-    WORKFLOW:
-    1. Search for main topic -> get_page_by_id for top results
-    2. Search for related terms -> get_page_by_id for those too
-    3. Combine information from multiple pages for complete answer
+    IMPORTANT: You MUST call get_page_by_id to read content. Previews (~100 chars) are NOT enough to answer questions.
 
-    Tips:
-    - Call get_categories() first to discover valid category filter values
-    - Use specific function/feature names when known (e.g., 'MC_BR_MoveAbsolute')
-    - Try variations: 'axis move' vs 'motion control' vs 'positioning'
-    - Check breadcrumb_path to understand page context before retrieving
+    Use breadcrumb_path in results to assess relevance before retrieving — skip results whose breadcrumb
+    clearly shows they are about a different library, module, or topic.
 
-    You MUST call get_page_by_id to read actual content - previews are NOT enough.
+    If search returns empty results, call get_help_statistics to check if the index is still building.
     """
     app_ctx: AppContext = ctx.request_context.lifespan_context
+
+    # Return immediately with status when the index is not queryable.
+    # fts_ready allows keyword-only search while vectors are still building.
+    status = app_ctx.search_engine.build_status
+    state = status.get("state")
+    if state not in ("ready", "fts_ready"):
+        phase = status.get("phase", "")
+        build_type = status.get("build_type", "unknown")
+        processed = status.get("pages_processed", 0)
+        total = status.get("pages_total", 0)
+        elapsed = status.get("elapsed_seconds")
+
+        progress = f"{processed}/{total} pages" if total else phase
+        elapsed_str = f", {elapsed:.0f}s elapsed" if elapsed else ""
+
+        if status.get("error"):
+            msg = f"Index build failed: {status['error']}"
+        else:
+            msg = (
+                f"Search index is building ({build_type}): {phase} - {progress}{elapsed_str}. "
+                f"Call get_help_statistics to check progress, then retry search."
+            )
+
+        logger.info(f"Search called while building: {msg}")
+        return SearchResults(query=query, results=[], total=0, status_message=msg)
 
     # Handle FieldInfo objects when function called directly (not through FastMCP framework)
     # This supports both MCP tool invocation and direct test calls
@@ -274,7 +395,7 @@ def search_help(
     if isinstance(category, FieldInfo):
         category = category.default
 
-    # Perform search (returns breadcrumb_path directly from FTS5 index)
+    # Perform search (returns breadcrumb_path directly from LanceDB index)
     results = app_ctx.search_engine.search(
         query=query, limit=limit, search_in_content=content_search, category=category
     )
@@ -282,20 +403,15 @@ def search_help(
     # Convert to SearchResult models
     search_results = []
     for r in results:
-        # Get a tiny preview - intentionally truncated to force get_page_by_id usage
+        # Use snippet precomputed by search engine to avoid extra disk I/O per result.
+        # Keep previews intentionally short and incomplete to drive get_page_by_id usage.
         content_preview = None
-        if not r["is_section"]:
-            full_text = app_ctx.indexer.extract_plain_text(r["page_id"])
-            if full_text:
-                # Only show first 100 chars - useless for answering, just proves content exists
-                content_preview = full_text[:100].strip() + "... [TRUNCATED - call get_page_by_id for full content]"
+        snippet = r.get("snippet")
+        if snippet:
+            content_preview = snippet.strip() + "... [TRUNCATED - call get_page_by_id for full content]"
 
         # Build online help URL from file path
-        online_help_url = None
-        if r["file_path"]:
-            # Normalize path separators and build URL
-            normalized_path = r["file_path"].replace("\\", "/")
-            online_help_url = f"{app_ctx.online_help_base_url}{normalized_path}"
+        online_help_url = _build_online_help_url(app_ctx.online_help_base_url, r.get("file_path"))
 
         result = SearchResult(
             page_id=r["page_id"],
@@ -312,7 +428,29 @@ def search_help(
 
         search_results.append(result)
 
-    return SearchResults(query=query, results=search_results, total=len(search_results))
+    # Determine search mode from engine state, not from result data.
+    # This ensures correct reporting even when the result set is empty.
+    engine = app_ctx.search_engine
+    if engine._embeddings_enabled and engine.ready:
+        search_mode = "hybrid"
+    else:
+        search_mode = "keyword"
+
+    # Add status message only when embeddings are enabled but not yet ready
+    # (i.e., hybrid mode is expected but temporarily degraded to keyword-only)
+    status_msg = None
+    if search_mode == "keyword" and app_ctx.search_engine._embeddings_enabled:
+        status_msg = (
+            "Semantic search is still loading — results are keyword-only. Retry later for better relevance ranking."
+        )
+
+    return SearchResults(
+        query=query,
+        results=search_results,
+        total=len(search_results),
+        search_mode=search_mode,
+        status_message=status_msg,
+    )
 
 
 @mcp.tool()
@@ -341,22 +479,17 @@ def get_categories(ctx: Context) -> CategoriesResult:
 @mcp.tool()
 def browse_section(
     ctx: Context,
-    section_id: str = Field(
-        description="ID of the section to browse (from get_categories or previous browse_section call)"
-    ),
+    section_id: str = Field(description="Section ID from get_categories or a previous browse_section call."),
 ) -> SectionChildren | None:
     """Browse the children of a section in the help tree.
 
-    Use this to navigate the documentation hierarchy:
-    1. Call get_categories() to get top-level categories
-    2. Call browse_section(category_id) to see what's inside
-    3. For child sections (is_section=True), call browse_section again to go deeper
-    4. For pages (is_section=False), call get_page_by_id to read the content
+    Use browse_section to explore structure or find sibling/related pages within a section.
+    Prefer search_help for direct topic lookups — it is faster and more precise.
 
-    This is useful for:
-    - Exploring documentation structure before searching
-    - Finding related pages within the same section
-    - Understanding the organization of a topic area
+    Workflow:
+    1. get_categories() → get top-level category IDs
+    2. browse_section(category_id) → see children
+    3. Sections (is_section=True) → browse deeper. Pages (is_section=False) → get_page_by_id.
     """
     app_ctx: AppContext = ctx.request_context.lifespan_context
 
@@ -380,19 +513,20 @@ def browse_section(
 @mcp.tool()
 def get_page_by_id(
     ctx: Context,
-    page_id: str = Field(description="Page ID from search results. Call multiple times for different pages."),
-    include_html: bool = Field(default=False, description="Include full HTML content (rarely needed)"),
-    include_text: bool = Field(default=True, description="Include full plain text content"),
-    include_breadcrumb: bool = Field(default=True, description="Include navigation breadcrumb path"),
+    page_id: str = Field(description="Page ID from search results."),
+    include_html: bool = Field(
+        default=False, description="Include raw HTML (only needed for rendering or link extraction)."
+    ),
+    include_text: bool = Field(default=True, description="Include full plain text content."),
+    include_breadcrumb: bool = Field(default=True, description="Include navigation breadcrumb path."),
 ) -> PageContent | None:
-    """Get the COMPLETE content of a help page. Call this for EACH page you need.
+    """Get the COMPLETE content of a help page.
 
-    For thorough answers:
-    - Retrieve the main topic page
-    - Also retrieve related pages (examples, error handling, best practices)
-    - Cross-reference information from multiple pages
+    Before calling, check the breadcrumb_path from search results to confirm the page is relevant.
+    Skip pages whose breadcrumb shows they belong to a different library or unrelated topic.
 
-    Don't hesitate to call this multiple times - reading 3-5 pages gives much better answers.
+    For thorough answers, retrieve 2-5 pages: the main topic plus related pages
+    (examples, error handling, configuration). Cross-reference across pages.
     """
     app_ctx: AppContext = ctx.request_context.lifespan_context
 
@@ -415,10 +549,7 @@ def get_page_by_id(
         breadcrumb = [p.text for p in breadcrumb_pages]
 
     # Build online help URL
-    online_help_url = None
-    if page.file_path:
-        normalized_path = page.file_path.replace("\\", "/")
-        online_help_url = f"{app_ctx.online_help_base_url}{normalized_path}"
+    online_help_url = _build_online_help_url(app_ctx.online_help_base_url, page.file_path)
 
     return PageContent(
         page_id=page.id,
@@ -435,18 +566,17 @@ def get_page_by_id(
 @mcp.tool()
 def get_page_by_help_id(
     ctx: Context,
-    help_id: str = Field(description="HelpID value (e.g., '3002099')"),
-    include_html: bool = Field(default=False, description="Include full HTML content"),
-    include_text: bool = Field(default=True, description="Include plain text content"),
-    include_breadcrumb: bool = Field(
-        default=False, description="Include breadcrumb trail (use get_breadcrumb tool for full details)"
+    help_id: str = Field(
+        description="Numeric HelpID value (e.g., '3002099'). Found in error messages, context help, and AS project references."
     ),
+    include_html: bool = Field(default=False, description="Include raw HTML."),
+    include_text: bool = Field(default=True, description="Include plain text content."),
+    include_breadcrumb: bool = Field(default=True, description="Include breadcrumb trail."),
 ) -> PageContent | None:
-    """Retrieve a help page by its HelpID.
+    """Retrieve a help page by its numeric HelpID.
 
-    HelpIDs are numeric identifiers used in the B&R help system. This tool
-    looks up the page associated with a HelpID and returns its content.
-    Breadcrumb is optional - use the dedicated get_breadcrumb tool for navigation.
+    Use this when you have a HelpID from error codes, context-sensitive help links,
+    or AS project references. Returns the same content as get_page_by_id.
     """
     app_ctx: AppContext = ctx.request_context.lifespan_context
 
@@ -469,10 +599,7 @@ def get_page_by_help_id(
         breadcrumb = [p.text for p in breadcrumb_pages]
 
     # Build online help URL
-    online_help_url = None
-    if page.file_path:
-        normalized_path = page.file_path.replace("\\", "/")
-        online_help_url = f"{app_ctx.online_help_base_url}{normalized_path}"
+    online_help_url = _build_online_help_url(app_ctx.online_help_base_url, page.file_path)
 
     return PageContent(
         page_id=page.id,
@@ -519,11 +646,12 @@ async def get_breadcrumb(
 
 
 @mcp.tool()
-async def get_help_statistics(ctx: Context) -> dict[str, int]:
-    """Get statistics about the indexed help content.
+async def get_help_statistics(ctx: Context) -> dict:
+    """Check index build progress and get content statistics.
 
-    Returns counts of total pages, sections, and HelpID mappings.
-    Also includes parent-child relationship statistics.
+    Primary use: check if the search index is ready (state='ready' or 'fts_ready').
+    Call this when search_help returns empty results to see if the index is still building.
+    Also returns counts of total pages, sections, and HelpID mappings.
     """
     app_ctx: AppContext = ctx.request_context.lifespan_context
 
@@ -535,53 +663,40 @@ async def get_help_statistics(ctx: Context) -> dict[str, int]:
     pages_with_parents = sum(1 for p in app_ctx.indexer.pages.values() if p.parent_id is not None)
     root_pages = sum(1 for p in app_ctx.indexer.pages.values() if p.parent_id is None)
 
+    # Get index build status
+    build_status = app_ctx.search_engine.build_status
+
     await ctx.info(f"Statistics: {total_pages} total, {total_sections} sections, {total_help_ids} HelpIDs")
     await ctx.info(f"Hierarchy: {pages_with_parents} with parents, {root_pages} root items")
+    await ctx.info(
+        f"Index: state={build_status['state']}, type={build_status['build_type']}, phase={build_status['phase']}"
+    )
 
-    return {
+    result: dict = {
         "total_pages": total_pages,
         "total_sections": total_sections,
         "regular_pages": total_pages - total_sections,
         "help_id_mappings": total_help_ids,
         "pages_with_parents": pages_with_parents,
         "root_items": root_pages,
+        "index_status": {
+            "state": build_status["state"],
+            "build_type": build_status["build_type"],
+            "phase": build_status["phase"],
+            "pages_total": build_status["pages_total"],
+            "pages_processed": build_status["pages_processed"],
+            "elapsed_seconds": build_status["elapsed_seconds"],
+        },
     }
 
+    # Include incremental stats when available
+    if build_status.get("incremental_stats"):
+        result["index_status"]["incremental_stats"] = build_status["incremental_stats"]
 
-# Resource for direct HTML file access
-@mcp.resource("help://page/{page_id}")
-def get_help_page_resource(page_id: str, ctx: Context) -> str:
-    """Read the content of a specific help page.
+    if build_status.get("error"):
+        result["index_status"]["error"] = build_status["error"]
 
-    Returns the plain text content of the page.
-    """
-    app_ctx: AppContext = ctx.request_context.lifespan_context
-
-    # Try to get plain text first (better for LLM)
-    text = app_ctx.indexer.extract_plain_text(page_id)
-    if text:
-        return text
-
-    # Fallback to HTML if text extraction fails but file exists
-    html = app_ctx.indexer.extract_html_content(page_id)
-    if html:
-        return html
-
-    raise ValueError(f"Page {page_id} not found or has no content")
-
-
-@mcp.resource("help://html/{page_id}")
-def get_page_html(page_id: str, ctx: Context) -> str:
-    """Get HTML content for a help page by its ID.
-
-    Returns the raw HTML content from the help file.
-    """
-    app_ctx: AppContext = ctx.request_context.lifespan_context
-
-    html_content = app_ctx.indexer.extract_html_content(page_id)
-    if html_content:
-        return html_content
-    return f"Page not found: {page_id}"
+    return result
 
 
 # Prompts for common workflows
@@ -701,181 +816,6 @@ List all pages consulted:
 Now perform deep research on "{topic}" and provide a comprehensive, well-sourced answer."""
 
 
-@mcp.prompt()
-def search_hardware(topic: str) -> str:
-    """Search specifically in the Hardware section of the B&R help.
-
-    Use this prompt when looking for information about X20 modules, PLCs,
-    drives, motors, or other physical components.
-    """
-    return f"""Search for "{topic}" specifically in the Hardware category.
-
-## Instructions
-
-1. Use the `search_help` tool with `category='Hardware'` and `limit=10`.
-2. Retrieve full content for the most relevant pages using `get_page_by_id`.
-3. Provide a summary of the hardware component, including:
-   - Technical data / specifications
-   - Wiring / pinout information (if available)
-   - Status/Error LED descriptions
-   - Configuration parameters
-
-Now search for "{topic}" in the Hardware section."""
-
-
-@mcp.prompt()
-def search_motion(topic: str) -> str:
-    """Search specifically in the Motion section of the B&R help.
-
-    Use this prompt for questions about ACOPOS, mapp Motion, axis control,
-    CNC, robotics, or motion function blocks (MC_*).
-    """
-    return f"""Search for "{topic}" specifically in the Motion category.
-
-## Instructions
-
-1. Use the `search_help` tool with `category='Motion'` and `limit=10`.
-2. Retrieve full content for the most relevant pages using `get_page_by_id`.
-3. Provide a detailed explanation including:
-   - Function block interface (if applicable)
-   - Configuration / parameters
-   - Error codes and troubleshooting
-   - Usage examples
-
-Now search for "{topic}" in the Motion section."""
-
-
-@mcp.prompt()
-def search_visualization(topic: str) -> str:
-    """Search specifically in the Visualization section of the B&R help.
-
-    Use this prompt for questions about mapp View, Visual Components,
-    widgets, events, actions, or HMI configuration.
-    """
-    return f"""Search for "{topic}" specifically in the Visualization category.
-
-## Instructions
-
-1. Use the `search_help` tool with `category='Visualization'` and `limit=10`.
-   (Note: If 'Visualization' yields few results, try searching without category as some older content might be under 'VisualComponents' or 'mapp View')
-2. Retrieve full content for the most relevant pages using `get_page_by_id`.
-3. Provide a summary including:
-   - Widget/Component properties and events
-   - Configuration details
-   - Usage examples
-
-Now search for "{topic}" in the Visualization section."""
-
-
-@mcp.prompt()
-def search_safety(topic: str) -> str:
-    """Search specifically in the Safety section of the B&R help.
-
-    Use this prompt for questions about Integrated Safety, SafeLOGIC,
-    safety functions, or safety hardware configuration.
-    """
-    return f"""Search for "{topic}" specifically in the Safety category.
-
-## Instructions
-
-1. Use the `search_help` tool with `category='Safety'` and `limit=10`.
-2. Retrieve full content for the most relevant pages using `get_page_by_id`.
-3. Provide a detailed explanation including:
-   - Safety function details
-   - Configuration / parameters
-   - Wiring / hardware constraints (if applicable)
-   - Usage examples
-
-Now search for "{topic}" in the Safety section."""
-
-
-@mcp.prompt()
-def search_vision(topic: str) -> str:
-    """Search specifically in the Vision section of the B&R help.
-
-    Use this prompt for questions about mapp Vision, Smart Camera,
-    vision sensors, or image processing functions.
-    """
-    return f"""Search for "{topic}" specifically in the Vision category.
-
-## Instructions
-
-1. Use the `search_help` tool with `category='Vision'` and `limit=10`.
-2. Retrieve full content for the most relevant pages using `get_page_by_id`.
-3. Provide a summary including:
-   - Component/Function details
-   - Configuration parameters
-   - Usage examples and best practices
-
-Now search for "{topic}" in the Vision section."""
-
-
-@mcp.prompt()
-def search_communication(topic: str) -> str:
-    """Search specifically in the Communication section of the B&R help.
-
-    Use this prompt for questions about POWERLINK, OPC UA, Modbus,
-    PROFINET, EtherNet/IP, or other fieldbus protocols.
-    """
-    return f"""Search for "{topic}" specifically in the Communication category.
-
-## Instructions
-
-1. Use the `search_help` tool with `category='Communication'` and `limit=10`.
-2. Retrieve full content for the most relevant pages using `get_page_by_id`.
-3. Provide a detailed explanation including:
-   - Protocol specifications / limits
-   - Configuration steps
-   - Function blocks for data exchange
-   - Troubleshooting
-
-Now search for "{topic}" in the Communication section."""
-
-
-@mcp.prompt()
-def search_programming(topic: str) -> str:
-    """Search specifically in the Programming section of the B&R help.
-
-    Use this prompt for questions about standard libraries, IEC 61131-3
-    programming, C/C++ usage, or general system functions.
-    """
-    return f"""Search for "{topic}" specifically in the Programming category.
-
-## Instructions
-
-1. Use the `search_help` tool with `category='Programming'` and `limit=10`.
-2. Retrieve full content for the most relevant pages using `get_page_by_id`.
-3. Provide a summary including:
-   - Function/Library details
-   - Input/Output parameters
-   - Return values and error codes
-   - Code examples
-
-Now search for "{topic}" in the Programming section."""
-
-
-@mcp.prompt()
-def search_mapp_services(topic: str) -> str:
-    """Search specifically for mapp Services.
-
-    Use this prompt for questions about mapp Services like AlarmX, Recipe,
-    UserX, Data, Report, Audit, etc. (Excludes mapp Motion/View/Vision).
-    """
-    return f"""Search for "{topic}" specifically in the Services category.
-
-## Instructions
-
-1. Use the `search_help` tool with `category='Services'` and `limit=10`.
-2. Retrieve full content for the most relevant pages using `get_page_by_id`.
-3. Provide a detailed explanation including:
-   - Component configuration (MpLink)
-   - Function block interface
-   - UI connection (if applicable)
-   - Usage examples
-
-Now search for "{topic}" in the Services section."""
-
-
 def main():
     """Entry point for the MCP server."""
     import argparse
@@ -893,11 +833,28 @@ def main():
         "--metadata-dir",
         help="Path to metadata directory (AS_HELP_METADATA_DIR). Example: './metadata'",
     )
-    parser.add_argument("--force-rebuild", action="store_true", help="Force index rebuild (AS_HELP_FORCE_REBUILD)")
+    parser.add_argument(
+        "--force-rebuild",
+        type=_parse_bool_arg,
+        nargs="?",
+        const=True,
+        default=None,
+        metavar="BOOL",
+        help="Force index rebuild: true/false (AS_HELP_FORCE_REBUILD). Omit value for true.",
+    )
     parser.add_argument(
         "--as-version",
         choices=["4", "6"],
         help="AS version for online help (AS_HELP_VERSION). Default: 4",
+    )
+    parser.add_argument(
+        "--create-embeddings",
+        type=_parse_bool_arg,
+        nargs="?",
+        const=True,
+        default=None,
+        metavar="BOOL",
+        help="Enable embedding via API: true/false (CREATE_EMBEDDINGS). Omit value for true.",
     )
     parser.add_argument("--usage", action="store_true", help="Print usage examples and exit")
 
@@ -910,19 +867,25 @@ def main():
         os.environ["AS_HELP_DB_PATH"] = str(Path(args.db_path).resolve())
     if args.metadata_dir:
         os.environ["AS_HELP_METADATA_DIR"] = str(Path(args.metadata_dir).resolve())
-    if args.force_rebuild:
-        os.environ["AS_HELP_FORCE_REBUILD"] = "true"
+    if args.force_rebuild is not None:
+        os.environ["AS_HELP_FORCE_REBUILD"] = "true" if args.force_rebuild else "false"
     if args.as_version:
         os.environ["AS_HELP_VERSION"] = args.as_version
+    if args.create_embeddings is not None:
+        os.environ["CREATE_EMBEDDINGS"] = "true" if args.create_embeddings else "false"
 
     # Run with stdio transport by default (for local MCP clients like Claude Desktop)
     # To expose over HTTP, set MCP_TRANSPORT=streamable-http and configure host/port with MCP_HOST/MCP_PORT
+    # Default host is 127.0.0.1 (localhost only); set MCP_HOST=0.0.0.0 to bind all interfaces
     transport = os.environ.get("MCP_TRANSPORT", "stdio")
     if transport == "streamable-http":
-        mcp.settings.host = os.environ.get("MCP_HOST", "0.0.0.0")
+        mcp.settings.host = os.environ.get("MCP_HOST", "127.0.0.1")
         mcp.settings.port = int(os.environ.get("MCP_PORT", "8000"))
-        mcp.settings.transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
-    mcp.run(transport=transport)
+        # Only disable DNS rebinding protection when explicitly opted in
+        if os.environ.get("MCP_DISABLE_DNS_REBINDING_PROTECTION", "false").lower() == "true":
+            logger.warning("DNS rebinding protection is DISABLED — only safe behind a reverse proxy or firewall")
+            mcp.settings.transport_security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+    mcp.run(transport=cast(Literal["stdio", "sse", "streamable-http"], transport))
 
 
 if __name__ == "__main__":

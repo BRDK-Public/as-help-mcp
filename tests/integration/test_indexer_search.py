@@ -10,15 +10,16 @@ class TestIndexerSearchEngineIntegration:
     """Integration tests for indexer and search engine working together."""
 
     @pytest.fixture
-    def integrated_system(self, temp_help_dir, sample_xml, tmp_path):
+    def integrated_system(self, temp_help_dir, sample_xml, tmp_path, mock_embedding_service):
         """Create fully integrated indexer + search engine."""
         # Initialize and parse
         indexer = HelpContentIndexer(temp_help_dir)
         indexer.parse_xml_structure()
 
         # Build search index
-        db_path = tmp_path / "test_integration.db"
-        search_engine = HelpSearchEngine(db_path, indexer, force_rebuild=True)
+        db_path = tmp_path / "test_integration_lance"
+        search_engine = HelpSearchEngine(db_path, indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        search_engine.initialize()
 
         yield indexer, search_engine
 
@@ -78,14 +79,17 @@ class TestIndexerSearchEngineIntegration:
         assert result is not None
         assert result["help_id"] == "12345"
 
-    def test_reindex_detection_after_xml_change(self, temp_help_dir, sample_xml, tmp_path):
+    def test_reindex_detection_after_xml_change(self, temp_help_dir, sample_xml, tmp_path, mock_embedding_service):
         """Verify both indexer and search engine detect XML changes."""
         # Initial indexing
         indexer1 = HelpContentIndexer(temp_help_dir)
         indexer1.parse_xml_structure()
 
-        db_path = tmp_path / "test_reindex.db"
-        search_engine1 = HelpSearchEngine(db_path, indexer1, force_rebuild=True)
+        db_path = tmp_path / "test_reindex_lance"
+        search_engine1 = HelpSearchEngine(
+            db_path, indexer1, force_rebuild=True, embedding_service=mock_embedding_service
+        )
+        search_engine1.initialize()
         search_engine1.close()
 
         # Check indexer detects no change
@@ -105,7 +109,10 @@ class TestIndexerSearchEngineIntegration:
         indexer3.parse_xml_structure()
 
         # Search engine should also detect change
-        search_engine3 = HelpSearchEngine(db_path, indexer3, force_rebuild=False)
+        search_engine3 = HelpSearchEngine(
+            db_path, indexer3, force_rebuild=False, embedding_service=mock_embedding_service
+        )
+        search_engine3.initialize()
         # Would rebuild if hash mismatch detected
         search_engine3.close()
 
@@ -114,15 +121,16 @@ class TestMCPToolIntegration:
     """Integration tests for MCP tools using real indexer/search engine."""
 
     @pytest.fixture
-    def app_context(self, temp_help_dir, sample_xml, tmp_path):
+    def app_context(self, temp_help_dir, sample_xml, tmp_path, mock_embedding_service):
         """Create app context with real components."""
         from src.server import AppContext
 
         indexer = HelpContentIndexer(temp_help_dir)
         indexer.parse_xml_structure()
 
-        db_path = tmp_path / "test_mcp.db"
-        search_engine = HelpSearchEngine(db_path, indexer, force_rebuild=True)
+        db_path = tmp_path / "test_mcp_lance"
+        search_engine = HelpSearchEngine(db_path, indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        search_engine.initialize()
 
         context = AppContext(
             indexer=indexer,
@@ -206,13 +214,14 @@ class TestSearchAccuracy:
     """Test search accuracy and ranking."""
 
     @pytest.fixture
-    def search_system(self, temp_help_dir, sample_xml, tmp_path):
+    def search_system(self, temp_help_dir, sample_xml, tmp_path, mock_embedding_service):
         """Create search system."""
         indexer = HelpContentIndexer(temp_help_dir)
         indexer.parse_xml_structure()
 
-        db_path = tmp_path / "test_accuracy.db"
-        search_engine = HelpSearchEngine(db_path, indexer, force_rebuild=True)
+        db_path = tmp_path / "test_accuracy_lance"
+        search_engine = HelpSearchEngine(db_path, indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        search_engine.initialize()
 
         yield indexer, search_engine
 
@@ -257,13 +266,14 @@ class TestBreadcrumbConsistency:
     """Test breadcrumb consistency across components."""
 
     @pytest.fixture
-    def system(self, temp_help_dir, sample_xml, tmp_path):
+    def system(self, temp_help_dir, sample_xml, tmp_path, mock_embedding_service):
         """Create full system."""
         indexer = HelpContentIndexer(temp_help_dir)
         indexer.parse_xml_structure()
 
-        db_path = tmp_path / "test_breadcrumb.db"
-        search_engine = HelpSearchEngine(db_path, indexer, force_rebuild=True)
+        db_path = tmp_path / "test_breadcrumb_lance"
+        search_engine = HelpSearchEngine(db_path, indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        search_engine.initialize()
 
         yield indexer, search_engine
 
@@ -291,13 +301,14 @@ class TestPerformance:
     """Test performance characteristics of integrated system."""
 
     @pytest.fixture
-    def system(self, temp_help_dir, sample_xml, tmp_path):
+    def system(self, temp_help_dir, sample_xml, tmp_path, mock_embedding_service):
         """Create system."""
         indexer = HelpContentIndexer(temp_help_dir)
         indexer.parse_xml_structure()
 
-        db_path = tmp_path / "test_perf.db"
-        search_engine = HelpSearchEngine(db_path, indexer, force_rebuild=True)
+        db_path = tmp_path / "test_perf_lance"
+        search_engine = HelpSearchEngine(db_path, indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        search_engine.initialize()
 
         yield indexer, search_engine
 
@@ -331,3 +342,95 @@ class TestPerformance:
 
         # Later searches shouldn't be slower
         assert times[-1] <= times[0] * 2  # Allow 2x tolerance
+
+
+class TestIncrementalUpdateIntegration:
+    """Integration tests for incremental index updates."""
+
+    def test_add_page_then_search(self, temp_help_dir, sample_xml, tmp_path, mock_embedding_service):
+        """Verify a page added via incremental update is searchable."""
+        indexer = HelpContentIndexer(temp_help_dir)
+        indexer.parse_xml_structure()
+
+        db_path = tmp_path / "inc_integ_lance"
+        engine = HelpSearchEngine(db_path, indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine.initialize()
+        initial_count = engine.db.open_table(engine.TABLE_NAME).count_rows()
+        engine.close()
+
+        # Add a new page to the XML
+        new_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<BrHelpContent>
+    <Section Id="hardware_section" Text="Hardware" File="index.html">
+        <Page Id="x20di9371_page" Text="X20DI9371" File="hardware/x20di9371.html">
+            <Identifiers><HelpID Value="12345"/></Identifiers>
+        </Page>
+        <Page Id="new_page" Text="Brand New Module" File="hardware/x20di9371.html"/>
+    </Section>
+    <Section Id="motion_section" Text="Motion" File="motion/overview.html">
+        <Identifiers><HelpID Value="20000"/></Identifiers>
+        <Section Id="mapp_motion_section" Text="mapp Motion" File="motion/overview.html">
+            <Page Id="mc_moveabs_page" Text="MC_BR_MoveAbsolute" File="motion/mapp_motion/mc_br_moveabsolute.html">
+                <Identifiers><HelpID Value="20100"/></Identifiers>
+            </Page>
+        </Section>
+    </Section>
+</BrHelpContent>"""
+        (temp_help_dir / "brhelpcontent.xml").write_text(new_xml, encoding="utf-8")
+
+        indexer2 = HelpContentIndexer(temp_help_dir)
+        indexer2.parse_xml_structure()
+
+        engine2 = HelpSearchEngine(db_path, indexer2, force_rebuild=False, embedding_service=mock_embedding_service)
+        assert engine2._build_strategy == "incremental"
+        engine2.initialize()
+
+        # One more row
+        new_count = engine2.db.open_table(engine2.TABLE_NAME).count_rows()
+        assert new_count == initial_count + 1
+
+        # Searchable
+        results = engine2.search("Brand New Module")
+        assert any(r["page_id"] == "new_page" for r in results)
+        engine2.close()
+
+    def test_remove_page_then_search(self, temp_help_dir, sample_xml, tmp_path, mock_embedding_service):
+        """Verify a page removed via incremental update is no longer searchable."""
+        indexer = HelpContentIndexer(temp_help_dir)
+        indexer.parse_xml_structure()
+
+        db_path = tmp_path / "inc_integ_lance"
+        engine = HelpSearchEngine(db_path, indexer, force_rebuild=True, embedding_service=mock_embedding_service)
+        engine.initialize()
+        initial_count = engine.db.open_table(engine.TABLE_NAME).count_rows()
+        engine.close()
+
+        # Remove x20di9371_page from the XML
+        new_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<BrHelpContent>
+    <Section Id="hardware_section" Text="Hardware" File="index.html"/>
+    <Section Id="motion_section" Text="Motion" File="motion/overview.html">
+        <Identifiers><HelpID Value="20000"/></Identifiers>
+        <Section Id="mapp_motion_section" Text="mapp Motion" File="motion/overview.html">
+            <Page Id="mc_moveabs_page" Text="MC_BR_MoveAbsolute" File="motion/mapp_motion/mc_br_moveabsolute.html">
+                <Identifiers><HelpID Value="20100"/></Identifiers>
+            </Page>
+        </Section>
+    </Section>
+</BrHelpContent>"""
+        (temp_help_dir / "brhelpcontent.xml").write_text(new_xml, encoding="utf-8")
+
+        indexer2 = HelpContentIndexer(temp_help_dir)
+        indexer2.parse_xml_structure()
+
+        engine2 = HelpSearchEngine(db_path, indexer2, force_rebuild=False, embedding_service=mock_embedding_service)
+        assert engine2._build_strategy == "incremental"
+        engine2.initialize()
+
+        new_count = engine2.db.open_table(engine2.TABLE_NAME).count_rows()
+        assert new_count == initial_count - 1
+
+        # Removed page should not appear in results
+        results = engine2.search("X20DI9371")
+        assert not any(r["page_id"] == "x20di9371_page" for r in results)
+        engine2.close()

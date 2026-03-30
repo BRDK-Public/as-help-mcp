@@ -2,54 +2,17 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Run BR Help MCP Server",
-      "type": "debugpy",
-      "request": "launch",
-      "program": "${workspaceFolder}/src/server.py",
-      "cwd": "${workspaceFolder}",
-      "env": {
-        "AS_HELP_ROOT": "/mnt/c/BRAutomation/AS412/Help-en/Data",
-        "AS_HELP_FORCE_REBUILD": "false"
-      },
-      "console": "integratedTerminal",
-      "justMyCode": false
-    },
-    {
-      "name": "Rebuild BR Help Index",
-      "type": "debugpy",
-      "request": "launch",
-      "program": "${workspaceFolder}/src/server.py",
-      "cwd": "${workspaceFolder}",
-      "env": {
-        "AS_HELP_ROOT": "/mnt/c/BRAutomation/AS412/Help-en/Data",
-        "AS_HELP_FORCE_REBUILD": "true"
-      },
-      "console": "integratedTerminal",
-      "justMyCode": false
-    },
-    {
-      "name": "Test BR Help Indexer",
-      "type": "debugpy",
-      "request": "launch",
-      "program": "${workspaceFolder}/test_parsing.py",
-      "cwd": "${workspaceFolder}",
-      "console": "integratedTerminal",
-      "justMyCode": false
-    },
-    {
-      "name": "Test BR Help Search",
-      "type": "debugpy",
-      "request": "launch",
-      "program": "${workspaceFolder}/test_search.py",
-      "cwd": "${workspaceFolder}",
-      "console": "integratedTerminal",
-      "justMyCode": false
-    },
-    {
-      "name": "Test BR Help with MCP Inspector",
+      "name": "Build & Deploy EXE",
       "type": "node-terminal",
       "request": "launch",
-      "command": "AS_HELP_ROOT=/mnt/c/BRAutomation/AS412/Help-en/Data AS_HELP_FORCE_REBUILD=false uv run mcp dev src/server.py",
+      "command": "uv run python build.py --clean --deploy",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Build Docker Image",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "docker build -t as-help:local .",
       "cwd": "${workspaceFolder}"
     }
   ]

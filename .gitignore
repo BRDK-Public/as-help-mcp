@@ -33,6 +33,7 @@ help_index/
 *.db-shm
 *.db-wal
 .ashelp_search.db
+.ashelp_lance/
 .ashelp_metadata/
 mcp_startup.log
 
@@ -57,3 +58,6 @@ Thumbs.db
 
 # Testing
 .coverage
+
+# Pre-exported model cache for Docker builds (see prepare_model.py)
+.model_cache/

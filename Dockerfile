@@ -19,6 +19,7 @@ WORKDIR /app
 # Install runtime dependencies
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
+    libgomp1 \
     libsqlite3-0 \
     libxml2 \
     libxslt1.1 && \
@@ -39,7 +40,8 @@ ENV PATH="/app/.venv/bin:$PATH" \
 # Note: AS_HELP_DB_PATH is NOT set here - server.py auto-detects based on help root hash
 # Default stdio transport is used for local development; for HTTP, set MCP_TRANSPORT=streamable-http and configure host/port with MCP_HOST/MCP_PORT
 ENV AS_HELP_ROOT=/data/help \
-    AS_HELP_FORCE_REBUILD=false\
+    AS_HELP_FORCE_REBUILD=false \
+    CREATE_EMBEDDINGS=false \
     MCP_TRANSPORT=stdio \
     MCP_HOST=0.0.0.0 \
     MCP_PORT=8000
@@ -50,8 +52,8 @@ RUN mkdir -p /data/help /data/db
 # Expose port for SSE mode (optional)
 EXPOSE 8000
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+# Health check (start-period allows for first-run index build)
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
     CMD python -c "import sys; sys.path.insert(0, '/app/src'); from server import mcp; print('OK')" || exit 1
 
 # Run the MCP server

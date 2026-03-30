@@ -65,12 +65,12 @@ This MCP server reads files from a configured directory (`AS_HELP_ROOT`). The se
 - Uses `defusedxml` for safe XML parsing (prevents XXE attacks)
 - Does not expose the file system over network
 
-### SQLite Database
+### LanceDB Index
 
-The search index database:
+The search index directory:
 
 - Is stored locally (not networked)
-- Contains only indexed text content (no credentials)
+- Contains only indexed text content and embeddings (no credentials)
 - Should be placed in a secure location with appropriate permissions
 
 ## Dependencies

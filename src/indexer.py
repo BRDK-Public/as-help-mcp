@@ -41,8 +41,6 @@ class HelpPage:
     help_id: str | None = None
     parent_id: str | None = None
     is_section: bool = False
-    html_content: str | None = None
-    plain_text: str | None = None
 
 
 class HelpContentIndexer:
@@ -63,6 +61,7 @@ class HelpContentIndexer:
         self.help_id_map: dict[str, str] = {}  # Maps HelpID -> page ID
         self._breadcrumb_cache: dict[str, list[HelpPage]] = {}  # Cache breadcrumbs to avoid recomputation
         self._duplicate_ids: dict[str, list[str]] = {}  # Track duplicate IDs: id -> [first_title, second_title, ...]
+        self._dup_id_counter: dict[str, int] = {}  # Counter for generating unique synthetic IDs
 
         # Ensure directories exist
         self.help_root.mkdir(parents=True, exist_ok=True)
@@ -77,6 +76,23 @@ class HelpContentIndexer:
     def _get_xml_hash(self) -> str:
         """Calculate MD5 hash of brhelpcontent.xml for change detection."""
         return hashlib.md5(self.xml_path.read_bytes(), usedforsecurity=False).hexdigest()
+
+    def get_page_fingerprints(self) -> dict[str, str]:
+        """Compute a fingerprint for each page from its XML metadata.
+
+        The fingerprint is a short hash of (title, file_path, parent_id, help_id,
+        is_section).  Two fingerprints differ whenever B&R regenerates a page's
+        entry in brhelpcontent.xml, which reliably signals that the page content
+        changed as well.
+
+        Returns:
+            Dict mapping page_id -> hex fingerprint string.
+        """
+        fingerprints: dict[str, str] = {}
+        for page_id, page in self.pages.items():
+            key = f"{page.text}|{page.file_path}|{page.parent_id}|{page.help_id}|{page.is_section}"
+            fingerprints[page_id] = hashlib.md5(key.encode(), usedforsecurity=False).hexdigest()
+        return fingerprints
 
     def _load_metadata(self) -> dict[str, str | int] | None:
         """Load index metadata if it exists."""
@@ -146,13 +162,15 @@ class HelpContentIndexer:
             logger.info(f"Indexed {len(self.pages)} pages and sections in {elapsed:.2f}s")
             logger.info(f"Found {len(self.help_id_map)} HelpID mappings")
 
-            # Report duplicate IDs found in XML (these cause breadcrumb issues)
+            # Report duplicate IDs found in XML (resolved with synthetic IDs)
             if self._duplicate_ids:
-                logger.warning(f"Found {len(self._duplicate_ids)} duplicate IDs in brhelpcontent.xml (B&R data issue)")
+                logger.info(
+                    f"Resolved {len(self._duplicate_ids)} duplicate IDs in brhelpcontent.xml with synthetic IDs"
+                )
                 for dup_id, titles in list(self._duplicate_ids.items())[:5]:
-                    logger.warning(f"  Duplicate ID '{dup_id}': used by {titles}")
+                    logger.debug(f"  Duplicate ID '{dup_id}': used by {titles}")
                 if len(self._duplicate_ids) > 5:
-                    logger.warning(f"  ... and {len(self._duplicate_ids) - 5} more duplicates")  # pragma: no cover
+                    logger.debug(f"  ... and {len(self._duplicate_ids) - 5} more duplicates")  # pragma: no cover
 
             if len(self.help_id_map) == 0:
                 logger.warning("No HelpIDs found! Checking first 5 pages for debugging...")
@@ -195,11 +213,51 @@ class HelpContentIndexer:
             return  # pragma: no cover
 
         # Check for duplicate ID (B&R XML data issue)
+        # Generate a unique synthetic ID so this occurrence gets its own
+        # identity and its children trace the correct breadcrumb path.
         if section_id in self.pages:
             existing = self.pages[section_id]
             if section_id not in self._duplicate_ids:
                 self._duplicate_ids[section_id] = [existing.text]
             self._duplicate_ids[section_id].append(text)
+
+            count = self._dup_id_counter.get(section_id, 0) + 1
+            self._dup_id_counter[section_id] = count
+            synthetic_id = f"{section_id}__dup_{count}"
+
+            dup_page = HelpPage(
+                id=synthetic_id,
+                text=text,
+                file_path=file_path,
+                parent_id=parent_id,
+                is_section=True,
+            )
+
+            # Extract HelpID for the duplicate section
+            dup_identifiers = section_elem.find("Identifiers")
+            if dup_identifiers is None:
+                dup_identifiers = section_elem.find("I")
+            if dup_identifiers is not None:
+                dup_help_id_elem = dup_identifiers.find("HelpID")
+                if dup_help_id_elem is None:
+                    dup_help_id_elem = dup_identifiers.find("H")
+                if dup_help_id_elem is not None:
+                    dup_help_id = dup_help_id_elem.get("Value")
+                    if dup_help_id is None:
+                        dup_help_id = dup_help_id_elem.get("v")
+                    if dup_help_id:
+                        dup_page.help_id = dup_help_id
+                        self.help_id_map[dup_help_id] = synthetic_id
+
+            self.pages[synthetic_id] = dup_page
+
+            # Process children with the synthetic ID as parent
+            for child in section_elem:
+                if child.tag in ("Section", "S"):
+                    self._process_section(child, synthetic_id)
+                elif child.tag in ("Page", "P"):
+                    self._process_page(child, synthetic_id)
+            return
 
         # Create section entry
         page = HelpPage(id=section_id, text=text, file_path=file_path, parent_id=parent_id, is_section=True)
@@ -246,11 +304,43 @@ class HelpContentIndexer:
             return  # pragma: no cover
 
         # Check for duplicate ID (B&R XML data issue)
+        # Generate a unique synthetic ID so this occurrence keeps the correct parent.
         if page_id in self.pages:
             existing = self.pages[page_id]
             if page_id not in self._duplicate_ids:
                 self._duplicate_ids[page_id] = [existing.text]
             self._duplicate_ids[page_id].append(text)
+
+            count = self._dup_id_counter.get(page_id, 0) + 1
+            self._dup_id_counter[page_id] = count
+            synthetic_id = f"{page_id}__dup_{count}"
+
+            dup_page = HelpPage(
+                id=synthetic_id,
+                text=text,
+                file_path=file_path,
+                parent_id=parent_id,
+                is_section=False,
+            )
+
+            # Extract HelpID for the duplicate page
+            dup_identifiers = page_elem.find("Identifiers")
+            if dup_identifiers is None:
+                dup_identifiers = page_elem.find("I")
+            if dup_identifiers is not None:
+                dup_help_id_elem = dup_identifiers.find("HelpID")
+                if dup_help_id_elem is None:
+                    dup_help_id_elem = dup_identifiers.find("H")
+                if dup_help_id_elem is not None:
+                    dup_help_id = dup_help_id_elem.get("Value")
+                    if dup_help_id is None:
+                        dup_help_id = dup_help_id_elem.get("v")
+                    if dup_help_id:
+                        dup_page.help_id = dup_help_id
+                        self.help_id_map[dup_help_id] = synthetic_id
+
+            self.pages[synthetic_id] = dup_page
+            return
 
         page = HelpPage(id=page_id, text=text, file_path=file_path, parent_id=parent_id, is_section=False)
 
@@ -274,7 +364,10 @@ class HelpContentIndexer:
         self.pages[page_id] = page
 
     def extract_html_content(self, page_id: str) -> str | None:
-        """Extract and cache HTML content for a page.
+        """Read HTML content for a page from disk.
+
+        Does NOT cache the result to avoid memory bloat (58K+ pages).
+        File reads are fast enough for on-demand retrieval.
 
         Args:
             page_id: The unique ID of the page
@@ -287,10 +380,6 @@ class HelpContentIndexer:
 
         page = self.pages[page_id]
 
-        # Return cached content if available
-        if page.html_content is not None:
-            return page.html_content
-
         if not page.file_path:
             return None  # pragma: no cover
 
@@ -302,9 +391,7 @@ class HelpContentIndexer:
 
         try:
             with open(html_file, encoding="utf-8", errors="ignore") as f:
-                html_content = f.read()
-                page.html_content = html_content
-                return html_content
+                return f.read()
         except Exception as e:  # pragma: no cover
             logger.error(f"Failed to read HTML file {html_file}: {e}")  # pragma: no cover
             return None  # pragma: no cover
@@ -389,10 +476,11 @@ class HelpContentIndexer:
             return None  # pragma: no cover
 
     def extract_plain_text(self, page_id: str) -> str | None:
-        """Extract plain text from HTML content for searching.
+        """Extract plain text from HTML content.
 
-        Uses lxml parser for faster parsing.
-        Extracts text with proper spacing to preserve word boundaries.
+        Reads HTML from disk and parses with lxml on each call.
+        Does NOT cache the result to avoid memory bloat (58K+ pages).
+        lxml parsing is fast (~1ms per page).
 
         Args:
             page_id: The unique ID of the page
@@ -404,69 +492,7 @@ class HelpContentIndexer:
             return None  # pragma: no cover
 
         page = self.pages[page_id]
-
-        # Return cached text if available
-        if page.plain_text is not None:
-            return page.plain_text
-
-        html_content = self.extract_html_content(page_id)
-        if not html_content:
-            return None
-
-        try:
-            # Use lxml for faster parsing
-            from lxml import html as lxml_html
-
-            root = lxml_html.fromstring(html_content)
-
-            # Remove script and style elements using XPath (faster than Cleaner)
-            # Cast to lxml HtmlElement to access xpath method
-            from typing import cast
-
-            from lxml.html import HtmlElement
-
-            root_elem = cast(HtmlElement, root)
-            for element in root_elem.xpath(".//script | .//style"):
-                element.getparent().remove(element)
-
-            # Extract text with proper spacing between block elements
-            text_parts = []
-            for elem in root.iter():
-                if elem.text:
-                    text_parts.append(elem.text)
-                # Add space after block-level elements to preserve word boundaries
-                if elem.tag in (
-                    "p",
-                    "div",
-                    "h1",
-                    "h2",
-                    "h3",
-                    "h4",
-                    "h5",
-                    "h6",
-                    "li",
-                    "td",
-                    "th",
-                    "tr",
-                    "table",
-                    "blockquote",
-                    "pre",
-                ):
-                    text_parts.append(" ")
-                if elem.tail:
-                    text_parts.append(elem.tail)
-
-            text = "".join(text_parts) if text_parts else ""
-
-            if text:
-                text = " ".join(text.split())
-
-            page.plain_text = text
-            return text
-
-        except Exception as e:  # pragma: no cover
-            logger.debug(f"Failed to extract text from HTML: {e}")  # pragma: no cover
-            return None  # pragma: no cover
+        return self._extract_plain_text_no_cache(page)
 
     def get_page_by_help_id(self, help_id: str) -> HelpPage | None:
         """Get a page by its HelpID.

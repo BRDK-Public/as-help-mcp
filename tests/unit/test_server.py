@@ -7,15 +7,14 @@ import pytest
 
 from src.server import (
     AppContext,
+    _parse_bool_arg,
     browse_section,
     get_as_version_config,
     get_breadcrumb,
     get_categories,
-    get_help_page_resource,
     get_help_statistics,
     get_page_by_help_id,
     get_page_by_id,
-    get_page_html,
     search_help,
 )
 
@@ -52,6 +51,24 @@ class TestASVersionConfiguration:
             assert url == "https://help.br-automation.com/#/en/4/"
 
 
+class TestBoolArgParsing:
+    """Test strict boolean parser used by CLI args."""
+
+    def test_parse_bool_arg_accepts_true_false(self):
+        """Verify valid boolean strings are parsed correctly."""
+        assert _parse_bool_arg("true") is True
+        assert _parse_bool_arg("1") is True
+        assert _parse_bool_arg("yes") is True
+        assert _parse_bool_arg("false") is False
+        assert _parse_bool_arg("0") is False
+        assert _parse_bool_arg("no") is False
+
+    def test_parse_bool_arg_rejects_invalid_values(self):
+        """Verify invalid values raise an argparse type error."""
+        with pytest.raises(Exception, match="Invalid boolean value"):
+            _parse_bool_arg("flase")
+
+
 class TestSearchHelpTool:
     """Test search_help MCP tool."""
 
@@ -59,6 +76,15 @@ class TestSearchHelpTool:
     def mock_context(self, mock_indexer):
         """Create mock context with indexer and search engine."""
         mock_search_engine = MagicMock()
+        mock_search_engine.build_status = {
+            "state": "ready",
+            "build_type": "none",
+            "phase": "complete",
+            "pages_total": 3,
+            "pages_processed": 3,
+            "elapsed_seconds": 0.2,
+            "error": None,
+        }
 
         # Mock search results
         mock_search_engine.search.return_value = [
@@ -90,9 +116,6 @@ class TestSearchHelpTool:
 
     def test_search_help_truncates_preview(self, mock_context):
         """Verify content_preview is truncated to ~100 chars."""
-        # Add plain text to mock indexer
-        mock_context.request_context.lifespan_context.indexer.extract_plain_text.return_value = "A" * 500
-
         result = search_help(mock_context, query="test")
 
         assert len(result.results) > 0
@@ -102,9 +125,6 @@ class TestSearchHelpTool:
 
     def test_search_help_builds_online_url(self, mock_context):
         """Verify online_help_url is constructed from file_path."""
-        # Mock extract_plain_text to return None (for sections or pages without content)
-        mock_context.request_context.lifespan_context.indexer.extract_plain_text.return_value = None
-
         result = search_help(mock_context, query="test")
 
         assert len(result.results) > 0
@@ -128,9 +148,6 @@ class TestSearchHelpTool:
             }
         ]
 
-        # Mock extract_plain_text to return None
-        mock_context.request_context.lifespan_context.indexer.extract_plain_text.return_value = None
-
         result = search_help(mock_context, query="test")
 
         assert len(result.results) > 0
@@ -138,8 +155,8 @@ class TestSearchHelpTool:
         assert "\\" not in result.results[0].online_help_url
 
     def test_search_help_sections_no_preview(self, mock_context, mock_indexer):
-        """Verify sections (is_section=True) have no content_preview."""
-        # Mock section result
+        """Verify sections without snippet have no content_preview."""
+        # Mock section result with no snippet
         mock_context.request_context.lifespan_context.search_engine.search.return_value = [
             {
                 "page_id": "section1",
@@ -158,6 +175,47 @@ class TestSearchHelpTool:
 
         assert len(result.results) > 0
         assert result.results[0].content_preview is None
+
+    def test_search_help_returns_status_while_building(self, mock_context):
+        """Verify search returns status message while index build is in progress."""
+        mock_engine = mock_context.request_context.lifespan_context.search_engine
+        mock_engine.build_status = {
+            "state": "building",
+            "build_type": "full",
+            "phase": "embedding",
+            "pages_total": 100,
+            "pages_processed": 25,
+            "elapsed_seconds": 12.0,
+            "error": None,
+        }
+
+        result = search_help(mock_context, query="test")
+
+        assert result.total == 0
+        assert result.status_message is not None
+        assert "building" in result.status_message.lower()
+        mock_engine.search.assert_not_called()
+
+    def test_search_help_returns_status_on_error(self, mock_context):
+        """Verify search returns explicit failure message when index build failed."""
+        mock_engine = mock_context.request_context.lifespan_context.search_engine
+        mock_engine.build_status = {
+            "state": "error",
+            "build_type": "full",
+            "phase": "loading embedding model",
+            "pages_total": 100,
+            "pages_processed": 0,
+            "elapsed_seconds": 5.0,
+            "error": "boom",
+        }
+
+        result = search_help(mock_context, query="test")
+
+        assert result.total == 0
+        assert result.status_message is not None
+        assert "failed" in result.status_message.lower()
+        assert "boom" in result.status_message
+        mock_engine.search.assert_not_called()
 
 
 class TestGetPageByIDTool:
@@ -358,9 +416,20 @@ class TestGetHelpStatisticsTool:
     @pytest.fixture
     def mock_context(self, mock_indexer):
         """Create mock context."""
+        mock_search_engine = MagicMock()
+        mock_search_engine.build_status = {
+            "state": "ready",
+            "build_type": "none",
+            "phase": "complete",
+            "pages_total": 3,
+            "pages_processed": 3,
+            "elapsed_seconds": 0.5,
+            "incremental_stats": None,
+            "error": None,
+        }
         app_context = AppContext(
             indexer=mock_indexer,
-            search_engine=MagicMock(),
+            search_engine=mock_search_engine,
             as_version="4",
             online_help_base_url="https://help.br-automation.com/#/en/4/",
         )
@@ -384,9 +453,12 @@ class TestGetHelpStatisticsTool:
         assert "help_id_mappings" in result
         assert "pages_with_parents" in result
         assert "root_items" in result
+        assert "index_status" in result
 
         assert result["total_pages"] == 3  # from mock_indexer
         assert result["help_id_mappings"] == 1
+        assert result["index_status"]["state"] == "ready"
+        assert result["index_status"]["build_type"] == "none"
 
     @pytest.mark.asyncio
     async def test_get_help_statistics_regular_pages_calculation(self, mock_context):
@@ -426,6 +498,15 @@ class TestSearchResultTransformation:
         """Create mock context."""
         mock_search_engine = MagicMock()
         mock_search_engine.search.return_value = []
+        mock_search_engine.build_status = {
+            "state": "ready",
+            "build_type": "none",
+            "phase": "complete",
+            "pages_total": 3,
+            "pages_processed": 3,
+            "elapsed_seconds": 0.1,
+            "error": None,
+        }
 
         app_context = AppContext(
             indexer=mock_indexer,
@@ -446,64 +527,3 @@ class TestSearchResultTransformation:
         assert result.total == 0
         assert len(result.results) == 0
         assert result.query == "nonexistent"
-
-
-class TestResourceHandlers:
-    """Test MCP resource handlers."""
-
-    @pytest.fixture
-    def mock_context(self, mock_indexer):
-        """Create mock context."""
-        app_context = AppContext(
-            indexer=mock_indexer,
-            search_engine=MagicMock(),
-            as_version="4",
-            online_help_base_url="https://help.br-automation.com/#/en/4/",
-        )
-
-        ctx = MagicMock()
-        ctx.request_context.lifespan_context = app_context
-
-        return ctx
-
-    def test_get_help_page_resource_returns_text(self, mock_context, mock_indexer):
-        """Verify get_help_page_resource returns plain text content."""
-        mock_indexer.extract_plain_text.return_value = "This is plain text content"
-        mock_indexer.extract_html_content.return_value = "<html>HTML</html>"
-
-        result = get_help_page_resource(page_id="page1", ctx=mock_context)
-
-        assert result == "This is plain text content"
-
-    def test_get_help_page_resource_fallback_to_html(self, mock_context, mock_indexer):
-        """Verify get_help_page_resource falls back to HTML when text is empty."""
-        mock_indexer.extract_plain_text.return_value = None
-        mock_indexer.extract_html_content.return_value = "<html>Fallback HTML</html>"
-
-        result = get_help_page_resource(page_id="page1", ctx=mock_context)
-
-        assert result == "<html>Fallback HTML</html>"
-
-    def test_get_help_page_resource_not_found_raises(self, mock_context, mock_indexer):
-        """Verify get_help_page_resource raises ValueError for missing page."""
-        mock_indexer.extract_plain_text.return_value = None
-        mock_indexer.extract_html_content.return_value = None
-
-        with pytest.raises(ValueError, match="Page nonexistent not found"):
-            get_help_page_resource(page_id="nonexistent", ctx=mock_context)
-
-    def test_get_page_html_returns_html(self, mock_context, mock_indexer):
-        """Verify get_page_html returns HTML content."""
-        mock_indexer.extract_html_content.return_value = "<html><body>Content</body></html>"
-
-        result = get_page_html(page_id="page1", ctx=mock_context)
-
-        assert result == "<html><body>Content</body></html>"
-
-    def test_get_page_html_not_found_returns_message(self, mock_context, mock_indexer):
-        """Verify get_page_html returns error message for missing page."""
-        mock_indexer.extract_html_content.return_value = None
-
-        result = get_page_html(page_id="nonexistent", ctx=mock_context)
-
-        assert result == "Page not found: nonexistent"
