@@ -418,9 +418,10 @@ def search_help(
     # Determine search mode from results (all results share the same mode)
     search_mode = results[0].get("search_mode", "hybrid") if results else "hybrid"
 
-    # Add status message when running in degraded keyword-only mode
+    # Add status message only when embeddings are enabled but not yet ready
+    # (i.e., hybrid mode is expected but temporarily degraded to keyword-only)
     status_msg = None
-    if search_mode == "keyword":
+    if search_mode == "keyword" and app_ctx.search_engine._embeddings_enabled:
         status_msg = (
             "Semantic search is still loading — results are keyword-only. Retry later for better relevance ranking."
         )
